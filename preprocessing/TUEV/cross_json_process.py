@@ -8,12 +8,13 @@ import sys
 
 data_root = sys.argv[1]  
 print(f"Data root: {data_root}")
-processed_data_path = os.path.join(data_root,'TUEV/processed_data/')
+processed_data_path = os.path.join(data_root, 'TUEV', 'processed_data')
 data_split_path = './preprocessing/TUEV/cross_subject_json'
 os.makedirs(data_split_path, exist_ok=True)
-train_folder = os.path.join(processed_data_path, "train")
-val_folder = os.path.join(processed_data_path, "eval")
-eval_folder = os.path.join(processed_data_path, "test")
+
+train_folder = os.path.join(processed_data_path, "train_dir")
+val_folder = os.path.join(processed_data_path, "eval_dir")
+eval_folder = os.path.join(processed_data_path, "test_dir")
 save_train_path = os.path.join(data_split_path, 'train.json')
 save_val_path = os.path.join(data_split_path, 'val.json')
 save_test_path = os.path.join(data_split_path, 'test.json')
@@ -47,8 +48,29 @@ def is_23_channels(pkl_file):
     except Exception as e:
         print(f"Error loading file {pkl_file}: {e}")
         return False
+def get_subject_name_from_file(file_path):
+    """
+    TUEV pkl 文件名一般类似：
+    aaaaacsw_00000001-0.pkl
+    所以前 8 位就是 subject/patient id。
+    train / val / test 都统一这样取，避免 subject_id 混乱。
+    """
+    return os.path.basename(file_path)[:8]
 
-train_files = natsorted([os.path.join(train_folder, f) for f in os.listdir(train_folder) if f.endswith('.pkl')])
+val_basenames = set(
+    f for f in os.listdir(val_folder)
+    if f.endswith(".pkl")
+)
+
+train_files = natsorted([
+    os.path.join(train_folder, f)
+    for f in os.listdir(train_folder)
+    if f.endswith(".pkl") and f not in val_basenames
+])
+print("train_folder:", train_folder, "exists:", os.path.exists(train_folder), "pkl:", len(train_files))
+print("val_folder:", val_folder, "exists:", os.path.exists(val_folder), "pkl:", len([f for f in os.listdir(val_folder) if f.endswith('.pkl')]) if os.path.exists(val_folder) else "MISSING")
+print("test_folder:", eval_folder, "exists:", os.path.exists(eval_folder), "pkl:", len([f for f in os.listdir(eval_folder) if f.endswith('.pkl')]) if os.path.exists(eval_folder) else "MISSING")
+
 tuples_list_train = []
 subject_id_counter = 0
 subject_id_map = {}
@@ -60,7 +82,7 @@ for file in train_files:
         eeg_data = pickle.load(open(file, "rb"))
         label = eeg_data['Y']
         eeg = eeg_data['X']
-        subject_folder = os.path.basename(file)[:8]
+        subject_folder = get_subject_name_from_file(file)
         if subject_folder not in subject_id_map:
             subject_id_map[subject_folder] = subject_id_counter
             subject_id_counter += 1
@@ -84,7 +106,13 @@ for file in train_files:
         tuples_list_train.append(data)
     except Exception as e:
         print(f"Error loading file {file}: {e}")
+print("valid train samples after 23-channel filtering:", num_all)
 
+if num_all == 0:
+    raise RuntimeError(
+        "No valid 23-channel training samples found. "
+        "Check whether train_dir is empty or whether all pkl files were filtered by is_23_channels()."
+    )
 data_mean = (total_mean / num_all).tolist()
 data_std = (total_std / num_all).tolist()
 
@@ -113,7 +141,7 @@ for file in val_files:
         eeg_data = pickle.load(open(file, "rb"))
         label = eeg_data['Y']
         eeg = eeg_data['X']
-        subject_folder = os.path.basename(file)[:8]
+        subject_folder = get_subject_name_from_file(file)
         if subject_folder not in subject_id_map:
             subject_id_map[subject_folder] = subject_id_counter
             subject_id_counter += 1
@@ -150,17 +178,19 @@ for file in eval_files:
     if not is_23_channels(file):
         continue
     try:
-        data_name = os.path.basename(file).split('_')[1][:3]
-        if data_name not in subject_id_map:
-            subject_id_map[data_name] = subject_id_counter
+        subject_folder = get_subject_name_from_file(file)
+        if subject_folder not in subject_id_map:
+            subject_id_map[subject_folder] = subject_id_counter
             subject_id_counter += 1
-        subject_id = subject_id_map[data_name]
+
+        subject_id = subject_id_map[subject_folder]
         eeg_data = pickle.load(open(file, "rb"))
         label = eeg_data['Y']
         eeg = eeg_data['X']
+
         data = {
             "subject_id": subject_id,
-            "subject_name": data_name,
+            "subject_name": subject_folder,
             "file": file,
             "label": label
         }

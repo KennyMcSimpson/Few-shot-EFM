@@ -1,149 +1,257 @@
-import json
 import os
-import pickle
-import numpy as np
-from natsort import natsorted
-from collections import defaultdict
-import random
 import sys
+import json
+import pickle
+import random
+import re
+from pathlib import Path
+from collections import defaultdict, Counter
+
+import numpy as np
 
 
-data_root = sys.argv[1]  
+data_root = sys.argv[1]
 print(f"Data root: {data_root}")
-processed_data_path = os.path.join(data_root,'Siena/processed_data')
-data_split_path = './preprocessing/Siena/cross_subject_json'
-os.makedirs(data_split_path, exist_ok=True)
-save_train_path = os.path.join(data_split_path, 'train.json')
-save_val_path = os.path.join(data_split_path, 'val.json')
-save_test_path = os.path.join(data_split_path, 'test.json')
 
-# data_folder = "./Preprocessing/Siena/raw_data"
-# os.makedirs('./Preprocessing/Siena/cross_subject_json', exist_ok=True)
-# save_folder_train = './Preprocessing/Siena/cross_subject_json/train.json'
-# save_folder_val = './Preprocessing/Siena/cross_subject_json/val.json'
-# save_folder_test = './Preprocessing/Siena/cross_subject_json/test.json'
+processed_data_path = Path(data_root) / "Siena" / "processed_data"
+data_split_path = Path("./preprocessing/Siena/cross_subject_json")
+data_split_path.mkdir(parents=True, exist_ok=True)
 
-sampling_rate = 512
-ch_names = ['Fp1', 'F3', 'C3', 'P3', 'O1', 'F7', 'T3', 'T5', 'Fc1', 'Fc5', 'Cp1', 'Cp5', 'F9', 'Fz', 'Cz', 'Pz', 'Fp2',
-            'F4', 'C4', 'P4', 'O2', 'F8', 'T4', 'T6', 'Fc2', 'Fc6', 'Cp2', 'Cp6', 'F10']
-num_channels = len(ch_names)
-random.seed(42)
+save_train_path = data_split_path / "train.json"
+save_val_path = data_split_path / "val.json"
+save_test_path = data_split_path / "test.json"
 
+RANDOM_SEED = 42
+random.seed(RANDOM_SEED)
 
-def load_subject_metadata(subject_folder):
-    subject_data = []
-    folder_name = os.path.basename(subject_folder)
-    subject_num = int(folder_name[2:])
-    subject_name = f"PN{subject_num:02d}"
+# Siena 预处理一般是 10 秒片段；如果你后面检查出来不是 10，再改这里
+SEGMENT_SECONDS = 10
 
-    for file in natsorted(f for f in os.listdir(subject_folder) if f.endswith('.pkl')):
-        file_path = os.path.join(subject_folder, file)
-        try:
-            with open(file_path, 'rb') as f:
-                eeg_data = pickle.load(f)
-            subject_data.append({
-                "subject_id": subject_num,
-                "subject_name": subject_name,
-                "file": file_path,
-                "label": eeg_data['Y']
-            })
-        except Exception as e:
-            print(f"Error loading {file_path}: {str(e)}")
-    return subject_data
+# 根据你日志里的 Siena 通道顺序，29 通道
+SIENA_CH_NAMES_29 = [
+    "Fp1", "F3", "C3", "P3", "O1",
+    "F7", "T3", "T5", "Fc1", "Fc5",
+    "Cp1", "Cp5", "F9", "Fz", "Cz", "Pz",
+    "FP2", "F4", "C4", "P4", "O2",
+    "F8", "T4", "T6", "Fc2", "Fc6",
+    "Cp2", "Cp6", "F10"
+]
 
 
-def compute_normalization_params(data_list):
-    """Calculate normalization parameters."""
-    total_mean = np.zeros(num_channels)
-    total_std = np.zeros(num_channels)
-    max_val, min_val = -np.inf, np.inf
-    count = 0
+def get_subject_name(pkl_path: Path) -> str:
+    """
+    优先从路径中抓 PNxx，例如：
+    dataset/Siena/processed_data/PN12/xxx.pkl
+    或者文件名里带 PN12。
+    """
+    text = str(pkl_path)
+    m = re.search(r"(PN\d+)", text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
 
-    for data in data_list:
-        with open(data["file"], 'rb') as f:
-            eeg = pickle.load(f)['X']
+    # 兜底：用 processed_data 后第一层目录名
+    try:
+        rel = pkl_path.relative_to(processed_data_path)
+        if len(rel.parts) > 1:
+            return rel.parts[0]
+    except Exception:
+        pass
 
-        max_val = max(max_val, eeg.max())
-        min_val = min(min_val, eeg.min())
-        total_mean += eeg.mean(axis=1)
-        total_std += eeg.std(axis=1)
-        count += 1
-
-    return (total_mean / count).tolist(), (total_std / count).tolist(), max_val, min_val
-
-
-def split_subject_data(subject_data, val_ratio=0.2):
-    """Split the data of a single subject into a validation set with class-balanced partitioning."""
-    label_to_data = defaultdict(list)
-    for data in subject_data:
-        label_to_data[data["label"]].append(data)
-
-    train_data, val_data = [], []
-    for label, data_list in label_to_data.items():
-        random.shuffle(data_list)
-        split_idx = int(len(data_list) * (1 - val_ratio))
-        train_data.extend(data_list[:split_idx])
-        val_data.extend(data_list[split_idx:])
-
-    return train_data, val_data
+    # 再兜底：用文件名前缀
+    return pkl_path.stem.split("_")[0].split("-")[0]
 
 
-def save_dataset(data_list, save_path, norm_params=None):
-    if norm_params is None:
-        print("Computing normalization parameters...")
-        mean, std, max_val, min_val = compute_normalization_params(data_list)
+def load_sample(pkl_path: Path):
+    with open(pkl_path, "rb") as f:
+        obj = pickle.load(f)
+
+    if "X" not in obj:
+        raise KeyError(f"{pkl_path} does not contain key 'X'")
+
+    X = np.asarray(obj["X"])
+
+    if "Y" in obj:
+        y = obj["Y"]
+    elif "label" in obj:
+        y = obj["label"]
     else:
-        mean, std, max_val, min_val = norm_params
+        raise KeyError(f"{pkl_path} does not contain key 'Y' or 'label'")
 
-    dataset = {
-        "subject_data": data_list,  # 只包含元数据
-        "dataset_info": {
-            "sampling_rate": sampling_rate,
-            "ch_names": ch_names,
-            "min": min_val,
-            "max": max_val,
-            "mean": mean,
-            "std": std
-        }
+    # label 转成 int，兼容 numpy/list/scalar
+    if isinstance(y, (list, tuple, np.ndarray)):
+        y = np.asarray(y).reshape(-1)[0]
+    y = int(y)
+
+    return X, y
+
+
+def build_items(pkl_files):
+    subject_id_map = {}
+    subject_id_counter = 0
+    items = []
+    label_counter = Counter()
+
+    first_shape = None
+
+    for p in pkl_files:
+        try:
+            X, y = load_sample(p)
+        except Exception as e:
+            print(f"[WARN] skip {p}: {e}")
+            continue
+
+        if X.ndim != 2:
+            print(f"[WARN] skip {p}: X shape is {X.shape}, expected 2D (channels, time)")
+            continue
+
+        subject_name = get_subject_name(p)
+        if subject_name not in subject_id_map:
+            subject_id_map[subject_name] = subject_id_counter
+            subject_id_counter += 1
+
+        if first_shape is None:
+            first_shape = X.shape
+
+        items.append({
+            "subject_id": subject_id_map[subject_name],
+            "subject_name": subject_name,
+            "file": str(p),
+            "label": y
+        })
+        label_counter[y] += 1
+
+    return items, subject_id_map, label_counter, first_shape
+
+
+def compute_stats(items):
+    if len(items) == 0:
+        raise RuntimeError("No items available for computing normalization stats.")
+
+    first_X, _ = load_sample(Path(items[0]["file"]))
+    num_channels = first_X.shape[0]
+
+    total_mean = np.zeros(num_channels, dtype=np.float64)
+    total_std = np.zeros(num_channels, dtype=np.float64)
+    max_value = -np.inf
+    min_value = np.inf
+    n = 0
+
+    for item in items:
+        X, _ = load_sample(Path(item["file"]))
+        if X.shape[0] != num_channels:
+            print(f"[WARN] channel mismatch, skip stats: {item['file']} shape={X.shape}")
+            continue
+
+        total_mean += X.mean(axis=-1)
+        total_std += X.std(axis=-1)
+        max_value = max(max_value, float(X.max()))
+        min_value = min(min_value, float(X.min()))
+        n += 1
+
+    if n == 0:
+        raise RuntimeError("No valid samples for stats.")
+
+    return {
+        "min": min_value,
+        "max": max_value,
+        "mean": (total_mean / n).tolist(),
+        "std": (total_std / n).tolist()
     }
 
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    with open(save_path, 'w') as f:
-        json.dump(dataset, f, indent=2)
-    print(f"Saved to {save_path}")
+
+def save_json(items, save_path, dataset_info):
+    data = {
+        "dataset_info": dataset_info,
+        "subject_data": items
+    }
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"Saved {save_path}, samples={len(items)}")
 
 
 def main():
-    subject_folders = natsorted(
-        os.path.join(processed_data_path, f)
-        for f in os.listdir(processed_data_path)
-        if f.startswith("PN") and os.path.isdir(os.path.join(processed_data_path, f))
-    )
+    pkl_files = sorted(processed_data_path.rglob("*.pkl"))
 
-    train_subjects = [s for s in subject_folders if int(os.path.basename(s)[2:]) <= 14]
-    test_subjects = [s for s in subject_folders if int(os.path.basename(s)[2:]) > 14]  # The last two subjects are PN16 and PN17.
+    print("processed_data_path:", processed_data_path)
+    print("total pkl files:", len(pkl_files))
 
-    all_train_data, all_val_data = [], []
-    for subject in train_subjects:
-        subject_data = load_subject_metadata(subject)
-        train_data, val_data = split_subject_data(subject_data)
-        all_train_data.extend(train_data)
-        all_val_data.extend(val_data)
+    if len(pkl_files) == 0:
+        raise RuntimeError(
+            "No pkl files found. Check whether data_process.py saved files under dataset/Siena/processed_data."
+        )
 
-    all_test_data = []
-    for subject in test_subjects:
-        all_test_data.extend(load_subject_metadata(subject))
+    all_items, subject_id_map, label_counter, first_shape = build_items(pkl_files)
 
-    print(f"\nData counts:")
-    print(f"Train: {len(all_train_data)}, Val: {len(all_val_data)}, Test: {len(all_test_data)}")
+    print("valid samples:", len(all_items))
+    print("subjects:", len(subject_id_map), sorted(subject_id_map.keys()))
+    print("label distribution:", dict(label_counter))
+    print("first X shape:", first_shape)
 
-    print("\nComputing normalization...")
-    norm_params = compute_normalization_params(all_train_data)
+    if len(all_items) == 0:
+        raise RuntimeError("No valid samples loaded from pkl files.")
 
-    print("\nSaving datasets...")
-    save_dataset(all_train_data, save_train_path, norm_params)
-    save_dataset(all_val_data, save_val_path, norm_params)
-    save_dataset(all_test_data, save_test_path, norm_params)
+    # 按 subject 切分，避免同一个病人的片段同时出现在 train/test
+    subjects = sorted(set(item["subject_name"] for item in all_items))
+    random.shuffle(subjects)
+
+    n_sub = len(subjects)
+    n_train = max(1, int(n_sub * 0.7))
+    n_val = max(1, int(n_sub * 0.15))
+
+    train_subjects = set(subjects[:n_train])
+    val_subjects = set(subjects[n_train:n_train + n_val])
+    test_subjects = set(subjects[n_train + n_val:])
+
+    # 如果 subject 太少导致 test 为空，就从 train 里挪一个
+    if len(test_subjects) == 0 and len(train_subjects) > 1:
+        moved = sorted(train_subjects)[-1]
+        train_subjects.remove(moved)
+        test_subjects.add(moved)
+
+    train_items = [x for x in all_items if x["subject_name"] in train_subjects]
+    val_items = [x for x in all_items if x["subject_name"] in val_subjects]
+    test_items = [x for x in all_items if x["subject_name"] in test_subjects]
+
+    print("train subjects:", sorted(train_subjects))
+    print("val subjects:", sorted(val_subjects))
+    print("test subjects:", sorted(test_subjects))
+    print("split sizes:", len(train_items), len(val_items), len(test_items))
+
+    if len(train_items) == 0:
+        raise RuntimeError("Train split is empty.")
+    if len(val_items) == 0:
+        print("[WARN] Val split is empty.")
+    if len(test_items) == 0:
+        print("[WARN] Test split is empty.")
+
+    stats = compute_stats(train_items)
+
+    # 从第一个样本估计采样率。Siena 日志看起来原始多为 512Hz。
+    first_X, _ = load_sample(Path(train_items[0]["file"]))
+    num_channels, num_points = first_X.shape
+    estimated_sampling_rate = int(round(num_points / SEGMENT_SECONDS))
+
+    if num_channels == 29:
+        ch_names = SIENA_CH_NAMES_29
+    else:
+        ch_names = [f"CH{i}" for i in range(num_channels)]
+
+    dataset_info = {
+        "sampling_rate": estimated_sampling_rate,
+        "ch_names": ch_names,
+        "min": stats["min"],
+        "max": stats["max"],
+        "mean": stats["mean"],
+        "std": stats["std"]
+    }
+
+    print("dataset_info sampling_rate:", estimated_sampling_rate)
+    print("dataset_info num_channels:", num_channels)
+    print("num_t should be:", num_points / estimated_sampling_rate)
+
+    save_json(train_items, save_train_path, dataset_info)
+    save_json(val_items, save_val_path, dataset_info)
+    save_json(test_items, save_test_path, dataset_info)
 
 
 if __name__ == "__main__":

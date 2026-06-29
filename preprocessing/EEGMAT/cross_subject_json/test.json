@@ -1,0 +1,792 @@
+{
+  "subject_data": [
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_1_1.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_1_2.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_1_3.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_1_4.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_1_5.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_1_6.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_1_7.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_1_8.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_1_9.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_1_10.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_1_11.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_1_12.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_1_13.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_1_14.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_1_15.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_2_1.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_2_2.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_2_3.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_2_4.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_2_5.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_2_6.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_2_7.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_2_8.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_2_9.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_2_10.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_2_11.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_2_12.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_2_13.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_2_14.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 32,
+      "subject_name": "Subject32",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject32\\Subject32_2_15.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_1_1.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_1_2.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_1_3.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_1_4.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_1_5.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_1_6.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_1_7.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_1_8.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_1_9.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_1_10.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_1_11.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_1_12.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_1_13.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_1_14.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_1_15.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_2_1.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_2_2.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_2_3.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_2_4.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_2_5.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_2_6.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_2_7.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_2_8.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_2_9.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_2_10.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_2_11.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_2_12.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_2_13.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_2_14.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 33,
+      "subject_name": "Subject33",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject33\\Subject33_2_15.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_1_1.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_1_2.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_1_3.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_1_4.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_1_5.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_1_6.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_1_7.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_1_8.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_1_9.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_1_10.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_1_11.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_1_12.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_1_13.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_1_14.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_1_15.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_2_1.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_2_2.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_2_3.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_2_4.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_2_5.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_2_6.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_2_7.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_2_8.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_2_9.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_2_10.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_2_11.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_2_12.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_2_13.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_2_14.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 34,
+      "subject_name": "Subject34",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject34\\Subject34_2_15.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_1_1.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_1_2.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_1_3.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_1_4.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_1_5.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_1_6.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_1_7.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_1_8.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_1_9.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_1_10.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_1_11.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_1_12.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_1_13.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_1_14.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_1_15.pkl",
+      "label": 0
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_2_1.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_2_2.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_2_3.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_2_4.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_2_5.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_2_6.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_2_7.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_2_8.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_2_9.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_2_10.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_2_11.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_2_12.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_2_13.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_2_14.pkl",
+      "label": 1
+    },
+    {
+      "subject_id": 35,
+      "subject_name": "Subject35",
+      "file": "D:\\code\\codepy\\EEG_code\\AdaBrain-Bench-main\\dataset\\EEGMAT/processed_data\\Subject35\\Subject35_2_15.pkl",
+      "label": 1
+    }
+  ],
+  "dataset_info": {
+    "sampling_rate": 500,
+    "ch_names": [
+      "Fp1",
+      "Fp2",
+      "F3",
+      "F4",
+      "F7",
+      "F8",
+      "T3",
+      "T4",
+      "C3",
+      "C4",
+      "T5",
+      "T6",
+      "P3",
+      "P4",
+      "O1",
+      "O2",
+      "Fz",
+      "Cz",
+      "Pz"
+    ],
+    "min": -0.000583248217638596,
+    "max": 0.00024169560203050766,
+    "mean": [
+      -3.396148373546053e-09,
+      -2.865531399325934e-08,
+      -4.419129023205701e-08,
+      -1.2688582971225804e-08,
+      -6.299401244082783e-08,
+      3.830641495039379e-08,
+      -2.9322747105196267e-08,
+      -4.4710396764267565e-09,
+      -1.646179516077129e-08,
+      -3.831239069526938e-08,
+      9.15525775618181e-09,
+      3.238130461696044e-08,
+      1.713106928892551e-08,
+      -1.763967791328492e-08,
+      1.5477869733126666e-08,
+      1.7846068002740497e-08,
+      -3.1846645707448836e-08,
+      -3.665691179695274e-08,
+      6.862707151403351e-09
+    ],
+    "std": [
+      1.0495749547752081e-05,
+      1.1442537152861526e-05,
+      9.682999372517386e-06,
+      9.902791418046363e-06,
+      9.261843653989857e-06,
+      9.681262555017162e-06,
+      8.588384992280961e-06,
+      9.797497906221291e-06,
+      9.877301643956848e-06,
+      1.021672099499788e-05,
+      7.787337845355346e-06,
+      9.071674385198825e-06,
+      1.059865998167581e-05,
+      1.118074136696318e-05,
+      1.1670002051617145e-05,
+      1.2682866679657286e-05,
+      1.0261838843876766e-05,
+      1.0274708172579928e-05,
+      1.1542567388455091e-05
+    ]
+  }
+}

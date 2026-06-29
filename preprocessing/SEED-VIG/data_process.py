@@ -14,9 +14,9 @@ import sys
 
 data_root = sys.argv[1]  
 print(f"Data root: {data_root}")
-raw_data_path = os.path.join(data_root,'SEED-VIG/raw_data/Raw_Data')
+raw_data_path = os.path.join(data_root,'SEED-VIG/Raw_Data')
 processed_data_path = os.path.join(data_root,'SEED-VIG/processed_data')
-label_path = os.path.join(data_root,'SEED-VIG/raw_data/perclos_labels')
+label_path = os.path.join(data_root,'SEED-VIG/perclos_labels')
 os.makedirs(processed_data_path, exist_ok=True)
 
 

@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.log
+*.zip
+
+dataset/
+checkpoints/
+finetuning_results/
+col_*/
+backup/
+backup_other/
+analysis_lora_atlas_*/
+analysis_moduleA_lifecycle_*/
+
+.venv/
+env/
+wandb/

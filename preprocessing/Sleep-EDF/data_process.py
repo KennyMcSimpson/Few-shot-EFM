@@ -29,7 +29,7 @@ label_path = np.asarray(label_path)
 
 name_list = []
 for i in range(len(data_path)):
-    subject_name = data_path[i].split("/")[-1].split(".")[0].split("-")[0][3:5]
+    subject_name = Path(data_path[i]).name.split(".")[0].split("-")[0][3:5]
     if subject_name not in name_list:
         name_list.append(subject_name)
 print(name_list)
@@ -45,7 +45,7 @@ fs = 100
 for i in range(len(data_path)):
     print("processing ", i, " / ", len(data_path))
     raw = mne.io.read_raw_edf(data_path[i], preload=True, stim_channel=None)    #7950000
-    data_name = data_path[i].split("/")[-1].split(".")[0].split("-")[0][3:5]
+    data_name = Path(data_path[i]).name.split(".")[0].split("-")[0][3:5]
     # raw = raw.resample(fs, n_jobs=5)
     raw = raw.filter(l_freq=0.1, h_freq=49.9)
     # raw = raw.notch_filter(50.0)

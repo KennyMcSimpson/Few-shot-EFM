@@ -1,0 +1,65 @@
+{
+  "BCI-IV-2A": {
+    "root": {
+      "multi": "./preprocessing/BCI-4-2A/multi_subject_json",
+      "cross": "./preprocessing/BCI-4-2A/multi_subject_json",
+      "fewshot": "./preprocessing/BCI-4-2A/multi_subject_json"
+    },
+    "num_classes": 4,
+    "num_t": 4
+  },
+  "EEGMAT": {
+    "root": {
+      "multi": "./preprocessing/EEGMAT/cross_subject_json",
+      "cross": "./preprocessing/EEGMAT/cross_subject_json",
+      "fewshot": "./preprocessing/EEGMAT/cross_subject_json"
+    },
+    "num_classes": 2,
+    "num_t": 4
+  },
+  "Sleep-EDF": {
+    "root": {
+      "multi": "./preprocessing/Sleep-EDF/cross_subject_json",
+      "cross": "./preprocessing/Sleep-EDF/cross_subject_json",
+      "fewshot": "./preprocessing/Sleep-EDF/cross_subject_json"
+    },
+    "num_classes": 5,
+    "num_t": 30
+  },
+  "HMC": {
+    "root": {
+      "multi": "./preprocessing/HMC/cross_subject_json",
+      "cross": "./preprocessing/HMC/cross_subject_json",
+      "fewshot": "./preprocessing/HMC/cross_subject_json"
+    },
+    "num_classes": 5,
+    "num_t": 30
+  },
+  "SEED-IV": {
+    "root": {
+      "multi": "./preprocessing/SEED-IV/cross_subject_json",
+      "cross": "./preprocessing/SEED-IV/cross_subject_json",
+      "fewshot": "./preprocessing/SEED-IV/cross_subject_json"
+    },
+    "num_classes": 4,
+    "num_t": 1
+  },
+  "TUEV": {
+    "root": {
+      "multi": "./preprocessing/TUEV/cross_subject_json",
+      "cross": "./preprocessing/TUEV/cross_subject_json",
+      "fewshot": "./preprocessing/TUEV/cross_subject_json"
+    },
+    "num_classes": 6,
+    "num_t": 5
+  },
+  "Siena": {
+    "root": {
+      "multi": "./preprocessing/Siena/cross_subject_json",
+      "cross": "./preprocessing/Siena/cross_subject_json",
+      "fewshot": "./preprocessing/Siena/cross_subject_json"
+    },
+    "num_classes": 2,
+    "num_t": 10
+  }
+}

@@ -56,7 +56,7 @@ for folder_id, per_folder in enumerate(subject_folder):
             error_list.append(pkl_file)
 
         data={
-            "subject_id": int(per_folder.split("/")[-1]),
+            "subject_id": int(os.path.basename(os.path.normpath(per_folder))),
             "subject_name": subject_name,
             "file": pkl_file,
             "label": label

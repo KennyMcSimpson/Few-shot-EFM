@@ -2,6 +2,7 @@ import mne
 import numpy as np
 import os
 import pickle
+import shutil
 from tqdm import tqdm
 import sys
 
@@ -10,18 +11,29 @@ https://github.com/Abhishaike/EEG_Event_Classification
 """
 
 
-data_root = sys.argv[1]  
+data_root = sys.argv[1]
 print(f"Data root: {data_root}")
-raw_data_path = os.path.join(data_root,'TUEV/raw_data/v2.0.1')
-processed_data_path = os.path.join(data_root,'TUEV/processed_data')
+
+# 你的真实 TUEV 原始数据路径：
+# dataset/tuh_eeg/tuh_eeg_events_v2.0.1/v2.0.1/edf/train
+# dataset/tuh_eeg/tuh_eeg_events_v2.0.1/v2.0.1/edf/eval
+raw_data_path = os.path.join(
+    data_root,
+    "tuh_eeg",
+    "tuh_eeg_events_v2.0.1",
+    "v2.0.1"
+)
+
+processed_data_path = os.path.join(data_root, "TUEV", "processed_data")
 os.makedirs(processed_data_path, exist_ok=True)
+
 train_dir = os.path.join(processed_data_path, "train_dir")
 eval_dir = os.path.join(processed_data_path, "eval_dir")
 test_dir = os.path.join(processed_data_path, "test_dir")
-if not os.path.exists(train_dir):
-    os.makedirs(train_dir)
-if not os.path.exists(test_dir):
-    os.makedirs(test_dir)
+
+os.makedirs(train_dir, exist_ok=True)
+os.makedirs(eval_dir, exist_ok=True)
+os.makedirs(test_dir, exist_ok=True)
 
   
 # final_data = os.path.join(processed_data_path, "final_data")
@@ -96,11 +108,10 @@ def load_up_objects(BaseDir, Features, OffendingChannels, Labels, OutDir):
             if fname[-4:] == ".edf":
                 print("\t%s" % fname)
                 try:
-                    [signals, times, event, Rawdata] = readEDF(
-                        dirName + "/" + fname
-                    )  # event is the .rec file in the form of an array
+                    edf_path = os.path.join(dirName, fname)
+                    [signals, times, event, Rawdata] = readEDF(edf_path)
                 except (ValueError, KeyError):
-                    print("something funky happened in " + dirName + "/" + fname)
+                    print("something funky happened in " + edf_path)
                     continue
                 signals, offending_channels, labels = BuildEvents(signals, times, event)
 
@@ -166,6 +177,6 @@ train_files = [f for f in train_files if f.split("_")[0] in train_sub]
 # for file in train_files:
 #     os.system(f"cp {os.path.join(train_dir, file)} {os.path.join(train_dir, file)}")
 for file in val_files:
-    os.system(f"cp {os.path.join(train_dir, file)} {os.path.join(eval_dir, file)}")
+    shutil.copy2(os.path.join(train_dir, file), os.path.join(eval_dir, file))
 # for file in test_files:
 #     os.system(f"cp {os.path.join(test_dir, file)} {os.path.join(final_test_dir, file)}")

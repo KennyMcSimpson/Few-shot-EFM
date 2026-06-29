@@ -5,12 +5,12 @@ import numpy as np
 from scipy.io import loadmat
 from tqdm import tqdm
 import mne
-
+import sys
 
 data_root = sys.argv[1]  
 print(f"Data root: {data_root}")
-raw_data_path = os.path.join(data_root,'SEED-IV/raw_data/Preprocessed_EEG')
-processed_data_path = os.path.join(data_root,'SEED-IV/processed_data')
+raw_data_path = os.path.join(data_root, 'SEED_IV/eeg_raw_data')
+processed_data_path = os.path.join(data_root, 'SEED_IV/processed_data')
 os.makedirs(processed_data_path, exist_ok=True)
 
 
@@ -22,7 +22,7 @@ SESSION_LABELS = {
     2: [2,1,3,0,0,2,0,2,3,3,2,3,2,0,1,1,2,1,0,3,0,1,3,1],
     3: [1,2,2,1,3,3,3,1,1,2,1,0,2,3,3,0,2,3,0,0,2,0,1,0]
 }
-SUBJECT_NAMES = [f"S{i}" for i in range(1, 16)]   # S1 … S15
+SUBJECT_NAMES = [str(i) for i in range(1, 16)]  # S1 … S15
 
 # ================= 2. 工具函数 =================
 def extract_trials(mat_path):
@@ -70,7 +70,7 @@ for sub_idx, sub_name in enumerate(tqdm(SUBJECT_NAMES, desc="Subject")):
     os.makedirs(sub_dir, exist_ok=True)
 
     for ses in [1, 2, 3]:
-        ses_dir = os.path.join(data_root, str(ses))
+        ses_dir = os.path.join(raw_data_path, str(ses))
         sub_num = sub_name.lstrip("S")
         mat_files = glob(os.path.join(ses_dir, f"{sub_num}_*.mat"))
         print(mat_files)

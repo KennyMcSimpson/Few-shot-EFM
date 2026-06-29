@@ -2,7 +2,7 @@ import json
 import os
 import pickle
 import numpy as np
-from natsort import natsorted
+# from natsort import natsorted
 from collections import defaultdict
 import random
 import sys
@@ -10,7 +10,7 @@ import sys
 
 data_root = sys.argv[1]  
 print(f"Data root: {data_root}")
-processed_data_path = os.path.join(data_root,'SEED-IV/processed_data')
+processed_data_path = os.path.join(data_root, 'SEED_IV/processed_data')
 data_split_path = './preprocessing/SEED-IV/cross_subject_json'
 os.makedirs(data_split_path, exist_ok=True)
 save_train_path = os.path.join(data_split_path, 'train.json')
@@ -29,14 +29,16 @@ ch_names = ['FP1', 'FPZ', 'FP2', 'AF3', 'AF4', 'F7', 'F5', 'F3', 'F1', 'FZ', 'F2
 num_channels = len(ch_names)
 num_labels = 4
 random.seed(42)  
-
+def natural_key(path):
+    name = os.path.basename(os.path.normpath(path))
+    return int(name) if name.isdigit() else name
 
 def load_subject_data(subject_folder):
     subject_data = []
-    subject_num = int(subject_folder.split("/")[-1])
+    subject_num = int(os.path.basename(os.path.normpath(subject_folder)))
     subject_name = str(subject_num + 1)
 
-    for file in natsorted(f for f in os.listdir(subject_folder) if f.endswith('.pkl')):
+    for file in sorted((f for f in os.listdir(subject_folder) if f.endswith('.pkl')), key=natural_key):
         try:
             with open(os.path.join(subject_folder, file), 'rb') as f:
                 eeg_data = pickle.load(f)
@@ -110,11 +112,20 @@ def save_dataset(data_list, save_path, norm_params=None):
 
 
 def main():
-    subject_folders = natsorted([os.path.join(processed_data_path, f) for f in os.listdir(processed_data_path)])
+    subject_folders = sorted(
+        [os.path.join(processed_data_path, f) for f in os.listdir(processed_data_path)],
+        key=natural_key
+    )
 
+    train_subjects = [
+        s for s in subject_folders
+        if int(os.path.basename(os.path.normpath(s))) <= 12
+    ]
 
-    train_subjects = [s for s in subject_folders if int(s.split('/')[-1]) <= 12]
-    test_subjects = [s for s in subject_folders if int(s.split('/')[-1]) > 12]
+    test_subjects = [
+        s for s in subject_folders
+        if int(os.path.basename(os.path.normpath(s))) > 12
+    ]
 
     all_train_data, all_val_data = [], []
     for sub_id, subject in enumerate(train_subjects):
