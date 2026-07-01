@@ -2,15 +2,31 @@ __pycache__/
 *.py[cod]
 *.log
 *.zip
+*.7z
+*.tar
+*.tar.gz
+*.rar
+*.bat
+*.cmd
+*.ps1
 
 dataset/
 checkpoints/
 finetuning_results/
 col_*/
+outputs/
+runner_logs/
 backup/
 backup_other/
 analysis_lora_atlas_*/
 analysis_moduleA_lifecycle_*/
+moduleE_dynA_*.log
+tuev_overlap_report.txt
+
+# Generated dataset split indexes. They contain local filesystem paths and
+# should be regenerated after preprocessing instead of committed.
+preprocessing/**/cross_subject_json/*.json
+preprocessing/**/multi_subject_json/*.json
 
 .venv/
 env/

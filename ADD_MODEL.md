@@ -1,125 +1,134 @@
-# Add a New Model
-New model can be added by following the steps.
+# Add a Backbone
 
----
+Few-shot EFM wraps each EEG foundation model behind a small adapter class so
+that the training loop can attach task heads, LoRA modules, diagnostics, and
+functional-block metadata in a consistent way.
 
-### 2. Re-define model to fit our framework
-First, place your model files in the `models/` folder. Next, make the following modifications in the python file `run_finetuning.py` (Take CBraMod as an example).
+This guide describes the minimal steps for adding a new backbone without
+changing the existing model behavior.
 
-**Modification 1**: Import the model
-   ```python
-   from models.cbramod import CBraMod
-   ```
+## 1. Add Model Code
 
-**Modification 2**: Create a model wrapper class **Ada_ModelX** that includes model-specific preprocessing and feedforward steps. The following is an example of **Ada_CBraMod**:
-   
-   <!-- **Step 1:** Create a wrapper class  -->
+Place the model implementation under `models/` or under `external/<name>/` if
+you are vendoring a third-party project. Keep third-party code isolated when
+possible.
 
-   <!-- Initialize the original model
+Example:
 
-   ```python
-   model = CBraMod()
-   ``` -->
+```text
+models/my_backbone.py
+external/MyBackbone/
+```
 
-   <!-- **Step 2:** *(Optional)* load pre-trained weights  
-   ```python
-   if from_pretrain:
-       print("Load ckpt from %s" % fintune_list[args.model_name])
-       model.load_state_dict(
-           torch.load(fintune_list[args.model_name], map_location=torch.device('cpu'))
-       )
-   ```
-   > `finetune_list` contains the mapping defined earlier; `from_pretrain` is passed later. -->
+## 2. Register Checkpoint Path
 
-   <!-- **Step 3:** Replace the original task head with `nn.Identity()` and register a new task head  
-   ```python
-   model.proj_out = nn.Identity()
-   self.task_head = nn.Identity()
-   ```
-   > The specific task head will be added later. -->
-
-   <!-- **Step 4:** Store the model and any additional modules; your original model is defined as `self.main_model`.  
-   ```python
-   self.main_model = model
-   ```
-   > If your model needs extra layers (e.g., EEGPT requires a 1-D convolution before the main model), add them here:  
-   ```python
-   self.chan_conv = Conv1dWithConstraint(len(ch_names), chans_num, 1, max_norm=1)
-   ``` -->
-
-   <!-- **Step 5:** Define the `forward()` method.  
-   > Implement the full pipeline from input to final output. We will directly use `output = model(input)` to obtain your model's output in subsequent steps. -->
-
-   <!-- For **CBraMod** the data must be reshaped to `[batch_size, channel, time, 200]`:  
-   ```python
-   def forward(self, x):
-       b, n, t = x.shape
-       x = x.reshape(b, n, -1, 200)
-       y = self.main_model(x)
-       return self.task_head(y) -->
-   <!-- ``` -->
-   <!-- > `y` is the raw output of your model, and the final result returned will be the value after passing through `self.task_head`. -->
+Add the expected local checkpoint filename to `finetune_list` in
+`run_finetuning.py`:
 
 ```python
-class Ada_CBraMod(nn.Module):
-    def __init__(self, args, from_pretrain=False):
+finetune_list = {
+    "MyBackbone": "./checkpoints/my_backbone.pth",
+}
+```
+
+Do not commit checkpoint files to Git.
+
+## 3. Write A Wrapper
+
+The wrapper should expose:
+
+- `self.main_model`: the pretrained backbone;
+- `self.task_head`: an `nn.Module` attached by `get_models()`;
+- `forward(x)`: input preprocessing, backbone call, task head call;
+- optional metadata such as `input_channels` when needed by adapter logic.
+
+Skeleton:
+
+```python
+class Ada_MyBackbone(nn.Module):
+    def __init__(self, args, ch_names, num_t, from_pretrain=False):
         super().__init__()
-        # step 1: initialize the model
-        model = CBraMod()
-        # step 2: load the pretrained weight (optional)
+        model = MyBackbone(...)
         if from_pretrain:
-            print("Load ckpt from %s" % fintune_list[args.model_name])
-            model.load_state_dict(
-                torch.load(fintune_list[args.model_name], map_location=torch.device('cpu'))
-            )
-        # step 3: remove the original task head  
-        model.proj_out = nn.Identity()
-        # step 4: register a new one, which will be specified later
-        self.task_head = nn.Identity()
-        # step 5: wrap the model
+            state = torch.load(finetune_list[args.model_name], map_location="cpu")
+            model.load_state_dict(state, strict=False)
         self.main_model = model
+        self.task_head = nn.Identity()
 
     def forward(self, x):
-        # step 6: adding model-specific preprocessing steps
-        b, n, t = x.shape
-        x = x.reshape(b, n, -1, 200)
-        # step 7: model input and output
-        output = self.main_model(x)
-        # step 8: raw output->task output
-        output = self.task_head(output)
-        return output
+        features = self.main_model(x)
+        return self.task_head(features)
 ```
 
----
+Keep model-specific reshaping inside the wrapper. The rest of the training
+code should not need to know the original model's private input convention.
 
-### 3. Instantiate Your Model for Different Tasks  
-In the `get_models()` function (`run_finetuning.py`), instantiate the model and attach the appropriate task head.
+## 4. Attach Task Heads
+
+Register the wrapper in `get_models()` in `run_finetuning.py`:
 
 ```python
-model = Ada_CBraMod(args)
-if args.task_mod == 'Classification':
-    model.task_head = LinearWithConstraint(
-        len(ch_names) * num_t * 200, args.nb_classes, max_norm=1, flatten=1
-    )
-elif args.task_mod == 'Regression':
-    model.task_head = RegressionLayers(
-        input_dim=(len(ch_names) * num_t) * 200,
-        hidden_dim=200,
-        output_dim=1,
-        flatten=1
-    )
-elif args.task_mod == 'Retrieval':
-    model.task_head = LinearWithConstraint(
-        len(ch_names) * num_t * 200, 1024, max_norm=1, flatten=1
-    )
+elif args.model_name == "MyBackbone":
+    model = Ada_MyBackbone(args, ch_names, num_t, from_pretrain=True)
+    if args.task_mod == "Classification":
+        model.task_head = LinearWithConstraint(hidden_dim, args.nb_classes, max_norm=1)
+    elif args.task_mod == "Regression":
+        model.task_head = RegressionLayers(hidden_dim, hidden_dim, 1)
+    elif args.task_mod == "Retrieval":
+        model.task_head = LinearWithConstraint(hidden_dim, 1024, max_norm=1)
 ```
 
-We provide two ready-made heads whose implementations can be found in `run_finetuning.py`.  
-Pick one according to the downstream task:
+Use the existing heads unless the backbone requires a different feature shape.
 
-| **Task Head**           | **Recommended For** |
-|:-----------------------:|:-------------------:|
-| `LinearWithConstraint`  | **Classification** and **Retrieval** |
-| `RegressionLayers`         | **Regression** |
+## 5. Add LoRA Target Mapping
 
-Both heads expose arguments that let you decide whether to **flatten**, **average**, **remove the cls_token**, or apply other pre-processing before the final projection.
+If the backbone should support LoRA, update the target resolution logic in
+`util/lora.py` and the functional-block registry in `util/fb_registry.py`.
+
+The goal is not just to name modules. Map modules to meaningful EEGFM
+functional regions such as:
+
+```text
+input_front
+spatial
+temporal
+spectral
+mixing
+semantic
+readout
+```
+
+This keeps adapter choices comparable across backbones.
+
+## 6. Check The Integration
+
+Run a short import or dry run before launching expensive experiments:
+
+```bash
+python run_finetuning.py \
+  --dataset TUEV \
+  --model_name MyBackbone \
+  --task_mod Classification \
+  --subject_mod fewshot \
+  --finetune_mod linear \
+  --epochs 1 \
+  --batch_size 2
+```
+
+For LoRA integration, also check:
+
+```bash
+python run_finetuning.py \
+  --dataset TUEV \
+  --model_name MyBackbone \
+  --task_mod Classification \
+  --subject_mod fewshot \
+  --finetune_mod lora \
+  --lora_target semantic \
+  --fb_enable \
+  --fb_probe \
+  --epochs 1 \
+  --batch_size 2
+```
+
+Use local data and local checkpoints. Do not commit generated outputs.
