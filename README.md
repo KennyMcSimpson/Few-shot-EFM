@@ -29,13 +29,12 @@ https://huggingface.co/datasets/KennySimpson/few-shot-EFM
 run_finetuning.py              Main training and evaluation entrypoint
 engine_for_finetuning.py       Training loop, evaluation, loss, calibration, lifecycle hooks
 module_a_lifecycle.py          Validation-only adapter lifecycle and adaptive-SWA utilities
-run_module_c_auto_pipeline.py  Diagnostic pipeline for Module C selection
 
 models/                        EEG model wrappers and backbone integrations
 util/lora.py                   LoRA injection and trainable-parameter control
 util/fb_*.py                   Functional-block registry, policy, probes, and collection
 util/module_b_*.py             Signal/input-side adaptation helpers
-util/module_c_*.py             Diagnostic selection and LoRA search helpers
+util/module_c_*.py             Zero-update Module C preflight selector and subset scoring
 util/module_d_*.py             Semantic refinement utilities
 util/module_e_*.py             Structural routing and pressure-guided helpers
 
@@ -157,14 +156,20 @@ python run_finetuning.py \
   --fb_collect
 ```
 
-Module-C diagnostic pipeline:
+Module-C zero-update preflight selection:
 
 ```bash
-python run_module_c_auto_pipeline.py \
+python run_finetuning.py \
   --dataset TUEV \
-  --model LaBraM \
+  --task_mod Classification \
+  --model_name LaBraM \
   --subject_mod fewshot \
-  --k_shot 0.05
+  --k_shot 0.05 \
+  --finetune_mod lora \
+  --lora_target module_c \
+  --module_c_candidates B,D,E \
+  --module_c_preflight_train_batches 4 \
+  --module_c_preflight_val_batches 4
 ```
 
 ## Reproducibility Notes
