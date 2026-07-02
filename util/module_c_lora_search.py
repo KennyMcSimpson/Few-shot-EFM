@@ -340,21 +340,87 @@ class ModuleCDecision:
     subset_scores: Dict[Tuple[str, ...], float]
     reason: str
     recipe: Dict[str, Any]
+    module_utility_breakdown: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    subset_score_breakdown: Dict[Tuple[str, ...], Dict[str, Any]] = field(default_factory=dict)
+
+
+def module_c_policy_config_dict(config: Optional[ModuleCPolicyConfig] = None) -> Dict[str, Any]:
+    """Return the fixed conservative priority weights used by Module C."""
+    config = config or ModuleCPolicyConfig()
+    return {
+        "pressure_weight": float(config.pressure_weight),
+        "hard_class_weight": float(config.hard_class_weight),
+        "train_val_agreement_weight": float(config.stability_weight),
+        "class_conflict_weight": float(config.class_conflict_weight),
+        "generalization_risk_weight": float(config.val_test_risk_weight),
+        "complexity_weight": float(config.complexity_weight),
+        "subset_size_weight": float(config.subset_size_weight),
+        "marginal_margin": float(config.marginal_margin),
+        "min_module_score": float(config.min_module_score),
+        "max_subset_size": config.max_subset_size,
+        "allow_empty": bool(config.allow_empty),
+        "weight_source": "fixed_conservative_priority_not_literature_derived",
+    }
+
+
+def module_utility_breakdown(
+    score: ModuleCScore,
+    config: Optional[ModuleCPolicyConfig] = None,
+) -> Dict[str, float]:
+    """Explain how one module utility is assembled without changing selection."""
+    config = config or ModuleCPolicyConfig()
+    pressure = float(score.pressure)
+    low_rank_fit = float(score.low_rank_fit)
+    hard_class_leverage = float(score.hard_class_leverage)
+    train_val_agreement = float(score.stability)
+    class_conflict = max(0.0, float(score.class_conflict))
+    generalization_risk = max(0.0, float(score.val_test_risk))
+    complexity = max(0.0, float(score.complexity))
+
+    pressure_low_rank_product = pressure * low_rank_fit
+    pressure_low_rank_contribution = config.pressure_weight * pressure_low_rank_product
+    hard_class_contribution = config.hard_class_weight * hard_class_leverage
+    train_val_agreement_contribution = config.stability_weight * train_val_agreement
+    class_conflict_penalty = -config.class_conflict_weight * class_conflict
+    generalization_risk_penalty = -config.val_test_risk_weight * generalization_risk
+    complexity_penalty = -config.complexity_weight * complexity
+    utility = (
+        pressure_low_rank_contribution
+        + hard_class_contribution
+        + train_val_agreement_contribution
+        + class_conflict_penalty
+        + generalization_risk_penalty
+        + complexity_penalty
+    )
+    return {
+        "pressure": pressure,
+        "low_rank_fit": low_rank_fit,
+        "pressure_low_rank_product": pressure_low_rank_product,
+        "hard_class_leverage": hard_class_leverage,
+        "train_val_agreement": train_val_agreement,
+        "class_conflict": class_conflict,
+        "generalization_risk": generalization_risk,
+        "val_test_risk_legacy_name": generalization_risk,
+        "complexity": complexity,
+        "pressure_weight": float(config.pressure_weight),
+        "hard_class_weight": float(config.hard_class_weight),
+        "train_val_agreement_weight": float(config.stability_weight),
+        "class_conflict_weight": float(config.class_conflict_weight),
+        "generalization_risk_weight": float(config.val_test_risk_weight),
+        "complexity_weight": float(config.complexity_weight),
+        "pressure_low_rank_contribution": pressure_low_rank_contribution,
+        "hard_class_contribution": hard_class_contribution,
+        "train_val_agreement_contribution": train_val_agreement_contribution,
+        "class_conflict_penalty": class_conflict_penalty,
+        "generalization_risk_penalty": generalization_risk_penalty,
+        "complexity_penalty": complexity_penalty,
+        "utility": float(utility),
+    }
 
 
 def module_utility(score: ModuleCScore, config: Optional[ModuleCPolicyConfig] = None) -> float:
     """Score a single module from pressure, LoRA fit, class leverage, and risks."""
-    config = config or ModuleCPolicyConfig()
-    pressure_term = float(score.pressure) * float(score.low_rank_fit)
-    value = (
-        config.pressure_weight * pressure_term
-        + config.hard_class_weight * float(score.hard_class_leverage)
-        + config.stability_weight * float(score.stability)
-        - config.class_conflict_weight * max(0.0, float(score.class_conflict))
-        - config.val_test_risk_weight * max(0.0, float(score.val_test_risk))
-        - config.complexity_weight * max(0.0, float(score.complexity))
-    )
-    return float(value)
+    return float(module_utility_breakdown(score, config)["utility"])
 
 
 def normalized_interaction_scores(
@@ -388,6 +454,34 @@ def score_subset(
     if len(normalized_subset) > 1:
         score -= config.subset_size_weight * float(len(normalized_subset) - 1)
     return float(score)
+
+
+def score_subset_breakdown(
+    subset: Sequence[str],
+    module_scores: Mapping[str, float],
+    interaction_scores: Optional[Mapping[Tuple[Any, Any], float]] = None,
+    config: Optional[ModuleCPolicyConfig] = None,
+) -> Dict[str, float]:
+    """Explain a subset score as utility sum, interaction term, and size penalty."""
+    config = config or ModuleCPolicyConfig()
+    normalized_subset = tuple(normalize_module_id(x) for x in subset)
+    interactions = normalized_interaction_scores(interaction_scores)
+    module_utility_sum = sum(float(module_scores[m]) for m in normalized_subset)
+    interaction_total = 0.0
+    for left, right in combinations(normalized_subset, 2):
+        interaction_total += interactions.get(_pair_key(left, right), 0.0)
+    subset_size_penalty = (
+        config.subset_size_weight * float(len(normalized_subset) - 1)
+        if len(normalized_subset) > 1
+        else 0.0
+    )
+    final_score = module_utility_sum + interaction_total - subset_size_penalty
+    return {
+        "module_utility_sum": float(module_utility_sum),
+        "interaction_total": float(interaction_total),
+        "subset_size_penalty": float(subset_size_penalty),
+        "final_subset_score": float(final_score),
+    }
 
 
 def _candidate_subsets(module_ids: Sequence[str], config: ModuleCPolicyConfig) -> Iterable[Tuple[str, ...]]:
@@ -434,6 +528,10 @@ def select_module_subset(
             continue
         raw_scores[module_id] = score
     utilities = {module_id: module_utility(score, config) for module_id, score in raw_scores.items()}
+    utility_breakdown = {
+        module_id: module_utility_breakdown(score, config)
+        for module_id, score in raw_scores.items()
+    }
     candidate_modules = sorted(raw_scores.keys())
     eligible = [m for m, score in utilities.items() if score >= config.min_module_score]
     if not eligible:
@@ -445,21 +543,50 @@ def select_module_subset(
             subset_scores={tuple(): 0.0},
             reason="no module passed min_module_score",
             recipe=recipe,
+            module_utility_breakdown=utility_breakdown,
+            subset_score_breakdown={tuple(): {"module_utility_sum": 0.0, "interaction_total": 0.0, "subset_size_penalty": 0.0, "final_subset_score": 0.0}},
         )
 
     subset_scores: Dict[Tuple[str, ...], float] = {}
     for subset in _candidate_subsets(sorted(eligible), config):
         subset_scores[subset] = score_subset(subset, utilities, interactions, config)
+    subset_breakdown: Dict[Tuple[str, ...], Dict[str, Any]] = {
+        subset: score_subset_breakdown(subset, utilities, interactions, config)
+        for subset in subset_scores.keys()
+    }
 
     ranked = sorted(subset_scores.items(), key=lambda item: (item[1], -len(item[0])), reverse=True)
     selected, selected_score = ranked[0]
     rejected_by_margin: List[Tuple[Tuple[str, ...], float, float]] = []
     for subset, value in ranked:
         proper_best = _best_proper_subset_score(subset, subset_scores)
+        if subset in subset_breakdown:
+            subset_breakdown[subset]["best_proper_subset_score"] = (
+                float(proper_best) if proper_best is not None else None
+            )
+            subset_breakdown[subset]["marginal_gain_over_best_proper_subset"] = (
+                float(value - proper_best) if proper_best is not None else None
+            )
+            subset_breakdown[subset]["accepted_by_margin"] = (
+                proper_best is None or value > proper_best + config.marginal_margin
+            )
         if proper_best is None or value > proper_best + config.marginal_margin:
             selected, selected_score = subset, value
             break
         rejected_by_margin.append((subset, value, proper_best))
+    for subset, value in subset_scores.items():
+        if "best_proper_subset_score" in subset_breakdown[subset]:
+            continue
+        proper_best = _best_proper_subset_score(subset, subset_scores)
+        subset_breakdown[subset]["best_proper_subset_score"] = (
+            float(proper_best) if proper_best is not None else None
+        )
+        subset_breakdown[subset]["marginal_gain_over_best_proper_subset"] = (
+            float(value - proper_best) if proper_best is not None else None
+        )
+        subset_breakdown[subset]["accepted_by_margin"] = (
+            proper_best is None or value > proper_best + config.marginal_margin
+        )
 
     recipe = build_module_c_recipe(selected, registry=registry, candidate_modules=candidate_modules, module_scores=utilities)
     reason = _selection_reason(selected, selected_score, interactions, rejected_by_margin)
@@ -470,6 +597,8 @@ def select_module_subset(
         subset_scores=subset_scores,
         reason=reason,
         recipe=recipe,
+        module_utility_breakdown=utility_breakdown,
+        subset_score_breakdown=subset_breakdown,
     )
 
 

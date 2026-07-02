@@ -27,6 +27,7 @@ from .module_c_lora_search import (
     ModuleCPolicyConfig,
     ModuleCScore,
     is_module_c_baseline_candidate,
+    module_c_policy_config_dict,
     parse_module_ids,
     select_module_subset,
 )
@@ -605,6 +606,8 @@ def _build_scores_and_interactions(
             "class_conflict": _clip01(conflict),
             "overfit_risk": overfit_risk,
             "val_test_risk": overfit_risk,
+            "generalization_risk": overfit_risk,
+            "train_val_mismatch_risk": overfit_risk,
             "complexity": complexity.get(module_id, 1.0),
             "train_grad_energy": train_energy[module_id],
             "val_grad_energy": val_energy[module_id],
@@ -668,6 +671,7 @@ def _write_decision_json(
     path: str,
     args: Any,
     decision: ModuleCDecision,
+    config: ModuleCPolicyConfig,
     diagnostics: Mapping[str, Mapping[str, Any]],
     interaction_scores: Mapping[Tuple[str, str], float],
     replaced_modules: Sequence[str],
@@ -687,11 +691,30 @@ def _write_decision_json(
         "selected_modules": list(decision.selected_modules),
         "selected_score": float(decision.selected_score),
         "reason": decision.reason,
+        "policy_config": {
+            **module_c_policy_config_dict(config),
+            "hard_k": max(1, int(getattr(args, "module_c_preflight_hard_k", 2))),
+            "train_batches": max(1, int(getattr(args, "module_c_preflight_train_batches", 1))),
+            "val_batches": max(1, int(getattr(args, "module_c_preflight_val_batches", 1))),
+            "max_profile_classes": max(0, int(getattr(args, "module_c_preflight_max_profile_classes", 8))),
+            "svd_max_numel": int(getattr(args, "module_c_preflight_svd_max_numel", 1000000)),
+            "interaction_complement_weight": 0.04,
+            "interaction_redundancy_weight": 0.04,
+            "interaction_redundancy_cosine_threshold": 0.85,
+            "train_val_pressure_gap_tolerance": 0.50,
+            "test_used_for_selection": 0,
+        },
         "module_scores": {k: float(v) for k, v in decision.module_scores.items()},
+        "module_utility_breakdown": decision.module_utility_breakdown,
         "subset_scores": {
             "+".join(key) if key else "none": float(value)
             for key, value in decision.subset_scores.items()
         },
+        "subset_score_breakdown": {
+            "+".join(key) if key else "none": value
+            for key, value in decision.subset_score_breakdown.items()
+        },
+        "selected_subset_breakdown": decision.subset_score_breakdown.get(tuple(decision.selected_modules), {}),
         "interaction_scores": {
             "+".join(key): float(value)
             for key, value in interaction_scores.items()
@@ -757,6 +780,9 @@ def run_module_c_preflight_selection(
             f"Module C preflight injected no probe adapters for model={getattr(args, 'model_name', '')}, "
             f"candidates={','.join(candidate_modules)}."
         )
+    # Probe adapters are registered after the disposable model is moved to the
+    # target device, so align newly inserted LoRA tensors before backprop.
+    model.to(device)
 
     param_to_module, adapter_param_counts, probe_param_counts = _build_param_to_module(
         model=model,
@@ -834,6 +860,9 @@ def run_module_c_preflight_selection(
         config=config,
         registry=DEFAULT_CANDIDATE_MODULES,
     )
+    for module_id, breakdown in decision.module_utility_breakdown.items():
+        if module_id in diagnostics:
+            diagnostics[module_id].update(breakdown)
 
     selected = tuple(decision.selected_modules)
     setattr(args, "module_c_enable", True)
@@ -862,7 +891,7 @@ def run_module_c_preflight_selection(
         ]
         _write_csv(score_path, score_rows)
         _write_csv(interaction_path, interaction_rows)
-        _write_decision_json(decision_path, args, decision, diagnostics, interaction_scores, replaced)
+        _write_decision_json(decision_path, args, decision, config, diagnostics, interaction_scores, replaced)
         print(f"[ModuleC] preflight scores saved to: {score_path}")
         print(f"[ModuleC] preflight decision saved to: {decision_path}")
 
