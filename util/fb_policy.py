@@ -27,11 +27,16 @@ def add_fb_args(parser):
     parser.add_argument("--module_c_preflight_train_batches", default=1, type=int, help="Number of train batches for Module C zero-update preflight.")
     parser.add_argument("--module_c_preflight_val_batches", default=1, type=int, help="Number of validation batches for Module C zero-update preflight.")
     parser.add_argument("--module_c_preflight_hard_k", default=2, type=int, help="Number of validation hard classes used by Module C preflight.")
-    parser.add_argument("--module_c_preflight_min_score", default=0.01, type=float, help="Minimum single-module utility required by Module C preflight selector.")
-    parser.add_argument("--module_c_preflight_margin", default=0.03, type=float, help="Marginal guard for adding extra modules in Module C preflight.")
+    parser.add_argument("--module_c_preflight_min_score", default=0.01, type=float, help="Minimum RGFS residual-burden marginal relief required to add a Module C action.")
+    parser.add_argument("--module_c_preflight_margin", default=0.03, type=float, help="RGFS tie tolerance; complexity is used only when marginal relief is indistinguishable within this margin.")
     parser.add_argument("--module_c_preflight_svd_max_numel", default=1000000, type=int, help="Maximum gradient tensor size used for Module C low-rank SVD fit; larger tensors are skipped.")
     parser.add_argument("--module_c_preflight_max_profile_classes", default=8, type=int, help="Maximum validation classes used for Module C interaction profiles.")
     parser.add_argument("--module_c_preflight_dropout", default=0.0, type=float, help="Dropout for temporary Module C probe LoRA branches.")
+    parser.add_argument("--module_c_probe_head_steps", default=3, type=int, help="Temporary head-only calibration steps on the disposable Module C probe model before RGFS gradients are measured.")
+    parser.add_argument("--module_c_probe_head_lr", default=1e-3, type=float, help="Learning rate for temporary Module C probe-head calibration.")
+    parser.add_argument("--module_c_rgfs_confidence_scale", default=0.20, type=float, help="Finite-sample cosine confidence margin scale used by RGFS relief/harm lower bounds.")
+    parser.add_argument("--module_c_rgfs_harm_threshold", default=0.05, type=float, help="Reliable negative relief threshold that blocks an action on high-burden classes.")
+    parser.add_argument("--module_c_rgfs_focus_ratio", default=0.80, type=float, help="Class burden ratio relative to uniform that defines RGFS focus classes.")
     return parser
 MODEL_DEFAULT_RECIPE={"BIOT":"sem_lif","LaBraM":"sem_lif","EEGPT":"sig_align","CBraMod":"str_mix","Gram":"gram_diag","CSBrain":"csb_diag","NeurIPT":"probe_only"}
 MODULE_B_METADATA_KEYS=("module_b_current","module_b_role","module_b_is_active","module_b_is_pure_isolation")

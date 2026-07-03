@@ -3,8 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from util.module_d_semantic_boundary_summary import build_semantic_boundary_summary
-from util.module_d_semantic_refinement import module_d_sbr_rows, write_module_d_sbr_eval
+from util.module_d_semantic_boundary_summary import build_semantic_boundary_summary, module_d_sbr_rows
 
 
 def _write_one_row(path, row):
@@ -14,6 +13,16 @@ def _write_one_row(path, row):
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))
         writer.writeheader()
         writer.writerow(row)
+
+
+def _write_rows(path, rows):
+    rows = [dict(row) for row in rows]
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _read_rows(path):
@@ -154,8 +163,8 @@ class ModuleDSemanticBoundarySummaryTest(unittest.TestCase):
             }
             _write_one_row(reference, reference_row)
             _write_one_row(capability, capability_row)
-            write_module_d_sbr_eval(
-                str(adapted_sbr),
+            _write_rows(
+                adapted_sbr,
                 module_d_sbr_rows(
                     reference_row=reference_row,
                     adapted_row=adapted_row,

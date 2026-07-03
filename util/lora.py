@@ -738,9 +738,9 @@ def _apply_lora_to_gram_module(
             should_replace = is_attn_linear or is_layer_fusion
             if should_replace and not _module_e_name_allowed(name, plan.module_e_allowed_names):
                 should_replace = False
-        elif plan.use_ffn and any(k in lower for k in ("mlp", "ffn", "fc", "linear")):
+        if not should_replace and plan.use_ffn and any(k in lower for k in ("mlp", "ffn", "fc", "linear")):
             should_replace = _layer_selected_for_ffn(name, lora_target, max_layer_idx)
-        elif plan.use_all_linear and lower.startswith("main_model."):
+        if not should_replace and plan.use_all_linear and lower.startswith("main_model."):
             should_replace = True
 
     if should_replace:

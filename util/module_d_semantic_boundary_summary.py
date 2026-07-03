@@ -12,10 +12,14 @@ try:
         module_d_sbr_rows,
     )
 except ImportError:  # pragma: no cover - allows direct script execution.
-    from module_d_semantic_refinement import (  # type: ignore
-        load_module_d_sbr_reference,
-        module_d_sbr_rows,
-    )
+    try:
+        from module_d_semantic_refinement import (  # type: ignore
+            load_module_d_sbr_reference,
+            module_d_sbr_rows,
+        )
+    except ImportError:  # pragma: no cover - supports pure CSV use without torch.
+        load_module_d_sbr_reference = None
+        module_d_sbr_rows = None
 
 
 SUMMARY_FILE_NAME = "module_d_semantic_boundary_summary.csv"
@@ -49,6 +53,162 @@ def _read_csv_rows(path: str) -> List[Dict[str, str]]:
         return []
     with open(path, newline="", encoding="utf-8-sig") as f:
         return list(csv.DictReader(f))
+
+
+def _norm_text(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _row_matches_optional(row: Mapping[str, Any], keys: Tuple[str, ...], expected: Any) -> bool:
+    expected_norm = _norm_text(expected)
+    if not expected_norm:
+        return True
+    seen = False
+    for key in keys:
+        value_norm = _norm_text(row.get(key, ""))
+        if not value_norm:
+            continue
+        seen = True
+        if value_norm == expected_norm:
+            return True
+    return not seen
+
+
+def _row_value(row: Mapping[str, Any], key: str) -> Any:
+    if key in row:
+        return row.get(key)
+    key_norm = key.lower()
+    for raw_key, value in row.items():
+        if str(raw_key).lower() == key_norm:
+            return value
+    return None
+
+
+def _fallback_load_module_d_sbr_reference(csv_path: str, model_name: Optional[Any] = None, reference_name: Optional[Any] = None) -> Dict[str, str]:
+    rows = _read_csv_rows(str(csv_path or ""))
+    if not rows:
+        raise FileNotFoundError(f"Module D SBR reference CSV has no rows: {csv_path}")
+    model_keys = ("model_name", "model", "foundation_model", "fm")
+    name_keys = ("reference_name", "name", "method", "run_tag", "tag", "adapter_target", "fb_recipe", "mode")
+    candidates = [
+        row for row in rows
+        if _row_matches_optional(row, model_keys, model_name)
+        and _row_matches_optional(row, name_keys, reference_name)
+    ]
+    if not candidates:
+        raise ValueError(f"No Module D SBR reference row matched model={model_name!r}, reference_name={reference_name!r} in {csv_path}")
+    return dict(candidates[-1])
+
+
+def _extract_split_recall(row: Mapping[str, Any], split: str, nb_classes: Optional[int] = None) -> List[Any]:
+    split_norm = str(split or "").strip().lower()
+    values: Dict[int, Any] = {}
+    prefixes: List[str] = []
+    if split_norm:
+        prefixes.extend((f"{split_norm}_class_", f"{split_norm}_class"))
+    if not split_norm or _norm_text(row.get("split", "")) == split_norm:
+        prefixes.extend(("class_", "class"))
+    for raw_key, value in row.items():
+        key = str(raw_key).strip().lower()
+        for prefix in prefixes:
+            if not key.startswith(prefix):
+                continue
+            tail = key[len(prefix):]
+            if tail.startswith("_"):
+                tail = tail[1:]
+            if tail.isdigit():
+                values[int(tail)] = value
+                break
+    if not values:
+        return []
+    count = max(values) + 1 if nb_classes is None or int(nb_classes) <= 0 else int(nb_classes)
+    return [values.get(i, float("nan")) for i in range(count)]
+
+
+def _extract_split_bacc(row: Mapping[str, Any], split: str) -> Optional[Any]:
+    split_norm = str(split or "").strip().lower()
+    keys: List[str] = []
+    if split_norm:
+        keys.extend((f"{split_norm}_balanced_accuracy", f"{split_norm}_balanced_acc", f"{split_norm}_bacc"))
+    if not split_norm or _norm_text(row.get("split", "")) == split_norm:
+        keys.extend(("balanced_accuracy", "balanced_acc", "bacc"))
+    for key in keys:
+        value = _row_value(row, key)
+        if _safe_float(value) is not None:
+            return value
+    return None
+
+
+def _mean(values: Iterable[float]) -> float:
+    vals = [float(v) for v in values]
+    return float(sum(vals) / len(vals)) if vals else 0.0
+
+
+def _fallback_sbr_result(reference_recall: List[Any], adapted_recall: List[Any], hard_k: int = 2, hard_classes: Optional[Tuple[int, ...]] = None, reference_bacc: Optional[Any] = None, adapted_bacc: Optional[Any] = None) -> Dict[str, Any]:
+    if len(reference_recall) != len(adapted_recall) or not reference_recall:
+        raise ValueError("SBR needs matching non-empty recall vectors.")
+    valid: List[int] = []
+    deltas: List[float] = []
+    for idx, (ref, adapted) in enumerate(zip(reference_recall, adapted_recall)):
+        ref_f = _safe_float(ref)
+        adapted_f = _safe_float(adapted)
+        if ref_f is None or adapted_f is None:
+            deltas.append(float("nan"))
+            continue
+        valid.append(idx)
+        deltas.append(float(adapted_f - ref_f))
+    if not valid:
+        raise ValueError("SBR needs at least one finite recall pair.")
+    if hard_classes is None:
+        hard = tuple(sorted(valid, key=lambda idx: (float(reference_recall[idx]), idx))[:max(1, int(hard_k))])
+    else:
+        hard = tuple(idx for idx in hard_classes if idx in valid)
+    stable = tuple(idx for idx in valid if idx not in set(hard))
+    hard_gain = _mean(deltas[idx] for idx in hard)
+    stable_loss = _mean(max(0.0, -deltas[idx]) for idx in stable)
+    ref_bacc = _safe_float(reference_bacc)
+    d_bacc = _safe_float(adapted_bacc)
+    return {
+        "hard_classes": ",".join(str(x) for x in hard),
+        "stable_classes": ",".join(str(x) for x in stable),
+        "hard_gain": float(hard_gain),
+        "stable_loss": float(stable_loss),
+        "sbr": float(hard_gain - stable_loss),
+        "reference_bacc": "" if ref_bacc is None else ref_bacc,
+        "adapted_bacc": "" if d_bacc is None else d_bacc,
+        "bacc_delta": "" if ref_bacc is None or d_bacc is None else float(d_bacc - ref_bacc),
+    }
+
+
+def _fallback_module_d_sbr_rows(reference_row: Mapping[str, Any], adapted_row: Mapping[str, Any], hard_k: int = 2, nb_classes: Optional[int] = None, model_name: str = "", run_tag: str = "", reference_source: str = "", reference_name: str = "", adapted_source: str = "", extra_metadata: Optional[Mapping[str, Any]] = None) -> Tuple[Dict[str, Any], ...]:
+    ref_val = _extract_split_recall(reference_row, "val", nb_classes=nb_classes)
+    adapted_val = _extract_split_recall(adapted_row, "val", nb_classes=nb_classes)
+    val_result = _fallback_sbr_result(ref_val, adapted_val, hard_k=hard_k, reference_bacc=_extract_split_bacc(reference_row, "val"), adapted_bacc=_extract_split_bacc(adapted_row, "val"))
+    metadata = {
+        "model_name": str(model_name or adapted_row.get("model_name", reference_row.get("model_name", ""))),
+        "run_tag": str(run_tag or adapted_row.get("run_tag", adapted_row.get("tag", ""))),
+        "reference_source": str(reference_source or ""),
+        "reference_name": str(reference_name or reference_row.get("reference_name", "")),
+        "adapted_source": str(adapted_source or ""),
+        "score_is_validation_only": 1,
+        "test_used_for_hard_class_selection": 0,
+    }
+    if extra_metadata:
+        metadata.update(dict(extra_metadata))
+    rows = [dict(metadata, split="val", **val_result)]
+    ref_test = _extract_split_recall(reference_row, "test", nb_classes=nb_classes)
+    adapted_test = _extract_split_recall(adapted_row, "test", nb_classes=nb_classes)
+    if ref_test and adapted_test:
+        hard_classes = tuple(int(x) for x in str(val_result["hard_classes"]).split(",") if str(x).strip())
+        test_result = _fallback_sbr_result(ref_test, adapted_test, hard_k=hard_k, hard_classes=hard_classes, reference_bacc=_extract_split_bacc(reference_row, "test"), adapted_bacc=_extract_split_bacc(adapted_row, "test"))
+        rows.append(dict(metadata, split="test", **test_result))
+    return tuple(rows)
+
+
+if load_module_d_sbr_reference is None:
+    load_module_d_sbr_reference = _fallback_load_module_d_sbr_reference
+if module_d_sbr_rows is None:
+    module_d_sbr_rows = _fallback_module_d_sbr_rows
 
 
 def _looks_like_sbr_eval(rows: Iterable[Mapping[str, Any]]) -> bool:

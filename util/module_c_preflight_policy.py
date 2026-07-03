@@ -2,9 +2,9 @@
 # Module C: zero-update preflight LoRA module selector.
 #
 # This file turns Module C from an offline candidate-training replay into a
-# cheap pre-training policy. It inserts temporary probe adapters, measures
-# gradient pressure on train/validation batches, writes interpretable
-# diagnostics, and lets module_c_lora_search pick the final B/D/E subset.
+# cheap pre-training policy. It calibrates the disposable task head, inserts
+# temporary probe adapters, measures signed class-wise relief, writes
+# interpretable diagnostics, and lets RGFS pick the final B/D/E subset.
 # --------------------------------------------------------
 
 from __future__ import annotations
@@ -23,13 +23,15 @@ import torch.nn as nn
 from .lora import apply_lora_to_eegfm, freeze_all_parameters
 from .module_c_lora_search import (
     DEFAULT_CANDIDATE_MODULES,
-    ModuleCDecision,
-    ModuleCPolicyConfig,
-    ModuleCScore,
+    build_module_c_recipe,
     is_module_c_baseline_candidate,
-    module_c_policy_config_dict,
     parse_module_ids,
-    select_module_subset,
+)
+from .module_c_rgfs_policy import (
+    RGFSConfig,
+    RGFSDecision,
+    rgfs_config_dict,
+    select_rgfs_subset,
 )
 from .module_e_structural_routing import (
     module_e_module_prefix_from_name,
@@ -37,21 +39,25 @@ from .module_e_structural_routing import (
 )
 
 
-MODULE_C_PREFLIGHT_SELECTION_RULE = "zero_update_preflight_no_test"
+MODULE_C_PREFLIGHT_SELECTION_RULE = "rgfs_zero_update_preflight_no_test"
 MODULE_C_PREFLIGHT_SCORE_FILE = "module_c_preflight_scores.csv"
 MODULE_C_PREFLIGHT_INTERACTION_FILE = "module_c_preflight_interactions.csv"
 MODULE_C_PREFLIGHT_DECISION_FILE = "module_c_preflight_decision.json"
+MODULE_C_RGFS_RELIEF_FILE = "module_c_rgfs_relief.csv"
+MODULE_C_ACTION_OVERLAP_FILE = "module_c_action_overlap.json"
 
 
 @dataclass(frozen=True)
 class ModuleCPreflightResult:
-    decision: ModuleCDecision
+    decision: RGFSDecision
     diagnostics_by_module: Mapping[str, Mapping[str, Any]]
     interaction_scores: Mapping[Tuple[str, str], float]
     replaced_modules: Tuple[str, ...]
     score_csv_path: str = ""
     interaction_csv_path: str = ""
     decision_json_path: str = ""
+    relief_csv_path: str = ""
+    action_overlap_json_path: str = ""
 
 
 def _is_module_c_execution_target(target: Any) -> bool:
@@ -370,6 +376,49 @@ def _forward_loss(model: nn.Module, samples: torch.Tensor, targets: torch.Tensor
     return criterion(output, targets)
 
 
+def _calibrate_probe_head(
+    args: Any,
+    model: nn.Module,
+    batches: Sequence[Sequence[Any]],
+    device: torch.device,
+    criterion: nn.Module,
+) -> int:
+    """Briefly fit only the disposable task head before measuring RGFS evidence."""
+    steps = max(0, int(getattr(args, "module_c_probe_head_steps", 3)))
+    if steps <= 0 or not batches or not hasattr(model, "task_head"):
+        return 0
+
+    freeze_all_parameters(model)
+    params = []
+    for param in model.task_head.parameters():
+        param.requires_grad_(True)
+        params.append(param)
+    if not params:
+        return 0
+
+    lr = float(getattr(args, "module_c_probe_head_lr", 1e-3))
+    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
+    original_training = bool(model.training)
+    completed = 0
+    try:
+        model.train(True)
+        for step in range(steps):
+            batch = batches[step % len(batches)]
+            samples, targets, _labels = _prepare_batch(args, batch, device)
+            optimizer.zero_grad(set_to_none=True)
+            loss = _forward_loss(model, samples, targets, criterion)
+            if not torch.isfinite(loss.detach()):
+                raise RuntimeError(f"Module C probe-head calibration produced non-finite loss: {float(loss.detach().cpu())}")
+            loss.backward()
+            optimizer.step()
+            completed += 1
+    finally:
+        optimizer.zero_grad(set_to_none=True)
+        model.zero_grad(set_to_none=True)
+        model.train(original_training)
+    return completed
+
+
 def _backward_batches(
     args: Any,
     model: nn.Module,
@@ -519,135 +568,214 @@ def _complexity_values(adapter_param_counts: Mapping[str, int], candidate_module
     }
 
 
-def _build_scores_and_interactions(
+def _filter_named_vectors(vectors: Mapping[str, torch.Tensor], kind: str) -> Dict[str, torch.Tensor]:
+    out: Dict[str, torch.Tensor] = {}
+    want_lora = str(kind).lower() == "lora"
+    for name, vector in vectors.items():
+        lower = str(name or "").lower()
+        is_lora = "lora_" in lower or lower.endswith("lora_a") or lower.endswith("lora_b")
+        if want_lora == is_lora:
+            out[name] = vector
+    return out
+
+
+def _confidence_margin(args: Any, seen: int) -> float:
+    scale = max(0.0, float(getattr(args, "module_c_rgfs_confidence_scale", 0.20)))
+    if seen <= 0:
+        return 1.0
+    return float(min(0.50, scale / math.sqrt(float(seen))))
+
+
+def _low_rank_fit_from_snapshot(snapshot: Mapping[str, Any]) -> float:
+    lrf_energy = float(snapshot.get("lrf_energy", 0.0))
+    if lrf_energy <= 0.0:
+        return 1.0
+    return _clip01(float(snapshot.get("lrf_weighted", 0.0)) / lrf_energy, default=1.0)
+
+
+def _class_burden_from_loss(class_loss_mean: Mapping[int, float]) -> Dict[int, float]:
+    losses = {int(cls): max(0.0, float(loss)) for cls, loss in class_loss_mean.items()}
+    total = sum(losses.values())
+    if total <= 0.0 and losses:
+        uniform = 1.0 / float(len(losses))
+        return {cls: uniform for cls in losses}
+    if total <= 0.0:
+        return {}
+    return {cls: float(loss / total) for cls, loss in losses.items()}
+
+
+def _class_gradient_snapshots(
+    args: Any,
+    model: nn.Module,
+    batches: Sequence[Sequence[Any]],
+    device: torch.device,
+    criterion: nn.Module,
+    param_to_module: Mapping[str, str],
+    candidate_modules: Sequence[str],
+    rank: int,
+    svd_max_numel: int,
+    classes: Sequence[int],
+) -> Tuple[Dict[int, Dict[str, Dict[str, Any]]], Dict[int, int]]:
+    snapshots: Dict[int, Dict[str, Dict[str, Any]]] = {}
+    seen_by_class: Dict[int, int] = {}
+    max_classes = max(0, int(getattr(args, "module_c_preflight_max_profile_classes", 8)))
+    for cls in _as_list(classes)[:max_classes]:
+        snap, seen = _backward_batches(
+            args=args,
+            model=model,
+            batches=batches,
+            device=device,
+            criterion=criterion,
+            param_to_module=param_to_module,
+            candidate_modules=candidate_modules,
+            rank=rank,
+            svd_max_numel=svd_max_numel,
+            class_filter=(int(cls),),
+        )
+        if seen <= 0:
+            continue
+        snapshots[int(cls)] = snap
+        seen_by_class[int(cls)] = int(seen)
+    return snapshots, seen_by_class
+
+
+def _cosine_float_vectors(left: Mapping[int, float], right: Mapping[int, float], classes: Sequence[int]) -> float:
+    return _profile_cosine(left, right, classes)
+
+
+def _build_rgfs_evidence(
     args: Any,
     candidate_modules: Sequence[str],
     train_snap: Mapping[str, Mapping[str, Any]],
     train_seen: int,
     val_snap: Mapping[str, Mapping[str, Any]],
     val_seen: int,
-    hard_snap: Mapping[str, Mapping[str, Any]],
-    hard_seen: int,
-    stable_snap: Mapping[str, Mapping[str, Any]],
-    stable_seen: int,
+    class_snaps: Mapping[int, Mapping[str, Mapping[str, Any]]],
+    class_seen: Mapping[int, int],
     hard_classes: Sequence[int],
     class_counts: Mapping[int, int],
     class_loss_mean: Mapping[int, float],
-    class_profiles: Mapping[str, Mapping[int, float]],
     adapter_param_counts: Mapping[str, int],
     probe_param_counts: Mapping[str, int],
-) -> Tuple[List[ModuleCScore], Dict[str, Dict[str, Any]], Dict[Tuple[str, str], float]]:
-    del args
-    train_energy = {
-        m: float(train_snap[m]["energy"]) / max(1, train_seen)
-        for m in candidate_modules
-    }
-    val_energy = {
-        m: float(val_snap[m]["energy"]) / max(1, val_seen)
-        for m in candidate_modules
-    }
-    hard_energy = {
-        m: float(hard_snap[m]["energy"]) / max(1, hard_seen)
-        for m in candidate_modules
-    }
-    stable_energy = {
-        m: float(stable_snap[m]["energy"]) / max(1, stable_seen)
-        for m in candidate_modules
-    }
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[Tuple[str, str], float], List[Dict[str, Any]], Dict[int, float], Dict[str, Dict[int, float]], Dict[str, Dict[int, float]], Dict[str, float], Dict[str, Any]]:
+    class_ids = tuple(sorted(int(cls) for cls in class_loss_mean.keys()))
+    burden = _class_burden_from_loss(class_loss_mean)
+    train_energy = {m: float(train_snap[m]["energy"]) / max(1, train_seen) for m in candidate_modules}
+    val_energy = {m: float(val_snap[m]["energy"]) / max(1, val_seen) for m in candidate_modules}
     per_param = {
         m: (train_energy[m] + val_energy[m]) / max(1, int(probe_param_counts.get(m, 0)))
         for m in candidate_modules
     }
     max_pressure = max([v for v in per_param.values() if v > 0.0], default=0.0)
     complexity = _complexity_values(adapter_param_counts, candidate_modules)
-    hard_samples = sum(int(class_counts.get(int(cls), 0)) for cls in hard_classes)
-    reliability = min(1.0, float(hard_samples) / max(1.0, float(sum(class_counts.values()) or 1)))
 
-    scores: List[ModuleCScore] = []
+    relief_lcb: Dict[str, Dict[int, float]] = {m: {} for m in candidate_modules}
+    harm_lcb: Dict[str, Dict[int, float]] = {m: {} for m in candidate_modules}
+    relief_rows: List[Dict[str, Any]] = []
     diagnostics: Dict[str, Dict[str, Any]] = {}
-    for module_id in candidate_modules:
-        mps = 0.0 if max_pressure <= 0.0 else per_param[module_id] / max_pressure
-        lrf_energy = float(train_snap[module_id].get("lrf_energy", 0.0))
-        lrf = (
-            float(train_snap[module_id].get("lrf_weighted", 0.0)) / lrf_energy
-            if lrf_energy > 0.0
-            else 1.0
-        )
-        tva_raw = _cosine_named_vectors(
-            train_snap[module_id].get("vectors", {}),
-            val_snap[module_id].get("vectors", {}),
-        )
-        stability = max(0.0, tva_raw)
-        hard_total = hard_energy[module_id]
-        val_total = max(val_energy[module_id], 1e-12)
-        hcl = _clip01((hard_total / val_total) * reliability)
-        hard_stable_cos = _cosine_named_vectors(
-            hard_snap[module_id].get("vectors", {}),
-            stable_snap[module_id].get("vectors", {}),
-        )
-        conflict = max(0.0, -hard_stable_cos)
-        pressure_gap = abs(train_energy[module_id] - val_energy[module_id]) / max(
-            train_energy[module_id] + val_energy[module_id],
-            1e-12,
-        )
-        overfit_risk = max(0.0, pressure_gap - 0.50) + max(0.0, -tva_raw)
-        overfit_risk = _clip01(overfit_risk)
 
-        diag = {
+    for module_id in candidate_modules:
+        lrf = _low_rank_fit_from_snapshot(train_snap[module_id])
+        train_vectors = train_snap[module_id].get("vectors", {})
+        val_vectors = val_snap[module_id].get("vectors", {})
+        train_val_cos = _cosine_named_vectors(train_vectors, val_vectors)
+        module_relief_sum = 0.0
+        module_harm_sum = 0.0
+        signed_lora_cos_by_class: Dict[int, float] = {}
+        signed_base_cos_by_class: Dict[int, float] = {}
+
+        for cls in class_ids:
+            cls_snap = class_snaps.get(int(cls), {})
+            cls_module_snap = cls_snap.get(module_id, {}) if cls_snap else {}
+            cls_vectors = cls_module_snap.get("vectors", {}) if cls_module_snap else {}
+            seen = int(class_seen.get(int(cls), 0))
+            margin = _confidence_margin(args, seen)
+
+            base_cos = _cosine_named_vectors(
+                _filter_named_vectors(train_vectors, "base"),
+                _filter_named_vectors(cls_vectors, "base"),
+            )
+            lora_cos = _cosine_named_vectors(
+                _filter_named_vectors(train_vectors, "lora"),
+                _filter_named_vectors(cls_vectors, "lora"),
+            )
+            base_lcb = base_cos - margin
+            base_ucb = base_cos + margin
+            lora_lcb = lora_cos - margin
+            lora_ucb = lora_cos + margin
+            relief = max(0.0, lrf * max(0.0, base_lcb), max(0.0, lora_lcb))
+            harm = max(0.0, -base_ucb, -lora_ucb)
+            relief_lcb[module_id][int(cls)] = float(relief)
+            harm_lcb[module_id][int(cls)] = float(harm)
+            module_relief_sum += float(burden.get(int(cls), 0.0)) * float(relief)
+            module_harm_sum += float(burden.get(int(cls), 0.0)) * float(harm)
+            signed_lora_cos_by_class[int(cls)] = float(lora_cos)
+            signed_base_cos_by_class[int(cls)] = float(base_cos)
+            relief_rows.append(
+                {
+                    "module_id": module_id,
+                    "class_id": int(cls),
+                    "class_count": int(class_counts.get(int(cls), 0)),
+                    "class_probe_batches": int(seen),
+                    "class_loss_mean": float(class_loss_mean.get(int(cls), 0.0)),
+                    "class_burden": float(burden.get(int(cls), 0.0)),
+                    "confidence_margin": float(margin),
+                    "low_rank_fit": float(lrf),
+                    "base_signed_cosine": float(base_cos),
+                    "base_relief_lcb": float(base_lcb),
+                    "lora_tangent_signed_cosine": float(lora_cos),
+                    "lora_tangent_relief_lcb": float(lora_lcb),
+                    "relief_lcb": float(relief),
+                    "harm_lcb": float(harm),
+                    "class_grad_energy": float(cls_module_snap.get("energy", 0.0)) / max(1, seen) if cls_module_snap else 0.0,
+                    "selection_rule": MODULE_C_PREFLIGHT_SELECTION_RULE,
+                    "test_used_for_selection": 0,
+                }
+            )
+
+        pressure_norm = 0.0 if max_pressure <= 0.0 else per_param[module_id] / max_pressure
+        pressure_gap = abs(train_energy[module_id] - val_energy[module_id]) / max(train_energy[module_id] + val_energy[module_id], 1e-12)
+        diagnostics[module_id] = {
             "module_id": module_id,
             "metric_source": MODULE_C_PREFLIGHT_SELECTION_RULE,
             "test_used_for_selection": 0,
-            "pressure": _clip01(mps),
+            "pressure": _clip01(pressure_norm),
             "module_pressure_raw": per_param[module_id],
-            "low_rank_fit": _clip01(lrf, default=1.0),
-            "hard_class_leverage": hcl,
-            "train_val_agreement": stability,
-            "stability": stability,
-            "class_conflict": _clip01(conflict),
-            "overfit_risk": overfit_risk,
-            "val_test_risk": overfit_risk,
-            "generalization_risk": overfit_risk,
-            "train_val_mismatch_risk": overfit_risk,
+            "low_rank_fit": float(lrf),
+            "train_val_signed_cosine": float(train_val_cos),
+            "train_val_agreement": max(0.0, float(train_val_cos)),
+            "train_val_mismatch_risk": _clip01(max(0.0, pressure_gap - 0.50) + max(0.0, -train_val_cos)),
+            "rgfs_weighted_relief": float(module_relief_sum),
+            "rgfs_weighted_harm": float(module_harm_sum),
             "complexity": complexity.get(module_id, 1.0),
             "train_grad_energy": train_energy[module_id],
             "val_grad_energy": val_energy[module_id],
-            "hard_grad_energy": hard_energy[module_id],
-            "stable_grad_energy": stable_energy[module_id],
             "adapter_param_count": int(adapter_param_counts.get(module_id, 0)),
             "probe_param_count": int(probe_param_counts.get(module_id, 0)),
-            "hard_classes": ",".join(str(x) for x in hard_classes),
-            "hard_class_sample_count": int(hard_samples),
-            "hard_class_reliability": reliability,
+            "hard_classes_by_loss": ",".join(str(x) for x in hard_classes),
             "class_loss_mean": json.dumps({str(k): v for k, v in sorted(class_loss_mean.items())}, ensure_ascii=False),
+            "class_burden": json.dumps({str(k): v for k, v in sorted(burden.items())}, ensure_ascii=False),
+            "relief_lcb_by_class": json.dumps({str(k): v for k, v in sorted(relief_lcb[module_id].items())}, ensure_ascii=False),
+            "harm_lcb_by_class": json.dumps({str(k): v for k, v in sorted(harm_lcb[module_id].items())}, ensure_ascii=False),
+            "signed_lora_cos_by_class": json.dumps({str(k): v for k, v in sorted(signed_lora_cos_by_class.items())}, ensure_ascii=False),
+            "signed_base_cos_by_class": json.dumps({str(k): v for k, v in sorted(signed_base_cos_by_class.items())}, ensure_ascii=False),
         }
-        diagnostics[module_id] = diag
-        scores.append(
-            ModuleCScore(
-                module_id=module_id,
-                pressure=diag["pressure"],
-                low_rank_fit=diag["low_rank_fit"],
-                hard_class_leverage=diag["hard_class_leverage"],
-                class_conflict=diag["class_conflict"],
-                stability=diag["stability"],
-                val_test_risk=diag["val_test_risk"],
-                complexity=diag["complexity"],
-                metadata=diag,
-            )
-        )
 
-    interaction_scores: Dict[Tuple[str, str], float] = {}
-    profile_classes = sorted({int(cls) for profile in class_profiles.values() for cls in profile.keys()})
+    overlap_scores: Dict[Tuple[str, str], float] = {}
+    overlap_payload: Dict[str, Any] = {"selection_rule": MODULE_C_PREFLIGHT_SELECTION_RULE, "pairs": []}
     for left, right in combinations(candidate_modules, 2):
-        cos = _profile_cosine(class_profiles.get(left, {}), class_profiles.get(right, {}), profile_classes)
-        complement = max(0.0, 1.0 - cos)
-        redundancy = max(0.0, cos - 0.85)
-        pressure_floor = min(
-            diagnostics[left]["pressure"],
-            diagnostics[right]["pressure"],
+        cos = _cosine_float_vectors(relief_lcb.get(left, {}), relief_lcb.get(right, {}), class_ids)
+        overlap_scores[(left, right)] = float(cos)
+        overlap_payload["pairs"].append(
+            {
+                "left_module": left,
+                "right_module": right,
+                "relief_profile_cosine": float(cos),
+                "redundancy_level": "high" if cos >= 0.85 else "low",
+                "complementarity_level": "high" if cos <= 0.35 else "medium" if cos <= 0.70 else "low",
+            }
         )
-        interaction = 0.04 * complement * pressure_floor - 0.04 * redundancy
-        interaction_scores[(left, right)] = float(max(-0.06, min(0.06, interaction)))
-    return scores, diagnostics, interaction_scores
+    return diagnostics, overlap_scores, relief_rows, burden, relief_lcb, harm_lcb, complexity, overlap_payload
 
 
 def _write_csv(path: str, rows: Sequence[Mapping[str, Any]]) -> Optional[str]:
@@ -667,18 +795,53 @@ def _write_csv(path: str, rows: Sequence[Mapping[str, Any]]) -> Optional[str]:
     return path
 
 
-def _write_decision_json(
-    path: str,
-    args: Any,
-    decision: ModuleCDecision,
-    config: ModuleCPolicyConfig,
-    diagnostics: Mapping[str, Mapping[str, Any]],
-    interaction_scores: Mapping[Tuple[str, str], float],
-    replaced_modules: Sequence[str],
-) -> Optional[str]:
+def _write_json(path: str, payload: Mapping[str, Any]) -> Optional[str]:
     if not path:
         return None
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return path
+
+
+def _write_decision_json(
+    path: str,
+    args: Any,
+    decision: RGFSDecision,
+    diagnostics: Mapping[str, Mapping[str, Any]],
+    overlap_scores: Mapping[Tuple[str, str], float],
+    action_overlap: Mapping[str, Any],
+    replaced_modules: Sequence[str],
+    relief_csv_path: str = "",
+    action_overlap_json_path: str = "",
+) -> Optional[str]:
+    if not path:
+        return None
+    candidate_modules = parse_module_ids(getattr(args, "module_c_candidates", "B,D,E"))
+    recipe = build_module_c_recipe(
+        decision.selected_modules,
+        registry=DEFAULT_CANDIDATE_MODULES,
+        candidate_modules=candidate_modules,
+        module_scores={m: decision.candidate_decisions.get(m, {}).get("focus_marginal_gain", 0.0) for m in candidate_modules},
+    )
+    policy_config = {
+        **rgfs_config_dict(
+            RGFSConfig(
+                min_marginal_gain=float(getattr(args, "module_c_preflight_min_score", 0.01)),
+                tie_tolerance=float(getattr(args, "module_c_preflight_margin", 0.03)),
+                harm_veto_threshold=float(getattr(args, "module_c_rgfs_harm_threshold", 0.05)),
+                focus_burden_ratio=float(getattr(args, "module_c_rgfs_focus_ratio", 0.80)),
+                allow_empty=True,
+            )
+        ),
+        "train_batches": max(1, int(getattr(args, "module_c_preflight_train_batches", 1))),
+        "val_batches": max(1, int(getattr(args, "module_c_preflight_val_batches", 1))),
+        "probe_head_steps": max(0, int(getattr(args, "module_c_probe_head_steps", 3))),
+        "probe_head_lr": float(getattr(args, "module_c_probe_head_lr", 1e-3)),
+        "relief_confidence_scale": float(getattr(args, "module_c_rgfs_confidence_scale", 0.20)),
+        "svd_max_numel": int(getattr(args, "module_c_preflight_svd_max_numel", 1000000)),
+        "test_used_for_selection": 0,
+    }
     payload = {
         "module_c_selection_rule": MODULE_C_PREFLIGHT_SELECTION_RULE,
         "test_used_for_selection": 0,
@@ -687,45 +850,28 @@ def _write_decision_json(
         "subject_mod": str(getattr(args, "subject_mod", "") or ""),
         "k_shot": getattr(args, "k_shot", ""),
         "seed": getattr(args, "seed", ""),
-        "candidate_modules": parse_module_ids(getattr(args, "module_c_candidates", "B,D,E")),
+        "candidate_modules": candidate_modules,
         "selected_modules": list(decision.selected_modules),
         "selected_score": float(decision.selected_score),
         "reason": decision.reason,
-        "policy_config": {
-            **module_c_policy_config_dict(config),
-            "hard_k": max(1, int(getattr(args, "module_c_preflight_hard_k", 2))),
-            "train_batches": max(1, int(getattr(args, "module_c_preflight_train_batches", 1))),
-            "val_batches": max(1, int(getattr(args, "module_c_preflight_val_batches", 1))),
-            "max_profile_classes": max(0, int(getattr(args, "module_c_preflight_max_profile_classes", 8))),
-            "svd_max_numel": int(getattr(args, "module_c_preflight_svd_max_numel", 1000000)),
-            "interaction_complement_weight": 0.04,
-            "interaction_redundancy_weight": 0.04,
-            "interaction_redundancy_cosine_threshold": 0.85,
-            "train_val_pressure_gap_tolerance": 0.50,
-            "test_used_for_selection": 0,
-        },
-        "module_scores": {k: float(v) for k, v in decision.module_scores.items()},
-        "module_utility_breakdown": decision.module_utility_breakdown,
-        "subset_scores": {
-            "+".join(key) if key else "none": float(value)
-            for key, value in decision.subset_scores.items()
-        },
-        "subset_score_breakdown": {
-            "+".join(key) if key else "none": value
-            for key, value in decision.subset_score_breakdown.items()
-        },
-        "selected_subset_breakdown": decision.subset_score_breakdown.get(tuple(decision.selected_modules), {}),
-        "interaction_scores": {
-            "+".join(key): float(value)
-            for key, value in interaction_scores.items()
-        },
+        "policy_config": policy_config,
+        "class_burden": {str(k): float(v) for k, v in decision.class_burden.items()},
+        "class_coverage": {str(k): float(v) for k, v in decision.class_coverage.items()},
+        "focus_classes": list(decision.focus_classes),
+        "candidate_decisions": decision.candidate_decisions,
+        "search_steps": list(decision.search_steps),
+        "module_scores": {m: float(decision.candidate_decisions.get(m, {}).get("focus_marginal_gain", 0.0)) for m in candidate_modules},
+        "subset_scores": {"+".join(decision.selected_modules) if decision.selected_modules else "none": float(decision.selected_score)},
+        "interaction_scores": {"+".join(key): float(value) for key, value in overlap_scores.items()},
+        "action_overlap": action_overlap,
         "diagnostics_by_module": diagnostics,
+        "relief_csv_path": relief_csv_path,
+        "action_overlap_json_path": action_overlap_json_path,
         "replaced_probe_modules": list(replaced_modules),
-        "recipe": decision.recipe,
+        "recipe": recipe,
+        "qv_qvffn_role": "baseline_control_only_not_module_c_candidate",
     }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    return path
+    return _write_json(path, payload)
 
 
 def run_module_c_preflight_selection(
@@ -737,11 +883,11 @@ def run_module_c_preflight_selection(
     criterion_builder: Optional[Callable[[Any, torch.device], nn.Module]] = None,
     is_main_process: bool = True,
 ) -> ModuleCPreflightResult:
-    """Resolve Module C selected modules with a zero-update probe.
+    """Resolve Module C selected modules with a zero-update RGFS probe.
 
-    The caller should pass a disposable base model. This function mutates that
-    model by inserting temporary probe adapters, but it does not update weights
-    and never touches the final training model.
+    The caller passes a disposable model. This function may briefly calibrate
+    the disposable task head and insert temporary probe adapters, but it never
+    updates or reuses the final training model.
     """
     candidate_modules = tuple(parse_module_ids(getattr(args, "module_c_candidates", "B,D,E")))
     candidate_modules = tuple(m for m in candidate_modules if not is_module_c_baseline_candidate(m))
@@ -764,6 +910,9 @@ def run_module_c_preflight_selection(
     original_training = bool(model.training)
     model.to(device)
     model.eval()
+    criterion = criterion_builder(args, device) if criterion_builder is not None else _default_criterion(args, device)
+    head_steps_completed = _calibrate_probe_head(args, model, train_batches, device, criterion)
+    model.eval()
 
     replaced = apply_lora_to_eegfm(
         model=model,
@@ -780,8 +929,6 @@ def run_module_c_preflight_selection(
             f"Module C preflight injected no probe adapters for model={getattr(args, 'model_name', '')}, "
             f"candidates={','.join(candidate_modules)}."
         )
-    # Probe adapters are registered after the disposable model is moved to the
-    # target device, so align newly inserted LoRA tensors before backprop.
     model.to(device)
 
     param_to_module, adapter_param_counts, probe_param_counts = _build_param_to_module(
@@ -794,7 +941,6 @@ def run_module_c_preflight_selection(
         raise RuntimeError("Module C preflight could not map probe parameters back to candidate modules.")
     _configure_probe_trainability(model, param_to_module)
 
-    criterion = criterion_builder(args, device) if criterion_builder is not None else _default_criterion(args, device)
     rank = int(getattr(args, "lora_rank", 4))
     svd_max_numel = int(getattr(args, "module_c_preflight_svd_max_numel", 1000000))
 
@@ -806,23 +952,8 @@ def run_module_c_preflight_selection(
             args, model, val_batches, device, criterion, param_to_module, candidate_modules, rank, svd_max_numel
         )
         hard_classes, class_counts, class_loss_mean = _validation_class_stats(args, model, val_batches, device)
-        stable_classes = tuple(sorted(set(class_counts.keys()) - set(hard_classes)))
-        if hard_classes:
-            hard_snap, hard_seen = _backward_batches(
-                args, model, val_batches, device, criterion, param_to_module, candidate_modules, rank, svd_max_numel,
-                class_filter=hard_classes,
-            )
-        else:
-            hard_snap, hard_seen = _empty_snapshot(candidate_modules), 0
-        if stable_classes:
-            stable_snap, stable_seen = _backward_batches(
-                args, model, val_batches, device, criterion, param_to_module, candidate_modules, rank, svd_max_numel,
-                class_filter=stable_classes,
-            )
-        else:
-            stable_snap, stable_seen = _empty_snapshot(candidate_modules), 0
         profile_classes = tuple(sorted(class_counts.keys()))
-        class_profiles = _class_pressure_profiles(
+        class_snaps, class_seen = _class_gradient_snapshots(
             args, model, val_batches, device, criterion, param_to_module, candidate_modules, rank, svd_max_numel,
             classes=profile_classes,
         )
@@ -830,39 +961,51 @@ def run_module_c_preflight_selection(
         model.zero_grad(set_to_none=True)
         model.train(original_training)
 
-    scores, diagnostics, interaction_scores = _build_scores_and_interactions(
+    diagnostics, overlap_scores, relief_rows, burden, relief_lcb, harm_lcb, complexity, action_overlap = _build_rgfs_evidence(
         args=args,
         candidate_modules=candidate_modules,
         train_snap=train_snap,
         train_seen=train_seen,
         val_snap=val_snap,
         val_seen=val_seen,
-        hard_snap=hard_snap,
-        hard_seen=hard_seen,
-        stable_snap=stable_snap,
-        stable_seen=stable_seen,
+        class_snaps=class_snaps,
+        class_seen=class_seen,
         hard_classes=hard_classes,
         class_counts=class_counts,
         class_loss_mean=class_loss_mean,
-        class_profiles=class_profiles,
         adapter_param_counts=adapter_param_counts,
         probe_param_counts=probe_param_counts,
     )
 
-    config = ModuleCPolicyConfig(
-        marginal_margin=float(getattr(args, "module_c_preflight_margin", 0.03)),
-        min_module_score=float(getattr(args, "module_c_preflight_min_score", 0.01)),
-        allow_empty=False,
+    config = RGFSConfig(
+        min_marginal_gain=float(getattr(args, "module_c_preflight_min_score", 0.01)),
+        tie_tolerance=float(getattr(args, "module_c_preflight_margin", 0.03)),
+        harm_veto_threshold=float(getattr(args, "module_c_rgfs_harm_threshold", 0.05)),
+        focus_burden_ratio=float(getattr(args, "module_c_rgfs_focus_ratio", 0.80)),
+        allow_empty=True,
     )
-    decision = select_module_subset(
-        scores,
-        interaction_scores=interaction_scores,
+    decision = select_rgfs_subset(
+        module_ids=candidate_modules,
+        class_ids=sorted(burden.keys()),
+        burden=burden,
+        relief_lcb=relief_lcb,
+        harm_lcb=harm_lcb,
+        complexity=complexity,
         config=config,
-        registry=DEFAULT_CANDIDATE_MODULES,
     )
-    for module_id, breakdown in decision.module_utility_breakdown.items():
+
+    for module_id, record in decision.candidate_decisions.items():
         if module_id in diagnostics:
-            diagnostics[module_id].update(breakdown)
+            diagnostics[module_id].update(
+                {
+                    "rgfs_gate": record.get("gate", ""),
+                    "rgfs_focus_marginal_gain": record.get("focus_marginal_gain", 0.0),
+                    "rgfs_marginal_gain": record.get("marginal_gain", 0.0),
+                    "rgfs_blocked_harm_classes": ",".join(str(x) for x in record.get("blocked_harm_classes", ())),
+                    "rgfs_selected": int(module_id in decision.selected_modules),
+                    "probe_head_steps_completed": int(head_steps_completed),
+                }
+            )
 
     selected = tuple(decision.selected_modules)
     setattr(args, "module_c_enable", True)
@@ -876,6 +1019,8 @@ def run_module_c_preflight_selection(
     score_path = os.path.join(diag_dir, MODULE_C_PREFLIGHT_SCORE_FILE) if diag_dir else ""
     interaction_path = os.path.join(diag_dir, MODULE_C_PREFLIGHT_INTERACTION_FILE) if diag_dir else ""
     decision_path = os.path.join(diag_dir, MODULE_C_PREFLIGHT_DECISION_FILE) if diag_dir else ""
+    relief_path = os.path.join(diag_dir, MODULE_C_RGFS_RELIEF_FILE) if diag_dir else ""
+    overlap_path = os.path.join(diag_dir, MODULE_C_ACTION_OVERLAP_FILE) if diag_dir else ""
 
     if is_main_process:
         score_rows = [diagnostics[m] for m in candidate_modules if m in diagnostics]
@@ -883,31 +1028,33 @@ def run_module_c_preflight_selection(
             {
                 "left_module": left,
                 "right_module": right,
-                "interaction_score": float(value),
+                "relief_profile_cosine": float(value),
                 "selection_rule": MODULE_C_PREFLIGHT_SELECTION_RULE,
                 "test_used_for_selection": 0,
             }
-            for (left, right), value in sorted(interaction_scores.items())
+            for (left, right), value in sorted(overlap_scores.items())
         ]
         _write_csv(score_path, score_rows)
         _write_csv(interaction_path, interaction_rows)
-        _write_decision_json(decision_path, args, decision, config, diagnostics, interaction_scores, replaced)
-        print(f"[ModuleC] preflight scores saved to: {score_path}")
-        print(f"[ModuleC] preflight decision saved to: {decision_path}")
+        _write_csv(relief_path, relief_rows)
+        _write_json(overlap_path, action_overlap)
+        _write_decision_json(decision_path, args, decision, diagnostics, overlap_scores, action_overlap, replaced, relief_path, overlap_path)
+        print(f"[ModuleC] RGFS relief saved to: {relief_path}")
+        print(f"[ModuleC] RGFS decision saved to: {decision_path}")
 
-    if not selected:
-        raise RuntimeError(
-            "Module C preflight selected no modules. This run will not fall back to qv/qv_ffn; "
-            f"inspect {decision_path or MODULE_C_PREFLIGHT_DECISION_FILE} and adjust candidates or thresholds."
-        )
+    if selected:
+        print(f"[ModuleC] RGFS selected modules: {','.join(selected)} ({decision.reason})")
+    else:
+        print("[ModuleC] RGFS selected no B/D/E modules; continuing without qv/qv_ffn fallback.")
 
-    print(f"[ModuleC] preflight selected modules: {','.join(selected)} ({decision.reason})")
     return ModuleCPreflightResult(
         decision=decision,
         diagnostics_by_module=diagnostics,
-        interaction_scores=interaction_scores,
+        interaction_scores=overlap_scores,
         replaced_modules=tuple(replaced),
         score_csv_path=score_path,
         interaction_csv_path=interaction_path,
         decision_json_path=decision_path,
+        relief_csv_path=relief_path,
+        action_overlap_json_path=overlap_path,
     )

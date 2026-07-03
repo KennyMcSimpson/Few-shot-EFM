@@ -1270,7 +1270,14 @@ def _apply_lora_training_setup(model, args):
     #   lora_base_update=freeze -> standard Frozen-LoRA. Original W is frozen; LoRA/head are trainable.
     #   lora_base_update=full   -> Full FT + LoRA. Original W remains trainable; LoRA is an extra branch.
     # This separates the freeze variable from the LoRA variable.
-    target_none = (str(args.lora_target).lower() == 'none')
+    module_c_selected_text = getattr(args, 'module_c_resolved_selected', getattr(args, 'module_c_selected', ''))
+    module_c_selected_tokens = [
+        token.strip().upper()
+        for token in re.split(r"[,;\s|]+", str(module_c_selected_text or ""))
+        if token.strip()
+    ]
+    target_module_c_empty = _is_module_c_execution_target(args.lora_target) and len(module_c_selected_tokens) == 0
+    target_none = (str(args.lora_target).lower() == 'none') or target_module_c_empty
 
     if args.lora_base_update == 'freeze':
         freeze_all_parameters(model)
@@ -1278,7 +1285,10 @@ def _apply_lora_training_setup(model, args):
     if target_none:
         if args.lora_base_update != 'freeze':
             raise ValueError('lora_target=none is intended for frozen-backbone diagnosis only; use --lora_base_update freeze.')
-        print('[LoRA] lora_target=none: no LoRA modules will be injected. Selected modules will be unfrozen below.')
+        if target_module_c_empty:
+            print('[ModuleC] RGFS selected no B/D/E modules: no qv/qv_ffn fallback will be injected.')
+        else:
+            print('[LoRA] lora_target=none: no LoRA modules will be injected. Selected modules will be unfrozen below.')
         if args.lora_train_head and hasattr(model, 'task_head'):
             unfreeze_module(model.task_head)
         if args.lora_train_chan_conv and hasattr(model, 'chan_conv'):
