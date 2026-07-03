@@ -31,13 +31,9 @@ if torch is not None:
 
 
 class ModuleEExplainabilityCleanupTest(unittest.TestCase):
-    def test_old_module_e_modes_resolve_to_dynamic_only(self):
+    def test_unsupported_module_e_mode_resolves_to_dynamic_only(self):
         self.assertEqual(
-            module_e_mode_from_args(argparse.Namespace(module_e_mode="static_pressure_topk")),
-            "dynamic_pressure_gate",
-        )
-        self.assertEqual(
-            module_e_mode_from_args(argparse.Namespace(module_e_mode="legacy_all_structural")),
+            module_e_mode_from_args(argparse.Namespace(module_e_mode="unsupported_mode")),
             "dynamic_pressure_gate",
         )
         self.assertEqual(

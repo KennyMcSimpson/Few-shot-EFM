@@ -81,9 +81,9 @@ def normalize_lora_target(lora_target: Any) -> str:
 def module_e_mode_from_args(args: Any) -> str:
     """Resolve Module E execution mode.
 
-    Formal Module E now uses only dynamic pressure-gated structural LoRA.
-    Older static top-k / legacy broad modes were removed to keep the method
-    story clean and avoid unexplained selection knobs.
+    Only the formal dynamic pressure-gated structural LoRA path is exposed.
+    Unsupported labels fall back to this path so custom callers cannot trigger
+    hidden Module E branches.
     """
     mode = str(getattr(args, "module_e_mode", "") or "").strip().lower()
     if mode:
@@ -364,7 +364,7 @@ class ModuleEDynamicPressureController:
         model_name: str,
         output_dir: str = "",
         run_tag: str = "",
-        beta: float = 0.95, # 骞虫粦绯绘暟
+        beta: float = 0.95,  # 这边是压力 EMA 的平滑系数
         temperature: float = 1.0,
         gate_floor: float = 0.2,
         scale_min: float = 0.5,

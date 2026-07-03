@@ -440,7 +440,7 @@ def _is_temporal_attn_only(lora_target: str) -> bool:
     return lora_target.lower() == "temporal_attn"
 
 
-# 这两个是旧 baseline 的名字，只在 LoRA 安装层保留，不再算 Module E 的正式接口。
+# 这两个名字只给旧 baseline 兼容，Module E 正式接口不再用它们。
 def _is_legacy_spatial_attn_ffn(lora_target: str) -> bool:
     return str(lora_target or "").lower() == "spatial_attn_ffn"
 
