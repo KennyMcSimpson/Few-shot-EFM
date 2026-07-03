@@ -77,6 +77,54 @@ class ModuleCRGFSPolicyTests(unittest.TestCase):
         self.assertEqual(decision.selected_modules, tuple())
         self.assertEqual(decision.reason, "no reliable positive marginal relief")
 
+    def test_structural_residual_can_select_e_without_class_shortcut(self):
+        decision = select_rgfs_subset(
+            module_ids=["B", "E"],
+            class_ids=[0, 1],
+            burden={0: 0.50, 1: 0.50},
+            relief_lcb={
+                "B": {0: 0.01, 1: 0.01},
+                "E": {0: 0.00, 1: 0.00},
+            },
+            harm_lcb={"B": {}, "E": {}},
+            complexity={"B": 1.0, "E": 1.2},
+            functional_burden={"E:structural_balance": 0.40},
+            functional_relief_lcb={
+                "B": {"E:structural_balance": 0.00},
+                "E": {"E:structural_balance": 0.80},
+            },
+            config=RGFSConfig(min_marginal_gain=0.01),
+        )
+
+        self.assertEqual(decision.selected_modules, ("E",))
+        self.assertGreater(decision.functional_coverage["E:structural_balance"], 0.0)
+        self.assertGreater(decision.candidate_decisions["E"]["functional_marginal_gain"], 0.0)
+
+    def test_structural_residual_does_not_bypass_high_burden_harm_gate(self):
+        decision = select_rgfs_subset(
+            module_ids=["B", "E"],
+            class_ids=[0, 1],
+            burden={0: 0.70, 1: 0.30},
+            relief_lcb={
+                "B": {0: 0.20, 1: 0.10},
+                "E": {0: 0.00, 1: 0.00},
+            },
+            harm_lcb={
+                "B": {},
+                "E": {0: 0.20},
+            },
+            complexity={"B": 1.0, "E": 1.2},
+            functional_burden={"E:structural_balance": 0.50},
+            functional_relief_lcb={
+                "B": {"E:structural_balance": 0.00},
+                "E": {"E:structural_balance": 0.90},
+            },
+            config=RGFSConfig(min_marginal_gain=0.01, harm_veto_threshold=0.05),
+        )
+
+        self.assertEqual(decision.selected_modules, ("B",))
+        self.assertEqual(decision.candidate_decisions["E"]["gate"], "blocked_harm_high_burden")
+
 
 if __name__ == "__main__":
     unittest.main()

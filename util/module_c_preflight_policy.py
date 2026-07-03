@@ -34,6 +34,8 @@ from .module_c_rgfs_policy import (
     select_rgfs_subset,
 )
 from .module_e_structural_routing import (
+    STRUCTURAL_ROUTING_BLOCKS,
+    module_e_branch_from_lora_param_name,
     module_e_module_prefix_from_name,
     structural_inventory_from_model,
 )
@@ -45,6 +47,7 @@ MODULE_C_PREFLIGHT_INTERACTION_FILE = "module_c_preflight_interactions.csv"
 MODULE_C_PREFLIGHT_DECISION_FILE = "module_c_preflight_decision.json"
 MODULE_C_RGFS_RELIEF_FILE = "module_c_rgfs_relief.csv"
 MODULE_C_ACTION_OVERLAP_FILE = "module_c_action_overlap.json"
+MODULE_C_E_STRUCTURAL_RESIDUAL_ID = "E:structural_balance"
 
 
 @dataclass(frozen=True)
@@ -643,6 +646,115 @@ def _cosine_float_vectors(left: Mapping[int, float], right: Mapping[int, float],
     return _profile_cosine(left, right, classes)
 
 
+def _is_lora_b_vector_name(name: Any) -> bool:
+    lower = str(name or "").lower()
+    return ".lora_b" in lower or lower.endswith("lora_b")
+
+
+def _is_lora_vector_name(name: Any) -> bool:
+    lower = str(name or "").lower()
+    return "lora_" in lower or lower.endswith("lora_a") or lower.endswith("lora_b")
+
+
+def _structural_branch_pressure_profile(
+    snapshot: Mapping[str, Any],
+    model_name: str,
+) -> Tuple[Dict[str, float], str]:
+    vectors = snapshot.get("vectors", {}) if snapshot else {}
+    scopes = (
+        ("lora_b", _is_lora_b_vector_name),
+        ("all_lora", _is_lora_vector_name),
+        ("all_probe", lambda _name: True),
+    )
+    for scope_name, predicate in scopes:
+        energy = {branch: 0.0 for branch in STRUCTURAL_ROUTING_BLOCKS}
+        count = {branch: 0 for branch in STRUCTURAL_ROUTING_BLOCKS}
+        for name, vector in vectors.items():
+            if not predicate(name):
+                continue
+            branch = module_e_branch_from_lora_param_name(model_name, name)
+            if branch not in energy:
+                continue
+            vec = vector.detach().float().view(-1)
+            energy[branch] += float(torch.dot(vec, vec).item())
+            count[branch] += int(vec.numel())
+        if sum(count.values()) > 0:
+            return {
+                branch: float(energy[branch] / max(1, count[branch]))
+                for branch in STRUCTURAL_ROUTING_BLOCKS
+            }, scope_name
+    return {branch: 0.0 for branch in STRUCTURAL_ROUTING_BLOCKS}, "none"
+
+
+def _structural_pressure_concentration(profile: Mapping[str, float]) -> float:
+    values = [max(0.0, float(profile.get(branch, 0.0))) for branch in STRUCTURAL_ROUTING_BLOCKS]
+    total = sum(values)
+    n = len(values)
+    if total <= 0.0 or n <= 1:
+        return 0.0
+    probs = [value / total for value in values]
+    entropy = -sum(prob * math.log(max(prob, 1e-12)) for prob in probs) / math.log(n)
+    return _clip01(1.0 - entropy)
+
+
+def _structural_pressure_agreement(left: Mapping[str, float], right: Mapping[str, float]) -> float:
+    a = torch.tensor([float(left.get(branch, 0.0)) for branch in STRUCTURAL_ROUTING_BLOCKS], dtype=torch.float32)
+    b = torch.tensor([float(right.get(branch, 0.0)) for branch in STRUCTURAL_ROUTING_BLOCKS], dtype=torch.float32)
+    denom = float(a.norm().item() * b.norm().item())
+    if denom <= 0.0:
+        return 0.0
+    return _clip01(float(torch.dot(a, b).item() / denom))
+
+
+def _focused_burden_cap(args: Any, burden: Mapping[int, float]) -> float:
+    if not burden:
+        return 0.0
+    values = [float(v) for v in burden.values() if float(v) > 0.0]
+    if not values:
+        return 0.0
+    ratio = float(getattr(args, "module_c_rgfs_focus_ratio", 0.80))
+    threshold = ratio / max(1, len(burden))
+    focused = sorted(float(v) for v in burden.values() if float(v) >= threshold)
+    if not focused:
+        return max(values)
+    mid = len(focused) // 2
+    if len(focused) % 2:
+        return float(focused[mid])
+    return float(0.5 * (focused[mid - 1] + focused[mid]))
+
+
+def _module_e_structural_residual_evidence(
+    args: Any,
+    train_snapshot: Mapping[str, Any],
+    val_snapshot: Mapping[str, Any],
+    burden: Mapping[int, float],
+    low_rank_fit: float,
+) -> Dict[str, Any]:
+    model_name = str(getattr(args, "model_name", "") or "")
+    train_profile, train_scope = _structural_branch_pressure_profile(train_snapshot, model_name)
+    val_profile, val_scope = _structural_branch_pressure_profile(val_snapshot, model_name)
+    imbalance = _structural_pressure_concentration(val_profile)
+    agreement = _structural_pressure_agreement(train_profile, val_profile)
+    fit = _clip01(low_rank_fit, default=1.0)
+    cap = _focused_burden_cap(args, burden)
+    residual_burden = float(cap * imbalance)
+    relief_lcb = float(agreement * fit)
+    return {
+        "functional_residual_id": MODULE_C_E_STRUCTURAL_RESIDUAL_ID,
+        "structural_branch_pressure_train": train_profile,
+        "structural_branch_pressure_val": val_profile,
+        "structural_pressure_scope_train": train_scope,
+        "structural_pressure_scope_val": val_scope,
+        "structural_imbalance": float(imbalance),
+        "structural_train_val_agreement": float(agreement),
+        "structural_low_rank_fit": float(fit),
+        "structural_residual_cap": float(cap),
+        "structural_residual_burden": float(residual_burden),
+        "structural_relief_lcb": float(relief_lcb),
+        "structural_residual_contribution": float(residual_burden * relief_lcb),
+    }
+
+
 def _build_rgfs_evidence(
     args: Any,
     candidate_modules: Sequence[str],
@@ -657,7 +769,7 @@ def _build_rgfs_evidence(
     class_loss_mean: Mapping[int, float],
     adapter_param_counts: Mapping[str, int],
     probe_param_counts: Mapping[str, int],
-) -> Tuple[Dict[str, Dict[str, Any]], Dict[Tuple[str, str], float], List[Dict[str, Any]], Dict[int, float], Dict[str, Dict[int, float]], Dict[str, Dict[int, float]], Dict[str, float], Dict[str, Any]]:
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[Tuple[str, str], float], List[Dict[str, Any]], Dict[int, float], Dict[str, Dict[int, float]], Dict[str, Dict[int, float]], Dict[str, float], Dict[str, float], Dict[str, Dict[str, float]], Dict[str, Any]]:
     class_ids = tuple(sorted(int(cls) for cls in class_loss_mean.keys()))
     burden = _class_burden_from_loss(class_loss_mean)
     train_energy = {m: float(train_snap[m]["energy"]) / max(1, train_seen) for m in candidate_modules}
@@ -671,6 +783,8 @@ def _build_rgfs_evidence(
 
     relief_lcb: Dict[str, Dict[int, float]] = {m: {} for m in candidate_modules}
     harm_lcb: Dict[str, Dict[int, float]] = {m: {} for m in candidate_modules}
+    functional_burden: Dict[str, float] = {}
+    functional_relief_lcb: Dict[str, Dict[str, float]] = {m: {} for m in candidate_modules}
     relief_rows: List[Dict[str, Any]] = []
     diagnostics: Dict[str, Dict[str, Any]] = {}
 
@@ -713,8 +827,10 @@ def _build_rgfs_evidence(
             signed_base_cos_by_class[int(cls)] = float(base_cos)
             relief_rows.append(
                 {
+                    "residual_type": "class",
                     "module_id": module_id,
                     "class_id": int(cls),
+                    "functional_residual_id": "",
                     "class_count": int(class_counts.get(int(cls), 0)),
                     "class_probe_batches": int(seen),
                     "class_loss_mean": float(class_loss_mean.get(int(cls), 0.0)),
@@ -735,6 +851,48 @@ def _build_rgfs_evidence(
 
         pressure_norm = 0.0 if max_pressure <= 0.0 else per_param[module_id] / max_pressure
         pressure_gap = abs(train_energy[module_id] - val_energy[module_id]) / max(train_energy[module_id] + val_energy[module_id], 1e-12)
+        structural_diag: Dict[str, Any] = {}
+        if module_id == "E":
+            structural_diag = _module_e_structural_residual_evidence(
+                args=args,
+                train_snapshot=train_snap[module_id],
+                val_snapshot=val_snap[module_id],
+                burden=burden,
+                low_rank_fit=lrf,
+            )
+            structural_burden = float(structural_diag.get("structural_residual_burden", 0.0))
+            structural_relief = float(structural_diag.get("structural_relief_lcb", 0.0))
+            if structural_burden > 0.0 and structural_relief > 0.0:
+                functional_burden[MODULE_C_E_STRUCTURAL_RESIDUAL_ID] = structural_burden
+                functional_relief_lcb[module_id][MODULE_C_E_STRUCTURAL_RESIDUAL_ID] = structural_relief
+                relief_rows.append(
+                    {
+                        "residual_type": "functional",
+                        "module_id": module_id,
+                        "class_id": "",
+                        "functional_residual_id": MODULE_C_E_STRUCTURAL_RESIDUAL_ID,
+                        "class_count": "",
+                        "class_probe_batches": "",
+                        "class_loss_mean": "",
+                        "class_burden": "",
+                        "confidence_margin": "",
+                        "low_rank_fit": float(lrf),
+                        "base_signed_cosine": "",
+                        "base_relief_lcb": "",
+                        "lora_tangent_signed_cosine": "",
+                        "lora_tangent_relief_lcb": "",
+                        "relief_lcb": float(structural_relief),
+                        "harm_lcb": 0.0,
+                        "class_grad_energy": "",
+                        "structural_residual_burden": structural_burden,
+                        "structural_imbalance": float(structural_diag.get("structural_imbalance", 0.0)),
+                        "structural_train_val_agreement": float(structural_diag.get("structural_train_val_agreement", 0.0)),
+                        "structural_branch_pressure_train": json.dumps(structural_diag.get("structural_branch_pressure_train", {}), ensure_ascii=False),
+                        "structural_branch_pressure_val": json.dumps(structural_diag.get("structural_branch_pressure_val", {}), ensure_ascii=False),
+                        "selection_rule": MODULE_C_PREFLIGHT_SELECTION_RULE,
+                        "test_used_for_selection": 0,
+                    }
+                )
         diagnostics[module_id] = {
             "module_id": module_id,
             "metric_source": MODULE_C_PREFLIGHT_SELECTION_RULE,
@@ -759,10 +917,20 @@ def _build_rgfs_evidence(
             "harm_lcb_by_class": json.dumps({str(k): v for k, v in sorted(harm_lcb[module_id].items())}, ensure_ascii=False),
             "signed_lora_cos_by_class": json.dumps({str(k): v for k, v in sorted(signed_lora_cos_by_class.items())}, ensure_ascii=False),
             "signed_base_cos_by_class": json.dumps({str(k): v for k, v in sorted(signed_base_cos_by_class.items())}, ensure_ascii=False),
+            **{
+                key: json.dumps(value, ensure_ascii=False) if isinstance(value, dict) else value
+                for key, value in structural_diag.items()
+            },
         }
 
     overlap_scores: Dict[Tuple[str, str], float] = {}
-    overlap_payload: Dict[str, Any] = {"selection_rule": MODULE_C_PREFLIGHT_SELECTION_RULE, "pairs": []}
+    overlap_payload: Dict[str, Any] = {
+        "selection_rule": MODULE_C_PREFLIGHT_SELECTION_RULE,
+        "residual_space": "class_plus_optional_functional",
+        "functional_burden": functional_burden,
+        "functional_relief_lcb": functional_relief_lcb,
+        "pairs": [],
+    }
     for left, right in combinations(candidate_modules, 2):
         cos = _cosine_float_vectors(relief_lcb.get(left, {}), relief_lcb.get(right, {}), class_ids)
         overlap_scores[(left, right)] = float(cos)
@@ -775,7 +943,7 @@ def _build_rgfs_evidence(
                 "complementarity_level": "high" if cos <= 0.35 else "medium" if cos <= 0.70 else "low",
             }
         )
-    return diagnostics, overlap_scores, relief_rows, burden, relief_lcb, harm_lcb, complexity, overlap_payload
+    return diagnostics, overlap_scores, relief_rows, burden, relief_lcb, harm_lcb, complexity, functional_burden, functional_relief_lcb, overlap_payload
 
 
 def _write_csv(path: str, rows: Sequence[Mapping[str, Any]]) -> Optional[str]:
@@ -840,6 +1008,10 @@ def _write_decision_json(
         "probe_head_lr": float(getattr(args, "module_c_probe_head_lr", 1e-3)),
         "relief_confidence_scale": float(getattr(args, "module_c_rgfs_confidence_scale", 0.20)),
         "svd_max_numel": int(getattr(args, "module_c_preflight_svd_max_numel", 1000000)),
+        "functional_residual_role": "bounded_module_specific_residual",
+        "e_structural_residual_id": MODULE_C_E_STRUCTURAL_RESIDUAL_ID,
+        "e_structural_residual_definition": "branch_pressure_concentration_times_train_val_agreement_and_low_rank_fit",
+        "e_structural_residual_bound": "at_most_one_focused_class_burden_scale",
         "test_used_for_selection": 0,
     }
     payload = {
@@ -857,6 +1029,8 @@ def _write_decision_json(
         "policy_config": policy_config,
         "class_burden": {str(k): float(v) for k, v in decision.class_burden.items()},
         "class_coverage": {str(k): float(v) for k, v in decision.class_coverage.items()},
+        "functional_burden": {str(k): float(v) for k, v in decision.functional_burden.items()},
+        "functional_coverage": {str(k): float(v) for k, v in decision.functional_coverage.items()},
         "focus_classes": list(decision.focus_classes),
         "candidate_decisions": decision.candidate_decisions,
         "search_steps": list(decision.search_steps),
@@ -961,7 +1135,7 @@ def run_module_c_preflight_selection(
         model.zero_grad(set_to_none=True)
         model.train(original_training)
 
-    diagnostics, overlap_scores, relief_rows, burden, relief_lcb, harm_lcb, complexity, action_overlap = _build_rgfs_evidence(
+    diagnostics, overlap_scores, relief_rows, burden, relief_lcb, harm_lcb, complexity, functional_burden, functional_relief_lcb, action_overlap = _build_rgfs_evidence(
         args=args,
         candidate_modules=candidate_modules,
         train_snap=train_snap,
@@ -992,6 +1166,8 @@ def run_module_c_preflight_selection(
         harm_lcb=harm_lcb,
         complexity=complexity,
         config=config,
+        functional_burden=functional_burden,
+        functional_relief_lcb=functional_relief_lcb,
     )
 
     for module_id, record in decision.candidate_decisions.items():
@@ -1001,6 +1177,9 @@ def run_module_c_preflight_selection(
                     "rgfs_gate": record.get("gate", ""),
                     "rgfs_focus_marginal_gain": record.get("focus_marginal_gain", 0.0),
                     "rgfs_marginal_gain": record.get("marginal_gain", 0.0),
+                    "rgfs_class_marginal_gain": record.get("class_marginal_gain", 0.0),
+                    "rgfs_focus_class_marginal_gain": record.get("focus_class_marginal_gain", 0.0),
+                    "rgfs_functional_marginal_gain": record.get("functional_marginal_gain", 0.0),
                     "rgfs_blocked_harm_classes": ",".join(str(x) for x in record.get("blocked_harm_classes", ())),
                     "rgfs_selected": int(module_id in decision.selected_modules),
                     "probe_head_steps_completed": int(head_steps_completed),
