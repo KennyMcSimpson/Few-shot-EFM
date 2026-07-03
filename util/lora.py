@@ -312,7 +312,6 @@ class LoraTargetPlan:
     spatial_branch_target: bool
     temporal_branch_target: bool
     module_c_selected: Tuple[str, ...] = ()
-    module_e_allowed_names: Optional[Tuple[str, ...]] = None
 
 
 def freeze_all_parameters(model: nn.Module) -> None:
@@ -468,26 +467,16 @@ def _max_layer_index(model: nn.Module) -> Optional[int]:
 
 
 def _layer_selected_for_ffn(module_name: str, lora_target: str, max_idx: Optional[int]) -> bool:
-    if str(lora_target or "").lower() in LEGACY_FFN_BASELINE_TARGETS:
+    target = "semantic" if _is_module_c_execution_target(lora_target) else str(lora_target or "").lower()
+    if target in LEGACY_FFN_BASELINE_TARGETS:
         return True
-    return layer_selected_for_semantic(module_name, lora_target, max_idx)
+    return layer_selected_for_semantic(module_name, target, max_idx)
 
 
-def _module_e_name_allowed(module_name: str, allowed_names: Optional[Tuple[str, ...]]) -> bool:
-    if allowed_names is None:
-        return True
-    name = str(module_name or "")
-    for raw_allowed in allowed_names:
-        allowed = str(raw_allowed or "").strip()
-        if not allowed:
-            continue
-        if name == allowed:
-            return True
-        if name.startswith(allowed + "."):
-            return True
-        if allowed.startswith(name + "."):
-            return True
-    return False
+def _csbrain_spectral_selection_target(plan: LoraTargetPlan) -> str:
+    if _is_module_c_execution_target(plan.target_lower) and plan.use_ffn:
+        return "semantic"
+    return plan.target_lower
 
 
 def _should_lora_input_side(lora_target: str, module_c_selected: Optional[str | Iterable[str]] = None) -> bool:
@@ -503,13 +492,9 @@ def _install_input_side_lora(model: nn.Module, r: int, alpha: float, dropout: fl
 def _lora_target_plan(
     lora_target: str,
     module_c_selected: Optional[str | Iterable[str]] = None,
-    module_e_allowed_names: Optional[Iterable[str]] = None,
 ) -> LoraTargetPlan:
     target_lower = str(lora_target or "").lower()
     selected = _module_c_selected_ids(module_c_selected) if _is_module_c_execution_target(target_lower) else tuple()
-    allowed = None
-    if module_e_allowed_names is not None:
-        allowed = tuple(str(name).strip() for name in module_e_allowed_names if str(name).strip())
     return LoraTargetPlan(
         target_lower=target_lower,
         enabled_parts=tuple(_target_to_enabled_parts(target_lower, selected)),
@@ -529,7 +514,6 @@ def _lora_target_plan(
             or _is_legacy_temporal_attn_ffn(target_lower)
         ),
         module_c_selected=selected,
-        module_e_allowed_names=allowed,
     )
 
 
@@ -568,9 +552,6 @@ def _apply_lora_to_biot_module(
         elif plan.use_all_linear and lower.startswith("main_model."):
             should_replace = True
 
-        if should_replace and is_attention_projection and not _module_e_name_allowed(name, plan.module_e_allowed_names):
-            should_replace = False
-
         if should_replace:
             _replace_with_lora_linear(model, name, module, r, alpha, dropout, replaced)
 
@@ -594,8 +575,6 @@ def _apply_lora_to_cbramod_module(
         if plan.temporal_branch_target and "self_attn_t" not in lower:
             return
         if plan.spatial_branch_target or plan.temporal_branch_target or len(plan.enabled_parts) > 0:
-            if not _module_e_name_allowed(name, plan.module_e_allowed_names):
-                return
             _record_replacement(
                 model,
                 name,
@@ -656,9 +635,6 @@ def _apply_lora_to_eegpt_labram_module(
             should_replace = True
             new_module = LoRALinear(module, r=r, alpha=alpha, dropout=dropout)
 
-        if should_replace and is_attention_projection and not _module_e_name_allowed(name, plan.module_e_allowed_names):
-            should_replace = False
-
         if should_replace and new_module is not None:
             _record_replacement(model, name, new_module, replaced)
 
@@ -682,8 +658,6 @@ def _apply_lora_to_csbrain_module(
         if plan.temporal_branch_target and "inter_window_attn" not in lower:
             return
         if plan.spatial_branch_target or plan.temporal_branch_target or len(plan.enabled_parts) > 0:
-            if not _module_e_name_allowed(name, plan.module_e_allowed_names):
-                return
             _record_replacement(
                 model,
                 name,
@@ -698,7 +672,7 @@ def _apply_lora_to_csbrain_module(
             or lower.endswith("global_fc")
             or (
                 "spectral_proj" in lower
-                and should_include_csbrain_spectral_proj(plan.target_lower)
+                and should_include_csbrain_spectral_proj(_csbrain_spectral_selection_target(plan))
             )
         ):
             should_replace = _layer_selected_for_ffn(name, lora_target, max_layer_idx)
@@ -736,8 +710,6 @@ def _apply_lora_to_gram_module(
             ))
             is_layer_fusion = ("proj_layers" in lower)
             should_replace = is_attn_linear or is_layer_fusion
-            if should_replace and not _module_e_name_allowed(name, plan.module_e_allowed_names):
-                should_replace = False
         if not should_replace and plan.use_ffn and any(k in lower for k in ("mlp", "ffn", "fc", "linear")):
             should_replace = _layer_selected_for_ffn(name, lora_target, max_layer_idx)
         if not should_replace and plan.use_all_linear and lower.startswith("main_model."):
@@ -775,8 +747,6 @@ def _apply_lora_to_neuript_module(
             should_replace = True
         elif lower.endswith("out_projection") and "o" in plan.enabled_parts:
             should_replace = True
-        if should_replace and not _module_e_name_allowed(name, plan.module_e_allowed_names):
-            should_replace = False
     elif plan.use_ffn and any(k in lower for k in ("mlp", "experts", "shared_expert", "linear_trans")):
         should_replace = _layer_selected_for_ffn(name, lora_target, max_layer_idx)
     elif plan.use_all_linear and lower.startswith("main_model."):
@@ -802,7 +772,6 @@ def apply_lora_to_eegfm(
     model_name: str,
     lora_target: str = "qv",
     module_c_selected: Optional[str | Iterable[str]] = None,
-    module_e_allowed_names: Optional[Iterable[str]] = None,
     r: int = 4,
     alpha: float = 8.0,
     dropout: float = 0.1,
@@ -833,7 +802,6 @@ def apply_lora_to_eegfm(
     plan = _lora_target_plan(
         lora_target,
         module_c_selected=module_c_selected,
-        module_e_allowed_names=module_e_allowed_names,
     )
     max_layer_idx = _max_layer_index(model)
     handler = LORA_MODEL_MODULE_HANDLERS.get(model_name)

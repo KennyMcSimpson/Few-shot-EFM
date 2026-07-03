@@ -25,7 +25,7 @@ DIAG_FILES=[
     "module_d_sbr_eval.csv",
     "module_e_coverage_audit.csv",
     "module_e_structural_pressure.csv",
-    "module_e_pressure_targets.csv",
+    "module_e_lora_injection_audit.csv",
     "module_e_dynamic_pressure.csv",
 ]
 def _copy(src,dst):

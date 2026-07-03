@@ -62,13 +62,10 @@ try:
     from util.module_e_structural_routing import (
         attach_module_e_dynamic_pressure_controller,
         is_module_e_target,
-        load_module_e_pressure_csv,
         module_e_mode_from_args,
         save_module_e_coverage_audit,
-        save_module_e_pressure_targets,
+        save_module_e_lora_injection_audit,
         save_module_e_structural_pressure_proxy,
-        select_module_e_pressure_targets,
-        structural_inventory_from_model,
     )
     from util.module_d_semantic_refinement import module_d_eval_row_from_details, save_module_d_sbr_eval
     from util.module_c_preflight_policy import (
@@ -85,14 +82,11 @@ except Exception as _fb_import_error:
     def save_block_delta_summary(*args, **kwargs): return None
     def collect_outputs_if_requested(*args, **kwargs): return None
     def save_module_e_coverage_audit(*args, **kwargs): return None
-    def save_module_e_pressure_targets(*args, **kwargs): return None
+    def save_module_e_lora_injection_audit(*args, **kwargs): return None
     def save_module_e_structural_pressure_proxy(*args, **kwargs): return None
     def attach_module_e_dynamic_pressure_controller(*args, **kwargs): return None
     def is_module_e_target(*args, **kwargs): return False
-    def load_module_e_pressure_csv(*args, **kwargs): return {}
-    def module_e_mode_from_args(*args, **kwargs): return "legacy_all_structural"
-    def select_module_e_pressure_targets(*args, **kwargs): return tuple()
-    def structural_inventory_from_model(*args, **kwargs): return tuple()
+    def module_e_mode_from_args(*args, **kwargs): return "dynamic_pressure_gate"
     def module_d_eval_row_from_details(*args, **kwargs): return {}
     def save_module_d_sbr_eval(*args, **kwargs): return None
     def module_c_preflight_requested(*args, **kwargs): return False
@@ -358,25 +352,12 @@ def get_args():
                         help='LoRA scaling alpha. Effective scaling = alpha / rank.')
     parser.add_argument('--lora_dropout', default=0.1, type=float,
                         help='Dropout used inside LoRA branch.')
-    parser.add_argument('--module_e_mode', default='', type=str,
-                        choices=['dynamic_pressure_gate', 'static_pressure_topk', 'legacy_all_structural'],
+    parser.add_argument('--module_e_mode', default='dynamic_pressure_gate', type=str,
+                        choices=['dynamic_pressure_gate'],
                         help=(
-                            'Module E execution mode. Empty/default uses dynamic_pressure_gate: insert broad structural LoRA, '
-                            'then let online branch pressure gate LoRA updates. static_pressure_topk keeps the older pre-LoRA '
-                            'pressure top-k ablation. legacy_all_structural inserts the full structural surface without pressure gating.'
+                            'Module E execution mode. The formal method inserts structural LoRA and lets online '
+                            'branch pressure gate the LoRA update strength.'
                         ))
-    parser.add_argument('--module_e_pressure_guided', action='store_true', default=None,
-                        help='Deprecated alias for --module_e_mode static_pressure_topk.')
-    parser.add_argument('--module_e_no_pressure_guided', action='store_false', dest='module_e_pressure_guided',
-                        help='Deprecated alias for --module_e_mode legacy_all_structural.')
-    parser.add_argument('--module_e_pressure_file', default='', type=str,
-                        help='Optional CSV pressure map for Module E. If empty, a pre-LoRA gradient pressure probe is computed from training batches.')
-    parser.add_argument('--module_e_pressure_top_k', default=8, type=int,
-                        help='Keep the top-K pressure structural module prefixes for Module E LoRA. <=0 keeps all positive-pressure prefixes.')
-    parser.add_argument('--module_e_pressure_min', default=0.0, type=float,
-                        help='Minimum nonnegative structural pressure required for a Module E target prefix.')
-    parser.add_argument('--module_e_pressure_probe_batches', default=2, type=int,
-                        help='Number of train batches used for automatic pre-LoRA Module E gradient pressure.')
     parser.add_argument('--module_e_pressure_beta', default=0.95, type=float,
                         help='EMA beta for dynamic Module E LoRA-B gradient pressure.')
     parser.add_argument('--module_e_gate_temperature', default=1.0, type=float,
@@ -388,7 +369,7 @@ def get_args():
     parser.add_argument('--module_e_scale_max', default=1.5, type=float,
                         help='Maximum branch LoRA gradient multiplier used by dynamic Module E.')
     parser.add_argument('--module_e_warmup_steps', default=0, type=int,
-                        help='Optimizer steps to collect Module E pressure while keeping branch LoRA scales at 1.')
+                        help='Optimizer steps to collect Module E pressure while keeping branch LoRA scales at 1. Default 0 means immediate gating.')
     parser.add_argument('--module_e_diag_freq', default=1, type=int,
                         help='Write dynamic Module E pressure diagnostics every N optimizer steps.')
     parser.add_argument('--lora_train_head', action='store_true', default=True,
@@ -1233,33 +1214,6 @@ def _module_e_dynamic_pressure_requested(args):
     )
 
 
-def _module_e_pressure_guided_requested(args):
-    return (
-        str(getattr(args, "finetune_mod", "")).lower() == "lora"
-        and str(getattr(args, "lora_target", "")).lower() != "none"
-        and _module_e_mode(args) == "static_pressure_topk"
-        and _module_e_lora_requested(args)
-    )
-
-
-def _defer_lora_for_module_e_pressure(args):
-    return _module_e_pressure_guided_requested(args) and not bool(
-        _parse_semicolon_names(getattr(args, "module_e_pressure_selected_names", ""))
-    )
-
-
-def _module_e_allowed_names_for_lora(args):
-    if not _module_e_pressure_guided_requested(args):
-        return None
-    selected = _parse_semicolon_names(getattr(args, "module_e_pressure_selected_names", ""))
-    if not selected:
-        raise RuntimeError(
-            "Module E pressure-guided insertion is enabled, but no pressure-selected targets exist. "
-            "The run must compute/read pressure before LoRA injection."
-        )
-    return selected
-
-
 def _apply_lora_training_setup(model, args):
     if args.task_mod == 'Retrieval':
         raise ValueError('LoRA mode is currently implemented for Classification/Regression, not Retrieval.')
@@ -1276,23 +1230,31 @@ def _apply_lora_training_setup(model, args):
         for token in re.split(r"[,;\s|]+", str(module_c_selected_text or ""))
         if token.strip()
     ]
+    explicit_target_none = str(args.lora_target).lower() == 'none'
     target_module_c_empty = _is_module_c_execution_target(args.lora_target) and len(module_c_selected_tokens) == 0
-    target_none = (str(args.lora_target).lower() == 'none') or target_module_c_empty
+    target_none = explicit_target_none or target_module_c_empty
 
     if args.lora_base_update == 'freeze':
         freeze_all_parameters(model)
 
     if target_none:
-        if args.lora_base_update != 'freeze':
+        if explicit_target_none and args.lora_base_update != 'freeze':
             raise ValueError('lora_target=none is intended for frozen-backbone diagnosis only; use --lora_base_update freeze.')
         if target_module_c_empty:
-            print('[ModuleC] RGFS selected no B/D/E modules: no qv/qv_ffn fallback will be injected.')
+            print(f'[ModuleC] RGFS selected no B/D/E modules: no qv/qv_ffn fallback will be injected; base_update={args.lora_base_update}.')
         else:
             print('[LoRA] lora_target=none: no LoRA modules will be injected. Selected modules will be unfrozen below.')
-        if args.lora_train_head and hasattr(model, 'task_head'):
-            unfreeze_module(model.task_head)
-        if args.lora_train_chan_conv and hasattr(model, 'chan_conv'):
-            unfreeze_module(model.chan_conv)
+        if args.lora_base_update == 'freeze':
+            if args.lora_train_head and hasattr(model, 'task_head'):
+                unfreeze_module(model.task_head)
+            if args.lora_train_chan_conv and hasattr(model, 'chan_conv'):
+                unfreeze_module(model.chan_conv)
+        elif args.lora_base_update == 'full':
+            if not args.lora_train_head and hasattr(model, 'task_head'):
+                for p in model.task_head.parameters():
+                    p.requires_grad = False
+        else:
+            raise ValueError(f'Unknown lora_base_update={args.lora_base_update}')
         replaced = []
     else:
         replaced = apply_lora_to_eegfm(
@@ -1300,7 +1262,6 @@ def _apply_lora_training_setup(model, args):
             model_name=args.model_name,
             lora_target=args.lora_target,
             module_c_selected=getattr(args, 'module_c_resolved_selected', getattr(args, 'module_c_selected', '')),
-            module_e_allowed_names=_module_e_allowed_names_for_lora(args),
             r=args.lora_rank,
             alpha=args.lora_alpha,
             dropout=args.lora_dropout,
@@ -1366,22 +1327,6 @@ def _apply_lora_training_setup(model, args):
     return replaced
 
 
-def _prepare_module_e_probe_batch(args, samples, targets, device):
-    if args.norm_method == 'mv':
-        samples = samples.float().to(device, non_blocking=True) * args.mv_norm_value
-    else:
-        samples = samples.float().to(device, non_blocking=True)
-
-    targets = targets.to(device, non_blocking=True)
-    if args.task_mod == 'Regression':
-        targets = targets.float()
-    elif int(getattr(args, "nb_classes", 0)) == 1:
-        targets = targets.float().unsqueeze(-1)
-    else:
-        targets = targets.int().long()
-    return samples, targets
-
-
 def _build_module_e_pressure_criterion(args, device):
     if args.task_mod == 'Regression':
         return torch.nn.MSELoss()
@@ -1391,125 +1336,6 @@ def _build_module_e_pressure_criterion(args, device):
         is_binary=(int(getattr(args, "nb_classes", 0)) == 1),
         epoch_id=1,
     )
-
-
-def _compute_module_e_gradient_pressure(args, model, data_loader_train, device, candidate_names):
-    max_batches = int(getattr(args, "module_e_pressure_probe_batches", 2))
-    if max_batches <= 0:
-        raise RuntimeError("Module E automatic pressure requires --module_e_pressure_probe_batches > 0.")
-    if data_loader_train is None:
-        raise RuntimeError("Module E automatic pressure requires a training dataloader.")
-
-    name_to_param = dict(model.named_parameters())
-    candidates = [name for name in candidate_names if name in name_to_param]
-    if not candidates:
-        raise RuntimeError("Module E automatic pressure found no candidate parameters in the model.")
-
-    original_training = bool(model.training)
-    original_requires_grad = {name: bool(name_to_param[name].requires_grad) for name in candidates}
-    pressure = {name: 0.0 for name in candidates}
-    criterion = _build_module_e_pressure_criterion(args, device)
-    seen_batches = 0
-
-    try:
-        model.eval()
-        for name in candidates:
-            name_to_param[name].requires_grad_(True)
-
-        for batch_idx, batch in enumerate(data_loader_train):
-            if batch_idx >= max_batches:
-                break
-            if not isinstance(batch, (list, tuple)) or len(batch) < 2:
-                continue
-
-            samples, targets = _prepare_module_e_probe_batch(args, batch[0], batch[1], device)
-            model.zero_grad(set_to_none=True)
-            with torch.enable_grad():
-                output = model(samples)
-                if isinstance(output, (list, tuple)):
-                    output = output[0]
-                loss = criterion(output, targets)
-                if not torch.isfinite(loss.detach()):
-                    raise RuntimeError(f"Module E pressure probe produced non-finite loss: {float(loss.detach().cpu())}")
-                loss.backward()
-
-            for name in candidates:
-                grad = name_to_param[name].grad
-                if grad is not None:
-                    pressure[name] += float(grad.detach().float().pow(2).sum().cpu().item())
-            seen_batches += 1
-
-        if seen_batches <= 0:
-            raise RuntimeError("Module E pressure probe did not consume any valid training batches.")
-
-        for name in list(pressure.keys()):
-            pressure[name] = float(pressure[name] / seen_batches)
-        return pressure
-    finally:
-        model.zero_grad(set_to_none=True)
-        for name, requires_grad in original_requires_grad.items():
-            name_to_param[name].requires_grad_(requires_grad)
-        model.train(original_training)
-
-
-def _compute_and_apply_module_e_pressure_guided_lora(args, model, data_loader_train, device):
-    candidate_names = structural_inventory_from_model(str(args.model_name), model)
-    if not candidate_names:
-        raise RuntimeError(
-            f"Module E pressure-guided insertion found no structural inventory for model={args.model_name}."
-        )
-
-    pressure_file = str(getattr(args, "module_e_pressure_file", "") or "").strip()
-    if pressure_file:
-        pressure_by_name = load_module_e_pressure_csv(pressure_file)
-        pressure_source = f"file:{pressure_file}"
-        if not pressure_by_name:
-            raise RuntimeError(f"Module E pressure file has no usable pressure rows: {pressure_file}")
-    else:
-        pressure_by_name = _compute_module_e_gradient_pressure(
-            args=args,
-            model=model,
-            data_loader_train=data_loader_train,
-            device=device,
-            candidate_names=candidate_names,
-        )
-        pressure_source = f"auto_grad:{int(getattr(args, 'module_e_pressure_probe_batches', 2))}_train_batches"
-
-    selected = select_module_e_pressure_targets(
-        model_name=str(args.model_name),
-        candidate_names=candidate_names,
-        pressure_by_name=pressure_by_name,
-        top_k=int(getattr(args, "module_e_pressure_top_k", 8)),
-        min_pressure=float(getattr(args, "module_e_pressure_min", 0.0)),
-    )
-    if not selected:
-        raise RuntimeError(
-            "Module E pressure-guided insertion selected zero targets. "
-            "Check the pressure file/probe, top_k, or min_pressure; refusing to fall back silently."
-        )
-
-    args.module_e_pressure_source = pressure_source
-    args.module_e_pressure_selected_names = ";".join(selected)
-    args.module_e_pressure_candidate_count = len(candidate_names)
-    args.module_e_pressure_selected_count = len(selected)
-    save_module_e_pressure_targets(
-        args=args,
-        candidate_names=candidate_names,
-        pressure_by_name=pressure_by_name,
-        selected_names=selected,
-        pressure_source=pressure_source,
-    )
-    print(
-        f"[ModuleE] pressure-guided targets selected: {len(selected)}/{len(candidate_names)} "
-        f"(source={pressure_source}, top_k={int(getattr(args, 'module_e_pressure_top_k', 8))})"
-    )
-    for name in selected[:40]:
-        print(f"  [ModuleE] selected {name}")
-    if len(selected) > 40:
-        print(f"  [ModuleE] ... {len(selected) - 40} more selected targets")
-
-    _apply_lora_training_setup(model, args)
-    return pressure_by_name
 
 
 def _register_cbra_grad_scale_hooks(model, args, verbose=True):
@@ -1713,12 +1539,8 @@ def get_models(args, ch_names, num_t):
             p.requires_grad = False
 
     if args.finetune_mod == 'lora':
-        if _defer_lora_for_module_e_pressure(args):
-            args.module_e_lora_deferred = True
-            print('[ModuleE] pressure-guided LoRA insertion deferred until pre-LoRA pressure is computed.')
-        else:
-            args.module_e_lora_deferred = False
-            _apply_lora_training_setup(model, args)
+        args.module_e_lora_deferred = False
+        _apply_lora_training_setup(model, args)
     
     # add modules for retrieval
     if args.task_mod == 'Retrieval':
@@ -3577,16 +3399,6 @@ def main(args, ds_init):
     model.to(device)
     # model_ema = None
     model_without_ddp = model
-    module_e_pressure_by_name = None
-
-    if bool(getattr(args, 'module_e_lora_deferred', False)):
-        module_e_pressure_by_name = _compute_and_apply_module_e_pressure_guided_lora(
-            args=args,
-            model=model_without_ddp,
-            data_loader_train=data_loader_train,
-            device=device,
-        )
-        args.module_e_lora_deferred = False
 
     if _module_e_dynamic_pressure_requested(args):
         attach_module_e_dynamic_pressure_controller(args, model_without_ddp)
@@ -3602,7 +3414,8 @@ def main(args, ds_init):
     print("Model = %s" % str(model_without_ddp))
     print('number of params:', n_parameters)
     save_block_registry(args, model_without_ddp)
-    save_module_e_coverage_audit(args, model_without_ddp, pressure_by_name=module_e_pressure_by_name)
+    save_module_e_coverage_audit(args, model_without_ddp)
+    save_module_e_lora_injection_audit(args, model_without_ddp)
 
     if getattr(args, 'adapter_calib_eval', False):
         if args.task_mod == 'Regression':

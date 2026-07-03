@@ -55,14 +55,23 @@ MODULE_E_METRIC_SRP = "structural_routing_pressure"
 MODULE_E_METRIC_SRR = "structural_routing_release"
 MODULE_E_METRIC_ESC = "e_structural_coverage"
 MODULE_E_PRESSURE_PROXY_FILE = "module_e_structural_pressure.csv"
-MODULE_E_PRESSURE_TARGETS_FILE = "module_e_pressure_targets.csv"
 MODULE_E_DYNAMIC_PRESSURE_FILE = "module_e_dynamic_pressure.csv"
-MODULE_E_PRE_LORA_PRESSURE_DEFINITION = "pre_lora_gradient_energy_on_structural_candidate_weight"
+MODULE_E_LORA_INJECTION_AUDIT_FILE = "module_e_lora_injection_audit.csv"
 MODULE_E_DYNAMIC_PRESSURE_DEFINITION = "online_lora_b_gradient_energy_mean_by_structural_branch"
 MODULE_E_MODE_DYNAMIC = "dynamic_pressure_gate"
-MODULE_E_MODE_STATIC = "static_pressure_topk"
-MODULE_E_MODE_LEGACY = "legacy_all_structural"
-MODULE_E_MODES = (MODULE_E_MODE_DYNAMIC, MODULE_E_MODE_STATIC, MODULE_E_MODE_LEGACY)
+MODULE_E_MODES = (MODULE_E_MODE_DYNAMIC,)
+
+
+def _module_c_selected_modules(args: Optional[Any]) -> set[str]:
+    if args is None:
+        return set()
+    selected = getattr(args, "module_c_resolved_selected", "") or getattr(args, "module_c_selected", "")
+    out = set()
+    for token in str(selected or "").replace(";", ",").replace("|", ",").split(","):
+        token = token.strip().upper()
+        if token:
+            out.add(token)
+    return out
 
 
 def normalize_lora_target(lora_target: Any) -> str:
@@ -70,22 +79,21 @@ def normalize_lora_target(lora_target: Any) -> str:
 
 
 def module_e_mode_from_args(args: Any) -> str:
-    """Resolve Module E execution mode while keeping old flags as aliases."""
+    """Resolve Module E execution mode.
+
+    Formal Module E now uses only dynamic pressure-gated structural LoRA.
+    Older static top-k / legacy broad modes were removed to keep the method
+    story clean and avoid unexplained selection knobs.
+    """
     mode = str(getattr(args, "module_e_mode", "") or "").strip().lower()
     if mode:
         if mode not in MODULE_E_MODES:
             return MODULE_E_MODE_DYNAMIC
         return mode
-
-    legacy_flag = getattr(args, "module_e_pressure_guided", None)
-    if legacy_flag is True:
-        return MODULE_E_MODE_STATIC
-    if legacy_flag is False:
-        return MODULE_E_MODE_LEGACY
     return MODULE_E_MODE_DYNAMIC
 
 
-# 这边是 E 模块的目标接口：正式 E 只认结构/空间/时间注意力，不再接收带 FFN 的复合 target。
+# Module E only accepts pure structural / spatial / temporal targets.
 def is_module_e_pure_target(lora_target: Any) -> bool:
     return normalize_lora_target(lora_target) in MODULE_E_PURE_TARGETS
 
@@ -147,6 +155,8 @@ def module_e_metadata(
     if args is not None:
         if target is None:
             target = getattr(args, "lora_target", "")
+            if normalize_lora_target(target) in ("module_c", "module_c_auto", "c_auto") and "E" in _module_c_selected_modules(args):
+                target = "struct_mix"
         if base_update is None:
             base_update = getattr(args, "lora_base_update", "")
 
@@ -281,155 +291,6 @@ def _pressure_for_name(name: str, pressure_by_name: Mapping[str, Any]) -> float:
     return pressure
 
 
-def select_module_e_pressure_targets(
-    model_name: str,
-    candidate_names: Iterable[Any],
-    pressure_by_name: Mapping[str, Any],
-    top_k: Optional[int] = None,
-    min_pressure: float = 0.0,
-) -> Tuple[str, ...]:
-    """Select the structural module prefixes where Module E is allowed to act.
-
-    Pressure is defined on candidate structural parameters. For LoRA insertion
-    we aggregate those parameter pressures back to the module prefix that can
-    actually be wrapped, then keep the strongest prefixes.
-    """
-    module_pressure: Dict[str, float] = {}
-    module_order: Dict[str, int] = {}
-    for idx, raw_name in enumerate(_as_name_tuple(candidate_names)):
-        name = str(raw_name or "")
-        if _structural_block_for_name(model_name, name) is None:
-            continue
-        prefix = module_e_module_prefix_from_name(name)
-        if not prefix:
-            continue
-        pressure = _pressure_for_name(name, pressure_by_name)
-        module_pressure[prefix] = module_pressure.get(prefix, 0.0) + pressure
-        module_order.setdefault(prefix, idx)
-
-    threshold = max(0.0, float(min_pressure or 0.0))
-    ranked = [
-        (prefix, pressure)
-        for prefix, pressure in module_pressure.items()
-        if pressure > 0.0 and pressure >= threshold
-    ]
-    ranked.sort(key=lambda item: (-item[1], module_order.get(item[0], 10**9), item[0]))
-
-    if top_k is not None and int(top_k) > 0:
-        ranked = ranked[: int(top_k)]
-    return tuple(prefix for prefix, _pressure in ranked)
-
-
-def load_module_e_pressure_csv(
-    path: str,
-    name_col: str = "",
-    value_col: str = "",
-) -> Dict[str, float]:
-    """Load an external Module E pressure file.
-
-    Accepted defaults cover the diagnostics written by this module and simple
-    user-provided CSV files with name/module/parameter and pressure/score
-    columns.
-    """
-    rows = _read_csv_rows(str(path or ""))
-    if not rows:
-        return {}
-
-    name_candidates = [
-        name_col,
-        "candidate_name",
-        "param_name",
-        "parameter_name",
-        "module_name",
-        "target_name",
-        "name",
-    ]
-    value_candidates = [
-        value_col,
-        "pressure",
-        "grad_energy",
-        "module_pressure",
-        "score",
-        "value",
-    ]
-
-    out: Dict[str, float] = {}
-    for row in rows:
-        name = ""
-        for col in name_candidates:
-            if col and row.get(col):
-                name = str(row.get(col, "") or "").strip()
-                break
-        if not name:
-            continue
-
-        value = None
-        for col in value_candidates:
-            if col and row.get(col) not in (None, ""):
-                value = _safe_float(row.get(col))
-                if value is not None:
-                    break
-        if value is None:
-            continue
-        out[name] = out.get(name, 0.0) + _safe_positive(value)
-    return out
-# 前面全是什么数据输入啊，什么名字清洗啊，没啥重要的
-# 下面是旧版的，没删掉主要是有一些模块还有效
-def save_module_e_pressure_targets(
-    args: Any,
-    candidate_names: Iterable[Any],
-    pressure_by_name: Mapping[str, Any],
-    selected_names: Iterable[Any],
-    pressure_source: str,
-) -> Optional[str]:
-    """Persist the pre-insertion pressure map and selected E action surface."""
-    if args is None:
-        return None
-    output_dir = str(getattr(args, "output_dir", "") or "")
-    if not output_dir:
-        return None
-
-    model_name = str(getattr(args, "model_name", "") or "")
-    selected = set(_as_name_tuple(selected_names))
-    rows = []
-    for raw_name in _as_name_tuple(candidate_names):
-        candidate = str(raw_name or "")
-        if _structural_block_for_name(model_name, candidate) is None:
-            continue
-        target = module_e_module_prefix_from_name(candidate)
-        pressure = _pressure_for_name(candidate, pressure_by_name)
-        rows.append(
-            {
-                "module_e_metric": MODULE_E_METRIC_SRP,
-                "pressure_definition": MODULE_E_PRE_LORA_PRESSURE_DEFINITION,
-                "pressure_source": str(pressure_source or ""),
-                "pressure_is_pre_e": 1,
-                "model_name": model_name,
-                "run_tag": str(getattr(args, "run_tag", "") or ""),
-                "candidate_name": candidate,
-                "target_name": target,
-                "structural_block": _structural_block_for_name(model_name, candidate) or "",
-                "pressure": float(pressure),
-                "selected_for_lora": int(target in selected),
-            }
-        )
-    rows.sort(key=lambda row: (-float(row["pressure"]), row["target_name"], row["candidate_name"]))
-    if not rows:
-        return None
-
-    diag_dir = os.path.join(output_dir, "diagnostics")
-    os.makedirs(diag_dir, exist_ok=True)
-    path = os.path.join(diag_dir, MODULE_E_PRESSURE_TARGETS_FILE)
-    keys = list(rows[0].keys())
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    print(f"[ModuleE] pressure-guided target selection saved to: {path}")
-    return path
-# 到此
-
 def structural_inventory_from_model(
     model_name: str,
     model: Any,
@@ -488,9 +349,7 @@ def _tensor_grad_energy_and_count(grad: Any) -> Tuple[float, int]:
     if not math.isfinite(energy) or count <= 0:
         return 0.0, 0
     return max(0.0, energy), count
-# 这边往上就是抓原始 EEGFM 的结构权重，后面静态旧模式会用到；正式动态 E 主要看 LoRA-B 梯度。
-
-# 这块是 Module E 的核心控制器：算 pressure，再把 pressure 变成 LoRA 梯度倍率。
+# Formal dynamic E mainly reads LoRA-B gradients and then scales branch LoRA gradients.
 class ModuleEDynamicPressureController:
     """Online pressure-gated LoRA update controller for Module E.
 
@@ -505,7 +364,7 @@ class ModuleEDynamicPressureController:
         model_name: str,
         output_dir: str = "",
         run_tag: str = "",
-        beta: float = 0.95, # 平滑系数
+        beta: float = 0.95, # 骞虫粦绯绘暟
         temperature: float = 1.0,
         gate_floor: float = 0.2,
         scale_min: float = 0.5,
@@ -555,7 +414,7 @@ class ModuleEDynamicPressureController:
         if is_pressure_param and name not in self._branch_pressure_param_names[branch]:
             self._branch_pressure_param_names[branch].append(name)
         return True
-# 下面主要是记录参数怎么变化的
+
     def branch_param_count(self, branch: Any) -> int:
         return len(self._branch_param_names.get(str(branch or ""), ()))
 
@@ -666,6 +525,10 @@ class ModuleEDynamicPressureController:
             "pressure_source": "online_lora_gradient_hook",
             "pressure_is_pre_e": 0,
             "pressure_controls_lora_update": 1,
+            "pressure_param_scope": "lora_b_only",
+            "controlled_param_scope": "all_lora_params_in_same_structural_branch",
+            "pressure_reason": "lora_b_is_zero_initialized_output_side_adapter",
+            "warmup_policy": "immediate_pressure_gate" if self.warmup_steps == 0 else "collect_pressure_then_gate",
             "model_name": self.model_name,
             "run_tag": self.run_tag,
             "epoch": "" if epoch is None else int(epoch),
@@ -778,6 +641,152 @@ def _infer_injected_names_from_model(model_name: str, model: Any) -> Tuple[str, 
     return tuple(names)
 
 
+def _module_by_name(model: Any, module_name: str) -> Optional[Any]:
+    if model is None or not hasattr(model, "named_modules"):
+        return None
+    for name, module in model.named_modules():
+        if name == module_name:
+            return module
+    return None
+
+
+def _module_enabled_parts(module: Any) -> str:
+    parts = getattr(module, "enable_lora", "")
+    if isinstance(parts, (list, tuple, set)):
+        return ",".join(str(part) for part in parts)
+    return str(parts or "")
+
+
+def _module_e_matched_rule(model_name: str, module_name: str, branch: str) -> str:
+    lower_model = str(model_name or "").lower()
+    lower_name = str(module_name or "").lower()
+    if lower_model == "cbramod":
+        if "self_attn_s" in lower_name:
+            return "CBraMod.self_attn_s->spatial"
+        if "self_attn_t" in lower_name:
+            return "CBraMod.self_attn_t->temporal"
+    if lower_model in ("eegpt", "labram") and ".attn." in lower_name:
+        return "ViT.attn.qkv/proj->mixing"
+    if lower_model == "csbrain":
+        if "inter_region_attn" in lower_name:
+            return "CSBrain.inter_region_attn->spatial"
+        if "inter_window_attn" in lower_name:
+            return "CSBrain.inter_window_attn->temporal"
+    if lower_model == "biot" and lower_name.endswith(("to_q", "to_k", "to_v", "to_out")):
+        return "BIOT.attention_projection->mixing"
+    if lower_model == "gram":
+        if ".attn." in lower_name:
+            return "Gram.attn_projection->mixing"
+        if "proj_layers" in lower_name:
+            return "Gram.proj_layers->mixing"
+    return f"fb_registry->{branch or 'unknown'}"
+
+
+def _module_e_param_counts(model: Any, module_name: str) -> Tuple[int, int]:
+    if model is None or not hasattr(model, "named_parameters"):
+        return 0, 0
+    lora_count = 0
+    pressure_count = 0
+    prefix = str(module_name or "")
+    dotted = prefix + "."
+    for raw_name, _param in model.named_parameters():
+        name = str(raw_name or "")
+        if not (name == prefix or name.startswith(dotted)):
+            continue
+        if not _is_lora_adapter_param(name):
+            continue
+        lora_count += 1
+        if _is_lora_b_param_name(name):
+            pressure_count += 1
+    return lora_count, pressure_count
+
+
+def save_module_e_lora_injection_audit(
+    args: Any,
+    model: Any,
+    injected_names: Optional[Iterable[Any]] = None,
+) -> Optional[str]:
+    """Save per-module audit rows for the actual Module E LoRA insertion.
+
+    This file explains where E touched the backbone. It is diagnostic metadata:
+    the dynamic pressure controller still decides update strength online.
+    """
+    if args is None or not bool(getattr(args, "fb_enable", False)):
+        return None
+
+    meta = module_e_metadata(args=args)
+    if not int(meta.get("module_e_is_active", 0)):
+        return None
+
+    output_dir = str(getattr(args, "output_dir", "") or "")
+    if not output_dir:
+        return None
+
+    model_name = str(getattr(args, "model_name", "") or "")
+    parsed_injected = _parse_name_list(injected_names)
+    if not parsed_injected:
+        parsed_injected = _parse_name_list(getattr(args, "module_e_injected_names", ""))
+    if not parsed_injected:
+        parsed_injected = _infer_injected_names_from_model(model_name, model)
+    if not parsed_injected:
+        return None
+
+    controlled_branches = set(_parse_name_list(getattr(args, "module_e_dynamic_pressure_branches", "")))
+    rows = []
+    for module_name in parsed_injected:
+        module_name = str(module_name or "")
+        branch = _structural_block_for_name(model_name, module_name) or ""
+        if not branch:
+            for raw_param_name, _param in getattr(model, "named_parameters", lambda: [])():
+                param_name = str(raw_param_name or "")
+                if param_name.startswith(module_name + "."):
+                    branch = _structural_block_for_name(model_name, param_name) or ""
+                    if branch:
+                        break
+        if not branch:
+            continue
+
+        module = _module_by_name(model, module_name)
+        lora_count, pressure_count = _module_e_param_counts(model, module_name)
+        rows.append(
+            {
+                "module_e_metric": "e_lora_injection_audit",
+                "model_name": model_name,
+                "run_tag": str(getattr(args, "run_tag", "") or ""),
+                "module_name": module_name,
+                "structural_branch": branch,
+                "matched_rule": _module_e_matched_rule(model_name, module_name, branch),
+                "wrapper_type": type(module).__name__ if module is not None else "",
+                "enabled_lora_parts": _module_enabled_parts(module),
+                "lora_param_count": lora_count,
+                "pressure_param_count": pressure_count,
+                "pressure_param_scope": "lora_b_only",
+                "controlled_param_scope": "all_lora_params_in_same_structural_branch",
+                "pressure_reason": "lora_b_is_zero_initialized_output_side_adapter",
+                "dynamic_pressure_controlled": int(
+                    bool(getattr(args, "module_e_dynamic_pressure_enabled", False))
+                    and branch in controlled_branches
+                    and lora_count > 0
+                ),
+            }
+        )
+
+    if not rows:
+        return None
+
+    diag_dir = os.path.join(output_dir, "diagnostics")
+    os.makedirs(diag_dir, exist_ok=True)
+    path = os.path.join(diag_dir, MODULE_E_LORA_INJECTION_AUDIT_FILE)
+    keys = list(rows[0].keys())
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    print(f"[ModuleE] LoRA injection audit saved to: {path}")
+    return path
+
+
 def save_module_e_coverage_audit(
     args: Any,
     model: Any,
@@ -832,7 +841,7 @@ def save_module_e_coverage_audit(
     return path
 
 
-# 这块往下主要是训练后的记录和诊断，不直接决定 LoRA 怎么更新。
+# The helpers below are post-hoc diagnostics; they do not control LoRA updates.
 def _safe_float(value: Any) -> Optional[float]:
     try:
         out = float(value)
@@ -946,7 +955,7 @@ def save_module_e_structural_pressure_proxy(
     print(f"[ModuleE] structural pressure proxy saved to: {path_out}")
     return path_out
 
-# 往下是怎么定义ESC，也就是Module E structural coverage的，主要是计算有多少结构路由表面被审计过了
+# ESC is a registry-defined structural coverage audit.
 @dataclass(frozen=True)
 class StructuralCoverageAudit:
     """ESC = how much audited structural routing surface Module E covers."""
