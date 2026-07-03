@@ -29,6 +29,19 @@ MODULE_B_LEGACY_ALIASES = frozenset(
 MODULE_B_TARGETS = frozenset((MODULE_B_TARGET, *MODULE_B_LEGACY_ALIASES))
 MODULE_B_CURRENT = "signal_alignment_input_front"
 MODULE_B_ROLE = "input_front_accessibility"
+MODULE_B_SITES = frozenset(("both", "input", "bridge"))
+
+
+def _module_c_selected_modules(args: Optional[Any]) -> set[str]:
+    if args is None:
+        return set()
+    selected = getattr(args, "module_c_resolved_selected", "") or getattr(args, "module_c_selected", "")
+    out = set()
+    for token in str(selected or "").replace(";", ",").replace("|", ",").split(","):
+        token = token.strip().upper()
+        if token:
+            out.add(token)
+    return out
 
 
 def normalize_lora_target(lora_target: Any) -> str:
@@ -39,28 +52,58 @@ def is_module_b_target(lora_target: Any) -> bool:
     return normalize_lora_target(lora_target) in MODULE_B_TARGETS
 
 
-def should_lora_input_side(lora_target: Any) -> bool:
+def normalize_module_b_sites(module_b_sites: Any = "both") -> str:
+    text = str(module_b_sites or "both").strip().lower()
+    aliases = {
+        "all": "both",
+        "input_side": "input",
+        "input-only": "input",
+        "input_only": "input",
+        "bridge-only": "bridge",
+        "bridge_only": "bridge",
+        "chan_conv": "bridge",
+        "channel_bridge": "bridge",
+    }
+    text = aliases.get(text, text)
+    if text not in MODULE_B_SITES:
+        raise ValueError(f"Unknown module_b_sites={module_b_sites!r}; expected one of {sorted(MODULE_B_SITES)}")
+    return text
+
+
+def should_lora_input_side(lora_target: Any, module_b_sites: Any = "both") -> bool:
     """Whether this target should install the raw-input residual adapter."""
-    return is_module_b_target(lora_target)
+    return is_module_b_target(lora_target) and normalize_module_b_sites(module_b_sites) in ("both", "input")
+
+
+def should_lora_bridge(lora_target: Any, module_b_sites: Any = "both") -> bool:
+    """Whether this target should wrap the existing 1x1 channel bridge."""
+    return is_module_b_target(lora_target) and normalize_module_b_sites(module_b_sites) in ("both", "bridge")
 
 
 def module_b_metadata(
     args: Optional[Any] = None,
     lora_target: Optional[Any] = None,
     lora_base_update: Optional[Any] = None,
+    module_b_sites: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Return shared Module B metadata for logs, probes, and collected outputs."""
     target = lora_target
     base_update = lora_base_update
+    sites = module_b_sites
     if args is not None:
         if target is None:
             target = getattr(args, "lora_target", "")
+            if normalize_lora_target(target) in ("module_c", "module_c_auto", "c_auto") and "B" in _module_c_selected_modules(args):
+                target = MODULE_B_TARGET
         if base_update is None:
             base_update = getattr(args, "lora_base_update", "")
+        if sites is None:
+            sites = getattr(args, "module_b_sites", "both")
 
     target = str(target or "")
     base_update = str(base_update or "")
     active = int(is_module_b_target(target))
+    sites = normalize_module_b_sites(sites or "both") if active else ""
     pure = int(bool(active) and base_update.lower() == "freeze")
 
     return {
@@ -68,6 +111,9 @@ def module_b_metadata(
         "module_b_role": MODULE_B_ROLE if active else "",
         "module_b_is_active": active,
         "module_b_is_pure_isolation": pure,
+        "module_b_sites": sites,
+        "module_b_input_side_active": int(bool(active) and sites in ("both", "input")),
+        "module_b_bridge_active": int(bool(active) and sites in ("both", "bridge")),
         "module_b_attribution_note": (
             "pure_frozen_b_isolation"
             if pure
@@ -123,6 +169,12 @@ class LoRAConv1d1x1(nn.Module):
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
 
+    def effective_delta_weight(self):
+        """Return the actual low-rank channel update W_delta = B @ A."""
+        return (
+            self.lora_B.squeeze(-1) @ self.lora_A.squeeze(-1)
+        ) * self.scaling * float(getattr(self, "lora_runtime_scale", 1.0))
+
     def forward(self, x):
         base_out = self.base(x)
         hidden = F.conv1d(self.dropout(x), self.lora_A, bias=None, stride=1, padding=0, dilation=1, groups=1)
@@ -160,6 +212,12 @@ class InputSideLoRAResidual(nn.Module):
     def reset_lora_parameters(self):
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
+
+    def effective_delta_weight(self):
+        """Return the actual input-channel update W_delta = B @ A."""
+        return (
+            self.lora_B.squeeze(-1) @ self.lora_A.squeeze(-1)
+        ) * self.scaling * float(getattr(self, "lora_runtime_scale", 1.0))
 
     def delta(self, x):
         if x.dim() != 3:

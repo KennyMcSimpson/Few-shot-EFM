@@ -5,7 +5,11 @@ from typing import Any, Callable, Optional
 
 import torch
 
-from .fb_probe import save_signal_alignment_probe
+from .fb_probe import (
+    save_module_b_config,
+    save_module_b_matrix_summary,
+    save_signal_alignment_probe,
+)
 
 
 def _cpu_tensor_state(model) -> dict:
@@ -26,8 +30,21 @@ def run_signal_alignment_probe_after_training(
     save_probe_fn: Optional[Callable[..., Any]] = None,
 ) -> bool:
     save_probe = save_probe_fn or save_signal_alignment_probe
-    if data_loader_val is None or not bool(is_main_process):
+    if not bool(is_main_process):
         return False
+
+    wrote_any = False
+    try:
+        wrote_any = bool(save_module_b_config(args=args, model=model)) or wrote_any
+    except Exception as exc:
+        print(f"[FB2][WARN] Module B config export failed: {exc}")
+    try:
+        wrote_any = bool(save_module_b_matrix_summary(args=args, model=model)) or wrote_any
+    except Exception as exc:
+        print(f"[FB2][WARN] Module B matrix summary export failed: {exc}")
+
+    if data_loader_val is None:
+        return bool(wrote_any)
 
     signal_probe_written = False
     if lifecycle_selection_row is not None:
@@ -74,4 +91,4 @@ def run_signal_alignment_probe_after_training(
             )
         )
 
-    return bool(signal_probe_written)
+    return bool(signal_probe_written or wrote_any)

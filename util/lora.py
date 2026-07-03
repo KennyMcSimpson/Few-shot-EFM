@@ -17,6 +17,7 @@ from .module_b_signal_alignment import (
     LoRAConv1d1x1,
     install_input_side_lora,
     is_module_b_target,
+    should_lora_bridge,
     should_lora_input_side,
 )
 from .module_c_lora_search import parse_module_ids
@@ -307,6 +308,7 @@ class LoraTargetPlan:
     use_structural: bool
     use_bridge: bool
     use_input_side: bool
+    module_b_sites: str
     spatial_only: bool
     temporal_only: bool
     spatial_branch_target: bool
@@ -424,12 +426,16 @@ def _should_lora_structural(lora_target: str, module_c_selected: Optional[str | 
     return is_module_e_structural_mixing_target(lora_target)
 
 
-def _should_lora_bridge(lora_target: str, module_c_selected: Optional[str | Iterable[str]] = None) -> bool:
+def _should_lora_bridge(
+    lora_target: str,
+    module_c_selected: Optional[str | Iterable[str]] = None,
+    module_b_sites: str = "both",
+) -> bool:
     target = lora_target.lower()
     if _is_module_c_execution_target(target):
-        return "B" in set(_module_c_selected_ids(module_c_selected))
+        return "B" in set(_module_c_selected_ids(module_c_selected)) and should_lora_bridge("signal_align", module_b_sites)
     return target in ("bridge", "input_bridge", "front",
-                      "bridge_ffn", "bridge_ffn_last2", "bridge_last2ffn_pure") or is_module_b_target(target)
+                      "bridge_ffn", "bridge_ffn_last2", "bridge_last2ffn_pure") or should_lora_bridge(target, module_b_sites)
 
 
 def _is_spatial_attn_only(lora_target: str) -> bool:
@@ -479,10 +485,14 @@ def _csbrain_spectral_selection_target(plan: LoraTargetPlan) -> str:
     return plan.target_lower
 
 
-def _should_lora_input_side(lora_target: str, module_c_selected: Optional[str | Iterable[str]] = None) -> bool:
+def _should_lora_input_side(
+    lora_target: str,
+    module_c_selected: Optional[str | Iterable[str]] = None,
+    module_b_sites: str = "both",
+) -> bool:
     if _is_module_c_execution_target(lora_target):
-        return "B" in set(_module_c_selected_ids(module_c_selected))
-    return should_lora_input_side(lora_target)
+        return "B" in set(_module_c_selected_ids(module_c_selected)) and should_lora_input_side("signal_align", module_b_sites)
+    return should_lora_input_side(lora_target, module_b_sites)
 
 
 def _install_input_side_lora(model: nn.Module, r: int, alpha: float, dropout: float) -> List[str]:
@@ -492,6 +502,7 @@ def _install_input_side_lora(model: nn.Module, r: int, alpha: float, dropout: fl
 def _lora_target_plan(
     lora_target: str,
     module_c_selected: Optional[str | Iterable[str]] = None,
+    module_b_sites: str = "both",
 ) -> LoraTargetPlan:
     target_lower = str(lora_target or "").lower()
     selected = _module_c_selected_ids(module_c_selected) if _is_module_c_execution_target(target_lower) else tuple()
@@ -501,8 +512,9 @@ def _lora_target_plan(
         use_ffn=_should_lora_ffn(target_lower, selected),
         use_all_linear=_should_lora_all_linear(target_lower),
         use_structural=_should_lora_structural(target_lower, selected),
-        use_bridge=_should_lora_bridge(target_lower, selected),
-        use_input_side=_should_lora_input_side(target_lower, selected),
+        use_bridge=_should_lora_bridge(target_lower, selected, module_b_sites),
+        use_input_side=_should_lora_input_side(target_lower, selected, module_b_sites),
+        module_b_sites=str(module_b_sites or "both"),
         spatial_only=_is_spatial_attn_only(target_lower),
         temporal_only=_is_temporal_attn_only(target_lower),
         spatial_branch_target=(
@@ -772,6 +784,8 @@ def apply_lora_to_eegfm(
     model_name: str,
     lora_target: str = "qv",
     module_c_selected: Optional[str | Iterable[str]] = None,
+    module_e_allowed_names: Optional[Iterable[str]] = None,
+    module_b_sites: str = "both",
     r: int = 4,
     alpha: float = 8.0,
     dropout: float = 0.1,
@@ -802,6 +816,7 @@ def apply_lora_to_eegfm(
     plan = _lora_target_plan(
         lora_target,
         module_c_selected=module_c_selected,
+        module_b_sites=module_b_sites,
     )
     max_layer_idx = _max_layer_index(model)
     handler = LORA_MODEL_MODULE_HANDLERS.get(model_name)

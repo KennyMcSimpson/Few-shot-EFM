@@ -39,7 +39,11 @@ def add_fb_args(parser):
     parser.add_argument("--module_c_rgfs_focus_ratio", default=0.80, type=float, help="Class burden ratio relative to uniform that defines RGFS focus classes.")
     return parser
 MODEL_DEFAULT_RECIPE={"BIOT":"sem_lif","LaBraM":"sem_lif","EEGPT":"sig_align","CBraMod":"str_mix","Gram":"gram_diag","CSBrain":"csb_diag","NeurIPT":"probe_only"}
-MODULE_B_METADATA_KEYS=("module_b_current","module_b_role","module_b_is_active","module_b_is_pure_isolation")
+MODULE_B_METADATA_KEYS=(
+    "module_b_current","module_b_role","module_b_is_active",
+    "module_b_is_pure_isolation","module_b_sites",
+    "module_b_input_side_active","module_b_bridge_active",
+)
 MODULE_D_METADATA_KEYS=("module_d_current","module_d_role","module_d_is_active","module_d_touches_semantic_ffn","module_d_is_pure_isolation","module_d_is_composite","module_d_variant","module_d_reference_metric","module_d_attribution_note")
 MODULE_E_METADATA_KEYS=("module_e_current","module_e_role","module_e_is_active","module_e_is_pure_isolation","module_e_is_composite","module_e_variant","module_e_target_blocks","module_e_reference_metrics","module_e_attribution_note")
 MODULE_C_METADATA_KEYS=("module_c_current","module_c_role","module_c_is_active","module_c_candidates","module_c_selected_modules","module_c_selection_rule","module_c_no_qv_baseline")

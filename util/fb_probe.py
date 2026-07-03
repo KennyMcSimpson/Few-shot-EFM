@@ -5,7 +5,12 @@ from collections import Counter, defaultdict
 from typing import Any, Dict, Iterable, List, Optional
 import torch
 from .fb_registry import CANONICAL_BLOCKS, classify_param_name
-from .module_b_signal_alignment import module_b_metadata
+from .module_b_signal_alignment import (
+    InputSideLoRAResidual,
+    LoRAConv1d1x1,
+    infer_input_channels,
+    module_b_metadata,
+)
 
 def _ensure_dir(path: str):
     if path: os.makedirs(path, exist_ok=True)
@@ -146,9 +151,129 @@ def _top_channel_energy_text(channel_energy: Optional[torch.Tensor], top_n: int=
     k=min(int(top_n), int(channel_energy.numel()))
     vals, idx=torch.topk(channel_energy.float(), k=k)
     return ";".join([f"{int(i)}:{float(v):.6g}" for v,i in zip(vals.tolist(),idx.tolist())])
-def save_signal_alignment_probe(args, model, data_loader, device, split: str="val_lifecycle_selected", selection_row: Optional[Dict[str, Any]]=None):
-    if not (bool(getattr(args,"fb_enable",False)) and bool(getattr(args,"fb_probe",False))):
+def _module_b_bridge_adapters(model) -> List[tuple[str, Any]]:
+    return [(name, module) for name, module in model.named_modules() if isinstance(module, LoRAConv1d1x1)]
+def _top_vector_text(values: Optional[torch.Tensor], top_n: int=5) -> str:
+    if values is None or values.numel()==0:
+        return ""
+    k=min(int(top_n), int(values.numel()))
+    vals, idx=torch.topk(values.float(), k=k)
+    return ";".join([f"{int(i)}:{float(v):.6g}" for v,i in zip(vals.tolist(),idx.tolist())])
+def _top_matrix_pairs_text(weight: torch.Tensor, top_n: int=8) -> str:
+    if weight.numel()==0:
+        return ""
+    flat=weight.detach().float().abs().flatten()
+    k=min(int(top_n), int(flat.numel()))
+    vals, idx=torch.topk(flat, k=k)
+    cols=int(weight.shape[1]) if weight.ndim==2 and weight.shape[1] else 1
+    pairs=[]
+    for v,i in zip(vals.tolist(),idx.tolist()):
+        out_idx=int(i)//cols
+        in_idx=int(i)%cols
+        pairs.append(f"{out_idx}:{in_idx}:{float(v):.6g}")
+    return ";".join(pairs)
+def _matrix_rank_stats(weight: torch.Tensor) -> Dict[str, Any]:
+    if weight.ndim!=2 or weight.numel()==0:
+        return {"effective_rank":"","rank90":"","top_singular_values":""}
+    try:
+        s=torch.linalg.svdvals(weight.float())
+        energy=s*s
+        total=float(energy.sum().item())
+        if total<=1e-20:
+            return {"effective_rank":0.0,"rank90":0,"top_singular_values":""}
+        p=energy/energy.sum()
+        entropy=float(-(p*(p+1e-12).log()).sum().item())
+        cumsum=torch.cumsum(energy,dim=0)/energy.sum()
+        top=";".join(f"{float(v):.6g}" for v in s[: min(8, int(s.numel()))].tolist())
+        return {"effective_rank":math.exp(entropy),"rank90":int((cumsum<0.90).sum().item()+1),"top_singular_values":top}
+    except Exception:
+        return {"effective_rank":"","rank90":"","top_singular_values":""}
+def _module_b_matrix_row(args, site: str, name: str, adapter: Any) -> Dict[str, Any]:
+    weight=adapter.effective_delta_weight().detach().float().cpu()
+    sq=weight.pow(2)
+    total=float(sq.sum().item())
+    diag_n=min(int(weight.shape[0]), int(weight.shape[1])) if weight.ndim==2 else 0
+    diag_energy=float(torch.diagonal(sq[:diag_n, :diag_n]).sum().item()) if diag_n>0 else 0.0
+    off_energy=max(total-diag_energy, 0.0)
+    row={
+        "site":site,
+        "module_name":name,
+        "model":getattr(args,"model_name",""),
+        "dataset":getattr(args,"dataset",""),
+        "subject_mod":getattr(args,"subject_mod",""),
+        "k_shot":getattr(args,"k_shot",""),
+        "seed":getattr(args,"seed",""),
+        "rank":int(getattr(adapter,"r",-1)),
+        "alpha":float(getattr(adapter,"alpha",0.0)),
+        "alpha_over_rank":float(getattr(adapter,"scaling",0.0)),
+        "runtime_scale":float(getattr(adapter,"lora_runtime_scale",1.0)),
+        "out_channels":int(weight.shape[0]) if weight.ndim==2 else "",
+        "in_channels":int(weight.shape[1]) if weight.ndim==2 else "",
+        "delta_fro_norm":float(torch.linalg.vector_norm(weight).item()) if weight.numel() else 0.0,
+        "delta_spectral_norm":float(torch.linalg.matrix_norm(weight,ord=2).item()) if weight.ndim==2 and weight.numel() else 0.0,
+        "diagonal_energy_ratio":diag_energy/(total+1e-12),
+        "off_diagonal_energy_ratio":off_energy/(total+1e-12),
+        "top_input_channels":_top_vector_text(sq.sum(dim=0) if weight.ndim==2 else None),
+        "top_output_channels":_top_vector_text(sq.sum(dim=1) if weight.ndim==2 else None),
+        "top_channel_pairs":_top_matrix_pairs_text(weight),
+    }
+    row.update(_matrix_rank_stats(weight))
+    row.update(_module_b_metadata(args))
+    return row
+def save_module_b_config(args, model):
+    meta=_module_b_metadata(args)
+    if not meta["module_b_is_active"]:
         return None
+    diag_dir=os.path.join(args.output_dir,"diagnostics")
+    _ensure_dir(diag_dir)
+    bridge_adapters=_module_b_bridge_adapters(model)
+    input_adapter=getattr(model,"input_side_lora",None)
+    bridge_base_frozen=""
+    if bridge_adapters:
+        bridge_base_frozen=int(all(not p.requires_grad for _,m in bridge_adapters for p in m.base.parameters()))
+    payload={
+        **meta,
+        "model":getattr(args,"model_name",""),
+        "dataset":getattr(args,"dataset",""),
+        "subject_mod":getattr(args,"subject_mod",""),
+        "k_shot":getattr(args,"k_shot",""),
+        "seed":getattr(args,"seed",""),
+        "lora_rank":getattr(args,"lora_rank",""),
+        "lora_alpha":getattr(args,"lora_alpha",""),
+        "alpha_over_rank":float(getattr(args,"lora_alpha",0.0))/max(float(getattr(args,"lora_rank",1)),1.0),
+        "lora_dropout":getattr(args,"lora_dropout",""),
+        "input_channels":infer_input_channels(model),
+        "input_side_lora_present":int(isinstance(input_adapter,InputSideLoRAResidual)),
+        "bridge_lora_count":len(bridge_adapters),
+        "bridge_lora_modules":";".join(name for name,_ in bridge_adapters),
+        "bridge_in_channels":";".join(str(int(m.in_channels)) for _,m in bridge_adapters),
+        "bridge_out_channels":";".join(str(int(m.out_channels)) for _,m in bridge_adapters),
+        "wrapped_base_conv_frozen":bridge_base_frozen,
+        "trainable_param_count":sum(int(p.numel()) for p in model.parameters() if p.requires_grad),
+        "total_param_count":sum(int(p.numel()) for p in model.parameters()),
+    }
+    path=os.path.join(diag_dir,"module_b_config.json")
+    with open(path,"w",encoding="utf-8") as f:
+        json.dump({k:_safe_scalar(v) for k,v in payload.items()},f,indent=2,ensure_ascii=False)
+    print(f"[FB2] Module B config saved to: {path}")
+    return path
+def save_module_b_matrix_summary(args, model):
+    meta=_module_b_metadata(args)
+    if not meta["module_b_is_active"]:
+        return None
+    rows=[]
+    input_adapter=getattr(model,"input_side_lora",None)
+    if isinstance(input_adapter,InputSideLoRAResidual):
+        rows.append(_module_b_matrix_row(args,"input_side","input_side_lora",input_adapter))
+    for name,adapter in _module_b_bridge_adapters(model):
+        rows.append(_module_b_matrix_row(args,"bridge",name,adapter))
+    if not rows:
+        return None
+    path=os.path.join(args.output_dir,"diagnostics","module_b_matrix_summary.csv")
+    _write_csv(path,rows)
+    print(f"[FB2] Module B matrix summary saved to: {path}")
+    return path
+def save_signal_alignment_probe(args, model, data_loader, device, split: str="val_lifecycle_selected", selection_row: Optional[Dict[str, Any]]=None):
     max_batches=int(getattr(args,"fb_signal_probe_batches",4))
     if max_batches<=0 or data_loader is None:
         return None
@@ -163,7 +288,8 @@ def save_signal_alignment_probe(args, model, data_loader, device, split: str="va
     csv_path=os.path.join(diag_dir,"signal_alignment_probe.csv")
     was_training=bool(model.training)
     ratios=[]; input_norms=[]; delta_norms=[]; delta_abs=[]; labels=[]
-    channel_energy_sum=None; channel_batches=0; batches_seen=0; samples_seen=0
+    channel_energy_sum=None; channel_delta_abs_sum=None; channel_input_abs_sum=None
+    channel_batches=0; batches_seen=0; samples_seen=0
     try:
         model.eval()
         with torch.no_grad():
@@ -196,6 +322,10 @@ def save_signal_alignment_probe(args, model, data_loader, device, split: str="va
                     pass
                 ce=delta.detach().float().pow(2).mean(dim=(0,2)).cpu()
                 channel_energy_sum=ce if channel_energy_sum is None else channel_energy_sum+ce
+                cda=delta.detach().float().abs().mean(dim=(0,2)).cpu()
+                cia=x.detach().float().abs().mean(dim=(0,2)).cpu()
+                channel_delta_abs_sum=cda if channel_delta_abs_sum is None else channel_delta_abs_sum+cda
+                channel_input_abs_sum=cia if channel_input_abs_sum is None else channel_input_abs_sum+cia
                 channel_batches+=1
                 batches_seen+=1
                 samples_seen+=int(x.shape[0])
@@ -210,8 +340,13 @@ def save_signal_alignment_probe(args, model, data_loader, device, split: str="va
     all_abs=torch.cat(delta_abs)
     finite=torch.isfinite(all_ratio)
     all_ratio=all_ratio[finite]; all_input=all_input[finite]; all_delta=all_delta[finite]; all_abs=all_abs[finite]
+    if all_ratio.numel()==0:
+        return None
     all_labels=torch.cat(labels)[finite] if labels and torch.cat(labels).numel()==finite.numel() else None
     channel_energy=(channel_energy_sum/float(max(channel_batches,1))) if channel_energy_sum is not None else None
+    channel_delta_abs=(channel_delta_abs_sum/float(max(channel_batches,1))) if channel_delta_abs_sum is not None else None
+    channel_input_abs=(channel_input_abs_sum/float(max(channel_batches,1))) if channel_input_abs_sum is not None else None
+    channel_delta_input_ratio=(channel_delta_abs/(channel_input_abs+1e-12)) if channel_delta_abs is not None and channel_input_abs is not None else None
     selection_row=selection_row or {}
 
     def make_row(row_type: str, mask: Optional[torch.Tensor]=None, class_id: str=""):
@@ -229,11 +364,15 @@ def save_signal_alignment_probe(args, model, data_loader, device, split: str="va
             "probe_samples_seen":int(samples_seen),
             "delta_input_ratio_mean":float(r.mean().item()),
             "delta_input_ratio_median":float(r.median().item()),
+            "delta_input_ratio_p95":float(torch.quantile(r.float(),0.95).item()) if r.numel()>1 else float(r.max().item()),
             "delta_input_ratio_max":float(r.max().item()),
             "input_norm_mean":float(inn.mean().item()),
             "delta_norm_mean":float(den.mean().item()),
             "delta_abs_mean":float(ab.mean().item()),
             "top_channel_delta_energy":_top_channel_energy_text(channel_energy),
+            "per_channel_delta_abs_mean":_top_vector_text(channel_delta_abs, top_n=9999),
+            "per_channel_delta_input_ratio":_top_vector_text(channel_delta_input_ratio, top_n=9999),
+            "top_channel_delta_input_ratio":_top_vector_text(channel_delta_input_ratio, top_n=5),
             "fb_recipe":getattr(args,"fb_resolved_recipe",getattr(args,"fb_recipe","")),
             "dataset":getattr(args,"dataset",""),
             "subject_mod":getattr(args,"subject_mod",""),

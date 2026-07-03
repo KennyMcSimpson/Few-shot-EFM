@@ -339,6 +339,13 @@ def get_args():
                             'bridge/input_bridge for EEGPT/BIOT input adapter.'
                             ' module_c auto-runs zero-update preflight unless --module_c_selected is provided.'
                         ))
+    parser.add_argument('--module_b_sites', default='both', type=str,
+                        choices=['both', 'input', 'bridge'],
+                        help=(
+                            'Module B site switch for signal_align and module_c+B. '
+                            'both = raw-input residual plus 1x1 channel-bridge LoRA (default); '
+                            'input = raw-input residual only; bridge = existing channel-bridge LoRA only.'
+                        ))
     parser.add_argument('--lora_base_update', default='freeze', type=str, choices=['freeze', 'full'],
                         help=(
                             'How to handle original backbone parameters when LoRA is injected. '
@@ -1262,6 +1269,7 @@ def _apply_lora_training_setup(model, args):
             model_name=args.model_name,
             lora_target=args.lora_target,
             module_c_selected=getattr(args, 'module_c_resolved_selected', getattr(args, 'module_c_selected', '')),
+            module_b_sites=getattr(args, 'module_b_sites', 'both'),
             r=args.lora_rank,
             alpha=args.lora_alpha,
             dropout=args.lora_dropout,
@@ -3181,6 +3189,8 @@ def main(args, ds_init):
         )
         if args.lora_train_chan_conv:
             short_tag += "_cc"
+        if getattr(args, 'module_b_sites', 'both') != 'both':
+            short_tag += f"_bsite{getattr(args, 'module_b_sites')}"
         if getattr(args, 'cbra_train_patch_embed_when_frozen', False):
             short_tag += "_cbpatchtrain"
         if getattr(args, 'cbra_freeze_patch_embed_in_full', False):
