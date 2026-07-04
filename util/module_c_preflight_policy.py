@@ -152,10 +152,11 @@ def _per_sample_loss(output: torch.Tensor, targets: torch.Tensor, args: Any) -> 
 
 def _collect_probe_batches(data_loader: Any, max_batches: int) -> List[Sequence[Any]]:
     batches: List[Sequence[Any]] = []
-    if data_loader is None or max_batches <= 0:
+    if data_loader is None:
         return batches
+    limit = int(max_batches)
     for batch_idx, batch in enumerate(data_loader):
-        if batch_idx >= max_batches:
+        if limit > 0 and batch_idx >= limit:
             break
         if isinstance(batch, (list, tuple)) and len(batch) >= 2:
             batches.append(batch)
@@ -295,6 +296,9 @@ def _empty_snapshot(candidate_modules: Sequence[str]) -> Dict[str, Dict[str, Any
             "vectors": {},
             "lrf_weighted": 0.0,
             "lrf_energy": 0.0,
+            "lrf_total_energy": 0.0,
+            "lrf_measured_tensors": 0,
+            "lrf_skipped_tensors": 0,
         }
         for m in candidate_modules
     }
@@ -319,6 +323,8 @@ def _snapshot_gradients(
         item["param_count"] += int(grad.numel())
         item["vectors"][name] = grad.reshape(-1).cpu()
         if _is_base_gradient_name(name):
+            if energy > 0.0:
+                item["lrf_total_energy"] += energy
             fit = _low_rank_fit_from_grad(
                 grad,
                 rank=rank,
@@ -327,6 +333,9 @@ def _snapshot_gradients(
             if fit is not None and energy > 0.0:
                 item["lrf_weighted"] += float(fit) * energy
                 item["lrf_energy"] += energy
+                item["lrf_measured_tensors"] += 1
+            elif energy > 0.0:
+                item["lrf_skipped_tensors"] += 1
     return snap
 
 
@@ -340,6 +349,9 @@ def _merge_snapshots(
         dst["param_count"] = max(int(dst.get("param_count", 0)), int(src.get("param_count", 0)))
         dst["lrf_weighted"] += float(src.get("lrf_weighted", 0.0))
         dst["lrf_energy"] += float(src.get("lrf_energy", 0.0))
+        dst["lrf_total_energy"] += float(src.get("lrf_total_energy", src.get("lrf_energy", 0.0)))
+        dst["lrf_measured_tensors"] += int(src.get("lrf_measured_tensors", 0))
+        dst["lrf_skipped_tensors"] += int(src.get("lrf_skipped_tensors", 0))
         dst_vectors = dst["vectors"]
         for name, vector in src.get("vectors", {}).items():
             if name in dst_vectors:
@@ -508,9 +520,11 @@ def _validation_class_stats(
         model.train(original_training)
 
     loss_mean = {cls: loss_sum[cls] / max(1, counts.get(cls, 0)) for cls in loss_sum}
-    ranked = sorted(loss_mean.items(), key=lambda item: (-item[1], item[0]))
-    hard_k = max(1, int(getattr(args, "module_c_preflight_hard_k", 2)))
-    hard = tuple(cls for cls, _loss in ranked[: min(hard_k, len(ranked))])
+    burden = _class_burden_from_loss(loss_mean)
+    uniform = 1.0 / float(len(burden)) if burden else 0.0
+    hard = tuple(sorted(cls for cls, amount in burden.items() if float(amount) >= uniform))
+    if not hard and burden:
+        hard = (max(burden, key=lambda cls: (float(burden[cls]), -int(cls))),)
     return hard, counts, loss_mean
 
 
@@ -527,8 +541,11 @@ def _class_pressure_profiles(
     classes: Sequence[int],
 ) -> Dict[str, Dict[int, float]]:
     profiles: Dict[str, Dict[int, float]] = {m: {} for m in candidate_modules}
-    max_classes = max(0, int(getattr(args, "module_c_preflight_max_profile_classes", 8)))
-    for cls in _as_list(classes)[:max_classes]:
+    max_classes = max(0, int(getattr(args, "module_c_preflight_max_profile_classes", 0)))
+    selected_classes = _as_list(classes)
+    if max_classes > 0:
+        selected_classes = selected_classes[:max_classes]
+    for cls in selected_classes:
         snap, seen = _backward_batches(
             args=args,
             model=model,
@@ -583,17 +600,49 @@ def _filter_named_vectors(vectors: Mapping[str, torch.Tensor], kind: str) -> Dic
 
 
 def _confidence_margin(args: Any, seen: int) -> float:
-    scale = max(0.0, float(getattr(args, "module_c_rgfs_confidence_scale", 0.20)))
+    scale = max(0.0, float(getattr(args, "module_c_rgfs_confidence_scale", 0.0)))
     if seen <= 0:
-        return 1.0
+        return 1.0 if scale > 0.0 else 0.0
     return float(min(0.50, scale / math.sqrt(float(seen))))
 
 
+def _low_rank_evidence_from_snapshot(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
+    measured_energy = max(0.0, float(snapshot.get("lrf_energy", 0.0)))
+    total_energy = max(0.0, float(snapshot.get("lrf_total_energy", measured_energy)))
+    weighted = max(0.0, float(snapshot.get("lrf_weighted", 0.0)))
+    measured_tensors = int(snapshot.get("lrf_measured_tensors", 0))
+    skipped_tensors = int(snapshot.get("lrf_skipped_tensors", 0))
+    if total_energy <= 0.0:
+        return {
+            "fit": 0.0,
+            "coverage": 0.0,
+            "status": "unmeasured",
+            "measured_energy": 0.0,
+            "total_energy": 0.0,
+            "measured_tensors": measured_tensors,
+            "skipped_tensors": skipped_tensors,
+        }
+    coverage = max(0.0, min(1.0, measured_energy / total_energy))
+    effective_fit = max(0.0, min(1.0, weighted / total_energy))
+    if measured_energy <= 0.0:
+        status = "unmeasured"
+    elif measured_energy + 1e-12 < total_energy:
+        status = "partial"
+    else:
+        status = "measured"
+    return {
+        "fit": float(effective_fit),
+        "coverage": float(coverage),
+        "status": status,
+        "measured_energy": float(measured_energy),
+        "total_energy": float(total_energy),
+        "measured_tensors": measured_tensors,
+        "skipped_tensors": skipped_tensors,
+    }
+
+
 def _low_rank_fit_from_snapshot(snapshot: Mapping[str, Any]) -> float:
-    lrf_energy = float(snapshot.get("lrf_energy", 0.0))
-    if lrf_energy <= 0.0:
-        return 1.0
-    return _clip01(float(snapshot.get("lrf_weighted", 0.0)) / lrf_energy, default=1.0)
+    return float(_low_rank_evidence_from_snapshot(snapshot)["fit"])
 
 
 def _class_burden_from_loss(class_loss_mean: Mapping[int, float]) -> Dict[int, float]:
@@ -621,8 +670,11 @@ def _class_gradient_snapshots(
 ) -> Tuple[Dict[int, Dict[str, Dict[str, Any]]], Dict[int, int]]:
     snapshots: Dict[int, Dict[str, Dict[str, Any]]] = {}
     seen_by_class: Dict[int, int] = {}
-    max_classes = max(0, int(getattr(args, "module_c_preflight_max_profile_classes", 8)))
-    for cls in _as_list(classes)[:max_classes]:
+    max_classes = max(0, int(getattr(args, "module_c_preflight_max_profile_classes", 0)))
+    selected_classes = _as_list(classes)
+    if max_classes > 0:
+        selected_classes = selected_classes[:max_classes]
+    for cls in selected_classes:
         snap, seen = _backward_batches(
             args=args,
             model=model,
@@ -707,13 +759,13 @@ def _structural_pressure_agreement(left: Mapping[str, float], right: Mapping[str
 
 
 def _focused_burden_cap(args: Any, burden: Mapping[int, float]) -> float:
+    del args
     if not burden:
         return 0.0
     values = [float(v) for v in burden.values() if float(v) > 0.0]
     if not values:
         return 0.0
-    ratio = float(getattr(args, "module_c_rgfs_focus_ratio", 0.80))
-    threshold = ratio / max(1, len(burden))
+    threshold = 1.0 / max(1, len(burden))
     focused = sorted(float(v) for v in burden.values() if float(v) >= threshold)
     if not focused:
         return max(values)
@@ -735,7 +787,7 @@ def _module_e_structural_residual_evidence(
     val_profile, val_scope = _structural_branch_pressure_profile(val_snapshot, model_name)
     imbalance = _structural_pressure_concentration(val_profile)
     agreement = _structural_pressure_agreement(train_profile, val_profile)
-    fit = _clip01(low_rank_fit, default=1.0)
+    fit = _clip01(low_rank_fit, default=0.0)
     cap = _focused_burden_cap(args, burden)
     residual_burden = float(cap * imbalance)
     relief_lcb = float(agreement * fit)
@@ -789,7 +841,8 @@ def _build_rgfs_evidence(
     diagnostics: Dict[str, Dict[str, Any]] = {}
 
     for module_id in candidate_modules:
-        lrf = _low_rank_fit_from_snapshot(train_snap[module_id])
+        lrf_info = _low_rank_evidence_from_snapshot(train_snap[module_id])
+        lrf = float(lrf_info["fit"])
         train_vectors = train_snap[module_id].get("vectors", {})
         val_vectors = val_snap[module_id].get("vectors", {})
         train_val_cos = _cosine_named_vectors(train_vectors, val_vectors)
@@ -837,6 +890,8 @@ def _build_rgfs_evidence(
                     "class_burden": float(burden.get(int(cls), 0.0)),
                     "confidence_margin": float(margin),
                     "low_rank_fit": float(lrf),
+                    "low_rank_coverage": float(lrf_info["coverage"]),
+                    "low_rank_status": str(lrf_info["status"]),
                     "base_signed_cosine": float(base_cos),
                     "base_relief_lcb": float(base_lcb),
                     "lora_tangent_signed_cosine": float(lora_cos),
@@ -877,6 +932,8 @@ def _build_rgfs_evidence(
                         "class_burden": "",
                         "confidence_margin": "",
                         "low_rank_fit": float(lrf),
+                        "low_rank_coverage": float(lrf_info["coverage"]),
+                        "low_rank_status": str(lrf_info["status"]),
                         "base_signed_cosine": "",
                         "base_relief_lcb": "",
                         "lora_tangent_signed_cosine": "",
@@ -900,6 +957,12 @@ def _build_rgfs_evidence(
             "pressure": _clip01(pressure_norm),
             "module_pressure_raw": per_param[module_id],
             "low_rank_fit": float(lrf),
+            "low_rank_coverage": float(lrf_info["coverage"]),
+            "low_rank_status": str(lrf_info["status"]),
+            "low_rank_measured_energy": float(lrf_info["measured_energy"]),
+            "low_rank_relevant_energy": float(lrf_info["total_energy"]),
+            "low_rank_measured_tensors": int(lrf_info["measured_tensors"]),
+            "low_rank_skipped_tensors": int(lrf_info["skipped_tensors"]),
             "train_val_signed_cosine": float(train_val_cos),
             "train_val_agreement": max(0.0, float(train_val_cos)),
             "train_val_mismatch_risk": _clip01(max(0.0, pressure_gap - 0.50) + max(0.0, -train_val_cos)),
@@ -910,7 +973,8 @@ def _build_rgfs_evidence(
             "val_grad_energy": val_energy[module_id],
             "adapter_param_count": int(adapter_param_counts.get(module_id, 0)),
             "probe_param_count": int(probe_param_counts.get(module_id, 0)),
-            "hard_classes_by_loss": ",".join(str(x) for x in hard_classes),
+            "focus_classes_by_validation_burden": ",".join(str(x) for x in hard_classes),
+            "focus_class_rule": "validation_loss_burden_at_or_above_uniform",
             "class_loss_mean": json.dumps({str(k): v for k, v in sorted(class_loss_mean.items())}, ensure_ascii=False),
             "class_burden": json.dumps({str(k): v for k, v in sorted(burden.items())}, ensure_ascii=False),
             "relief_lcb_by_class": json.dumps({str(k): v for k, v in sorted(relief_lcb[module_id].items())}, ensure_ascii=False),
@@ -992,26 +1056,29 @@ def _write_decision_json(
         candidate_modules=candidate_modules,
         module_scores={m: decision.candidate_decisions.get(m, {}).get("focus_marginal_gain", 0.0) for m in candidate_modules},
     )
+    train_batch_cap = int(getattr(args, "module_c_preflight_train_batches", 0))
+    val_batch_cap = int(getattr(args, "module_c_preflight_val_batches", 0))
     policy_config = {
         **rgfs_config_dict(
             RGFSConfig(
-                min_marginal_gain=float(getattr(args, "module_c_preflight_min_score", 0.01)),
-                tie_tolerance=float(getattr(args, "module_c_preflight_margin", 0.03)),
-                harm_veto_threshold=float(getattr(args, "module_c_rgfs_harm_threshold", 0.05)),
-                focus_burden_ratio=float(getattr(args, "module_c_rgfs_focus_ratio", 0.80)),
-                allow_empty=True,
+                min_marginal_gain=float(getattr(args, "module_c_preflight_min_score", 0.0)),
+                tie_tolerance=float(getattr(args, "module_c_preflight_margin", 0.0)),
+                harm_veto_threshold=float(getattr(args, "module_c_rgfs_harm_threshold", 0.0)),
+                focus_burden_ratio=float(getattr(args, "module_c_rgfs_focus_ratio", 1.0)),
+                allow_empty=False,
             )
         ),
-        "train_batches": max(1, int(getattr(args, "module_c_preflight_train_batches", 1))),
-        "val_batches": max(1, int(getattr(args, "module_c_preflight_val_batches", 1))),
+        "train_batch_cap": train_batch_cap,
+        "val_batch_cap": val_batch_cap,
+        "probe_scope": "formal_full_split" if train_batch_cap <= 0 and val_batch_cap <= 0 else "debug_batch_cap",
         "probe_head_steps": max(0, int(getattr(args, "module_c_probe_head_steps", 3))),
         "probe_head_lr": float(getattr(args, "module_c_probe_head_lr", 1e-3)),
-        "relief_confidence_scale": float(getattr(args, "module_c_rgfs_confidence_scale", 0.20)),
+        "relief_confidence_scale": float(getattr(args, "module_c_rgfs_confidence_scale", 0.0)),
         "svd_max_numel": int(getattr(args, "module_c_preflight_svd_max_numel", 1000000)),
         "functional_residual_role": "bounded_module_specific_residual",
         "e_structural_residual_id": MODULE_C_E_STRUCTURAL_RESIDUAL_ID,
         "e_structural_residual_definition": "branch_pressure_concentration_times_train_val_agreement_and_low_rank_fit",
-        "e_structural_residual_bound": "at_most_one_focused_class_burden_scale",
+        "e_structural_residual_bound": "median_class_burden_at_or_above_uniform",
         "test_used_for_selection": 0,
     }
     payload = {
@@ -1072,11 +1139,11 @@ def run_module_c_preflight_selection(
 
     train_batches = _collect_probe_batches(
         data_loader_train,
-        max(1, int(getattr(args, "module_c_preflight_train_batches", 1))),
+        int(getattr(args, "module_c_preflight_train_batches", 0)),
     )
     val_batches = _collect_probe_batches(
         data_loader_val if data_loader_val is not None else data_loader_train,
-        max(1, int(getattr(args, "module_c_preflight_val_batches", 1))),
+        int(getattr(args, "module_c_preflight_val_batches", 0)),
     )
     if not train_batches or not val_batches:
         raise RuntimeError("Module C preflight could not collect train/validation probe batches.")
@@ -1152,11 +1219,11 @@ def run_module_c_preflight_selection(
     )
 
     config = RGFSConfig(
-        min_marginal_gain=float(getattr(args, "module_c_preflight_min_score", 0.01)),
-        tie_tolerance=float(getattr(args, "module_c_preflight_margin", 0.03)),
-        harm_veto_threshold=float(getattr(args, "module_c_rgfs_harm_threshold", 0.05)),
-        focus_burden_ratio=float(getattr(args, "module_c_rgfs_focus_ratio", 0.80)),
-        allow_empty=True,
+        min_marginal_gain=float(getattr(args, "module_c_preflight_min_score", 0.0)),
+        tie_tolerance=float(getattr(args, "module_c_preflight_margin", 0.0)),
+        harm_veto_threshold=float(getattr(args, "module_c_rgfs_harm_threshold", 0.0)),
+        focus_burden_ratio=float(getattr(args, "module_c_rgfs_focus_ratio", 1.0)),
+        allow_empty=False,
     )
     decision = select_rgfs_subset(
         module_ids=candidate_modules,
@@ -1224,7 +1291,7 @@ def run_module_c_preflight_selection(
     if selected:
         print(f"[ModuleC] RGFS selected modules: {','.join(selected)} ({decision.reason})")
     else:
-        print("[ModuleC] RGFS selected no B/D/E modules; continuing without qv/qv_ffn fallback.")
+        print("[ModuleC][WARN] RGFS selected no B/D/E modules even though empty selection is disabled.")
 
     return ModuleCPreflightResult(
         decision=decision,

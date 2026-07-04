@@ -60,15 +60,16 @@ def _normalize_functional_burden(burden: Optional[Mapping[Any, Any]]) -> Dict[st
 class RGFSConfig:
     """Search thresholds for RGFS.
 
-    The values are gates/tie rules, not learned importance weights. Relief
-    magnitude comes from the probe; complexity only resolves indistinguishable
-    marginals.
+    Defaults are chosen to avoid hidden method constants: any positive residual
+    marginal can be accepted, exact ties can use complexity, positive reliable
+    harm vetoes a module, and focus classes are those whose burden is at least
+    the uniform class burden.
     """
 
     min_marginal_gain: float = 0.0
-    tie_tolerance: float = 0.01
-    harm_veto_threshold: float = 0.05
-    focus_burden_ratio: float = 0.80
+    tie_tolerance: float = 0.0
+    harm_veto_threshold: float = 0.0
+    focus_burden_ratio: float = 1.0
     max_subset_size: Optional[int] = None
     allow_empty: bool = True
 
@@ -100,6 +101,8 @@ def rgfs_config_dict(config: Optional[RGFSConfig] = None) -> Dict[str, Any]:
         "allow_empty": bool(config.allow_empty),
         "complexity_role": "tie_break_only",
         "residual_space": "class_plus_optional_functional",
+        "focus_rule": "class_burden_at_or_above_uniform_when_ratio_is_1",
+        "harm_rule": "positive_reliable_harm_on_focus_class_blocks_candidate_when_threshold_is_0",
     }
 
 
@@ -122,7 +125,7 @@ def functional_coverage_value(
 def _focus_classes(class_ids: Sequence[int], burden: Mapping[int, float], config: RGFSConfig) -> Tuple[int, ...]:
     if not class_ids:
         return tuple()
-    threshold = float(config.focus_burden_ratio) / float(len(class_ids))
+    threshold = max(0.0, float(config.focus_burden_ratio)) / float(len(class_ids))
     focused = [int(c) for c in class_ids if float(burden.get(int(c), 0.0)) >= threshold]
     if focused:
         return tuple(focused)
@@ -173,7 +176,7 @@ def _candidate_record(
     reliable_harm = [
         int(c)
         for c in focus_classes
-        if harm.get(int(c), 0.0) >= float(config.harm_veto_threshold)
+        if harm.get(int(c), 0.0) > float(config.harm_veto_threshold)
         and relief.get(int(c), 0.0) <= float(coverage.get(int(c), 0.0))
     ]
     marginal_by_class = {
@@ -227,6 +230,40 @@ def _choose_best(records: Sequence[Mapping[str, Any]], config: RGFSConfig) -> Op
         if float(record.get("complexity", 1.0)) < float(best.get("complexity", 1.0)):
             best = record
     return best
+
+
+def _blocked_harm_score(record: Mapping[str, Any]) -> Tuple[int, float, float]:
+    blocked = record.get("blocked_harm_classes", ()) or ()
+    harms = record.get("harm_lcb_by_class", {}) or {}
+    harm_values = [_positive(v) for v in harms.values()]
+    return (
+        len(tuple(blocked)),
+        max(harm_values, default=0.0),
+        sum(harm_values),
+    )
+
+
+def _choose_forced_nonempty(records: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Pick a transparent fallback when a formal C run disallows empty LoRA."""
+    candidates = [dict(r) for r in records if str(r.get("module_id", "")).strip()]
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda r: (
+            0 if float(r.get("focus_marginal_gain", 0.0)) > 0.0 else 1,
+            -float(r.get("focus_marginal_gain", 0.0)),
+            *_blocked_harm_score(r),
+            -float(r.get("marginal_gain", 0.0)),
+            float(r.get("complexity", 1.0)),
+            str(r.get("module_id", "")),
+        )
+    )
+    chosen = dict(candidates[0])
+    original_gate = str(chosen.get("gate", "") or "no_pass")
+    chosen["gate"] = f"forced_nonempty_from_{original_gate}"
+    chosen["forced_nonempty"] = True
+    chosen["forced_nonempty_reason"] = "formal_lora_search_requires_at_least_one_module"
+    return chosen
 
 
 def select_rgfs_subset(
@@ -288,6 +325,17 @@ def select_rgfs_subset(
             candidate_decisions[module_id] = dict(record)
 
         chosen = _choose_best(records, config)
+        forced_nonempty = False
+        if chosen is None and not selected and not bool(config.allow_empty):
+            chosen = _choose_forced_nonempty(records)
+            if chosen is not None:
+                forced_nonempty = True
+                forced_id = str(chosen.get("module_id", ""))
+                candidate_decisions[forced_id] = dict(chosen)
+                records = [
+                    dict(chosen) if str(r.get("module_id", "")) == forced_id else dict(r)
+                    for r in records
+                ]
         search_steps.append(
             {
                 "step": len(selected) + 1,
@@ -296,6 +344,7 @@ def select_rgfs_subset(
                 "current_functional_coverage": dict(functional_coverage),
                 "candidates": [dict(r) for r in records],
                 "chosen_module": "" if chosen is None else str(chosen.get("module_id", "")),
+                "forced_nonempty": bool(forced_nonempty),
             }
         )
         if chosen is None:
@@ -316,7 +365,10 @@ def select_rgfs_subset(
         functional_burden_norm,
         functional_coverage,
     )
-    if selected:
+    forced = any(bool(candidate_decisions.get(m, {}).get("forced_nonempty", False)) for m in selected)
+    if selected and forced:
+        reason = "forced non-empty module because formal LoRA search disallows empty selection"
+    elif selected:
         reason = "selected modules by residual burden coverage"
     elif config.allow_empty:
         reason = "no reliable positive marginal relief"
