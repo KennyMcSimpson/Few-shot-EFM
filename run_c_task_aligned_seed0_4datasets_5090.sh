@@ -67,7 +67,7 @@ model_tag() {
 read_decision() {
   local run_tag="$1"
   local decision
-  decision="$(find finetuning_results -type f -path "*/${run_tag}/module_c_preflight_decision.json" -print -quit 2>/dev/null || true)"
+  decision="$(find -L finetuning_results -type f -path "*/${run_tag}/module_c_preflight_decision.json" -print -quit 2>/dev/null || true)"
   if [[ -z "$decision" ]]; then
     echo 'NA NA NA NA'
     return

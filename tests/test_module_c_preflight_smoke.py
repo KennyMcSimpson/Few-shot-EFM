@@ -167,6 +167,11 @@ class ModuleCPreflightSmokeTests(unittest.TestCase):
                 result.branch_traces[tuple()]["trainable_parameter_count"],
                 original_trainable_count,
             )
+            for subset, trace in result.branch_traces.items():
+                expected_count = original_trainable_count + sum(
+                    result.ownership.parameter_counts[action] for action in subset
+                )
+                self.assertEqual(trace["trainable_parameter_count"], expected_count)
             self.assertTrue(all((action,) in result.branch_traces for action in ("B", "D", "E")))
             self.assertTrue(any(len(subset) == 2 for subset in result.branch_traces))
             fingerprints = {trace["support_fingerprint"] for trace in result.branch_traces.values()}
@@ -185,6 +190,10 @@ class ModuleCPreflightSmokeTests(unittest.TestCase):
             self.assertNotIn("first_order", serialized)
             self.assertNotIn("forced_nonempty_least_harm", serialized)
             self.assertEqual(payload["probe_training"]["lora_dropout"], 0.2)
+            self.assertEqual(
+                payload["probe_training"]["full_update_base_control"],
+                "same_pre_injection_base_trainability_for_every_branch",
+            )
 
     def test_binary_bce_search_uses_both_labels(self):
         support_loader, validation_loader = self._loaders(classes=2)

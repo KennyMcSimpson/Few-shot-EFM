@@ -9,6 +9,7 @@ except ModuleNotFoundError:  # pragma: no cover - depends on the training env.
     nn = None
 
 if torch is not None:
+    from run_finetuning import _apply_lora_training_setup
     from util.module_c_preflight_policy import (
         _configure_branch_trainability,
         install_module_c_action_registry,
@@ -67,6 +68,7 @@ if torch is not None:
             self.main_model = nn.Module()
             self.main_model.layers = nn.ModuleList([_BiotLayer()])
             self.task_head = nn.Linear(4, 3)
+            self.integer_state = nn.Parameter(torch.tensor(0, dtype=torch.long), requires_grad=False)
 
 
     class _MergedAttention(nn.Module):
@@ -157,11 +159,46 @@ class ModuleCLoraInterfaceTests(unittest.TestCase):
         self.assertTrue(ownership.action_wrapped_base_parameter_names["D"])
         self.assertTrue(ownership.action_wrapped_base_parameter_names["E"])
         self.assertTrue(
-            all(not named[name].requires_grad for name in ownership.action_wrapped_base_parameter_names["D"])
+            all(named[name].requires_grad for name in ownership.action_wrapped_base_parameter_names["D"])
         )
         self.assertTrue(
             all(named[name].requires_grad for name in ownership.action_wrapped_base_parameter_names["E"])
         )
+        self.assertFalse(model.integer_state.requires_grad)
+
+    def test_formal_full_update_restores_wrapped_base_trainability(self):
+        model = _TinyBIOT()
+        original_trainability = {id(parameter): bool(parameter.requires_grad) for parameter in model.parameters()}
+        args = SimpleNamespace(
+            task_mod="Classification",
+            model_name="BIOT",
+            lora_target="module_c",
+            module_c_selected="D",
+            module_c_resolved_selected="D",
+            module_b_sites="both",
+            lora_base_update="full",
+            lora_rank=2,
+            lora_alpha=4.0,
+            lora_dropout=0.0,
+            lora_train_head=True,
+            lora_train_chan_conv=False,
+        )
+
+        _apply_lora_training_setup(model, args)
+
+        original_parameters = [
+            parameter for parameter in model.parameters() if id(parameter) in original_trainability
+        ]
+        self.assertTrue(
+            all(
+                parameter.requires_grad == original_trainability[id(parameter)]
+                for parameter in original_parameters
+            )
+        )
+        self.assertTrue(
+            all(parameter.requires_grad for name, parameter in model.named_parameters() if "lora_" in name)
+        )
+        self.assertFalse(model.integer_state.requires_grad)
 
     def test_gram_actions_are_nonempty_and_disjoint(self):
         ownership = self._audit(_TinyGram(), "Gram")

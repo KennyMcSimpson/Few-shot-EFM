@@ -1235,6 +1235,9 @@ def _apply_lora_training_setup(model, args):
     #   lora_base_update=freeze -> standard Frozen-LoRA. Original W is frozen; LoRA/head are trainable.
     #   lora_base_update=full   -> Full FT + LoRA. Original W remains trainable; LoRA is an extra branch.
     # This separates the freeze variable from the LoRA variable.
+    pre_lora_trainability = {
+        id(parameter): bool(parameter.requires_grad) for parameter in model.parameters()
+    }
     module_c_selected_text = getattr(args, 'module_c_resolved_selected', getattr(args, 'module_c_selected', ''))
     module_c_selected_tokens = [
         token.strip().upper()
@@ -1294,8 +1297,17 @@ def _apply_lora_training_setup(model, args):
                 train_chan_conv=args.lora_train_chan_conv,
             )
         elif args.lora_base_update == 'full':
-            # Keep original backbone parameters trainable. LoRA params are newly created and trainable by default.
-            # task_head is also trainable by default. If lora_freeze_head is explicitly used, freeze it here.
+            # LoRA wrappers freeze their nested base modules when constructed.
+            # Restore every pre-existing parameter to its pre-injection state so
+            # full means the same Full FT base for every selected action set.
+            for parameter in model.parameters():
+                parameter_id = id(parameter)
+                if parameter_id not in pre_lora_trainability:
+                    continue
+                restore = pre_lora_trainability[parameter_id]
+                if restore and not (parameter.is_floating_point() or parameter.is_complex()):
+                    raise RuntimeError('A non-differentiable pre-LoRA parameter was unexpectedly trainable.')
+                parameter.requires_grad_(restore)
             if not args.lora_train_head and hasattr(model, 'task_head'):
                 for p in model.task_head.parameters():
                     p.requires_grad = False

@@ -436,10 +436,10 @@ def _configure_branch_trainability(
     if base_update not in ("freeze", "full"):
         raise ValueError(f"Unknown lora_base_update={base_update}")
 
-    # Every branch starts from the same frozen union model.  Full-update branches
+    # Every branch starts from the same frozen union model. Full-update branches
     # then restore the pre-injection trainability of original parameters only.
-    # This both preserves intentionally frozen/integer state and lets an inactive
-    # action behave exactly as if its wrapper had never been installed.
+    # Active and inactive actions therefore share exactly the same Full FT base;
+    # a branch differs from another branch only by its enabled LoRA parameters.
     freeze_all_parameters(model)
     named = dict(model.named_parameters())
     if base_update == "full":
@@ -448,13 +448,6 @@ def _configure_branch_trainability(
             if restore and not (parameter.is_floating_point() or parameter.is_complex()):
                 raise RuntimeError(f"Module C cannot restore gradients for non-differentiable parameter {name}.")
             parameter.requires_grad_(restore)
-
-        # Formal LoRA injection freezes the base weights owned by each active
-        # wrapper.  Bases belonging only to inactive actions keep their original
-        # trainability, so union injection does not change the measured recipe.
-        for action in active:
-            for name in ownership.action_wrapped_base_parameter_names.get(action, ()):
-                named[name].requires_grad_(False)
 
     with torch.no_grad():
         for name, owner in ownership.adapter_parameter_owner.items():
@@ -1078,6 +1071,7 @@ def run_module_c_preflight_selection(
             "learning_rate_rule": "configured downstream base LR, constant within the one-pass probe",
             "weight_decay": float(getattr(args, "weight_decay", 0.0)),
             "lora_base_update": str(getattr(args, "lora_base_update", "")),
+            "full_update_base_control": "same_pre_injection_base_trainability_for_every_branch",
             "lora_rank": int(getattr(args, "lora_rank", 0)),
             "lora_alpha": float(getattr(args, "lora_alpha", 0.0)),
             "lora_dropout": float(getattr(args, "lora_dropout", 0.0)),
