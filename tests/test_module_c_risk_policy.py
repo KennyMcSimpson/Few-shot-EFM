@@ -27,6 +27,20 @@ class ModuleCRiskPolicyTests(unittest.TestCase):
         self.assertEqual(decision.selected_modules, ("D",))
         self.assertEqual(decision.candidate_decisions["E"]["gate"], "unsafe_class_harm")
 
+    def test_supports_binary_classwise_validation_effects(self):
+        decision = select_validation_risk_subset(
+            module_effects={
+                "B": {0: 0.00, 1: 0.00},
+                "D": {0: 0.20, 1: 0.10},
+                "E": {0: 0.40, 1: -0.05},
+            },
+            parameter_counts={"B": 10, "D": 12, "E": 8},
+        )
+
+        self.assertEqual(decision.selected_modules, ("D",))
+        self.assertAlmostEqual(decision.overall_effect, 0.15)
+        self.assertAlmostEqual(decision.worst_class_effect, 0.10)
+
     def test_adds_only_actions_that_improve_mean_without_lowering_worst_class(self):
         decision = select_validation_risk_subset(
             module_effects={

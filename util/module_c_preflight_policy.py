@@ -408,8 +408,8 @@ def _class_grouped_validation_gradients(
         model.train(original_training)
 
     class_ids = tuple(sorted(counts))
-    if len(class_ids) < 3:
-        raise ValueError("Module C validation-risk selection is defined only for classification tasks with at least three validation classes.")
+    if len(class_ids) < 2:
+        raise ValueError("Module C validation-risk selection requires at least two observed validation labels.")
     for module_id in candidate_modules:
         for class_id in class_ids:
             vectors = gradients[module_id].setdefault(class_id, {})
@@ -752,8 +752,13 @@ def run_module_c_preflight_selection(
 ) -> ModuleCPreflightResult:
     """Resolve a nonempty B/D/E subset before the real LoRA model is built."""
 
-    if str(getattr(args, "task_mod", "")) != "Classification" or int(getattr(args, "nb_classes", 0)) < 3:
-        raise ValueError("Module C validation-risk selection supports only classification tasks with at least three classes.")
+    raw_nb_classes = int(getattr(args, "nb_classes", 0))
+    effective_classes = 2 if raw_nb_classes == 1 else raw_nb_classes
+    if str(getattr(args, "task_mod", "")) != "Classification" or effective_classes < 2:
+        raise ValueError(
+            "Module C validation-risk selection supports classification tasks with at least two classes; "
+            "binary BCE uses nb_classes=1."
+        )
     candidate_modules = tuple(parse_module_ids(getattr(args, "module_c_candidates", "B,D,E")))
     if not candidate_modules:
         raise RuntimeError("Module C requires at least one B/D/E candidate.")

@@ -39,8 +39,8 @@ def _normalize_effects(module_effects: Mapping[Any, Mapping[Any, Any]]) -> Dict[
         normalized[module_id] = effects
     if len(normalized) == 0:
         raise ValueError("Module C requires at least one B/D/E candidate.")
-    if class_ids is None or len(class_ids) < 3:
-        raise ValueError("Module C unified-risk selection is defined only for multi-class tasks with at least three classes.")
+    if class_ids is None or len(class_ids) < 2:
+        raise ValueError("Module C unified-risk selection requires class-wise validation effects for at least two classes.")
     return normalized
 
 

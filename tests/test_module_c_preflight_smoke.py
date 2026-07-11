@@ -56,6 +56,12 @@ if torch is not None:
             return self.task_head(hidden)
 
 
+    class _TinyBinaryGram(_TinyGram):
+        def __init__(self):
+            super().__init__()
+            self.task_head = nn.Linear(4, 1)
+
+
 @unittest.skipIf(torch is None, "torch is not installed in this Python environment")
 class ModuleCPreflightSmokeTests(unittest.TestCase):
     def test_bde_preflight_runs_through_real_lora_injection_without_test_data(self):
@@ -106,6 +112,52 @@ class ModuleCPreflightSmokeTests(unittest.TestCase):
             self.assertEqual(result.diagnostics_by_module["E"]["structural_reference_used_for_ranking"], 0)
             self.assertTrue(os.path.exists(result.score_csv_path))
             self.assertTrue(os.path.exists(result.decision_json_path))
+
+    def test_bce_binary_preflight_uses_both_validation_labels(self):
+        torch.manual_seed(11)
+        samples = torch.randn(8, 4, 5)
+        labels = torch.tensor([0, 1, 0, 1, 0, 1, 0, 1])
+        support_loader = DataLoader(TensorDataset(samples[:4], labels[:4]), batch_size=2, shuffle=False)
+        validation_loader = DataLoader(TensorDataset(samples[4:], labels[4:]), batch_size=2, shuffle=False)
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            args = SimpleNamespace(
+                task_mod="Classification",
+                nb_classes=1,
+                norm_method="",
+                mv_norm_value=0.01,
+                model_name="Gram",
+                module_c_candidates="B,D,E",
+                module_b_sites="input",
+                lora_rank=2,
+                lora_alpha=4.0,
+                opt="adamw",
+                lr=0.05,
+                weight_decay=0.0,
+                opt_eps=None,
+                opt_betas=None,
+                momentum=0.9,
+                clip_grad=None,
+                module_c_preflight_train_batches=0,
+                module_c_preflight_val_batches=0,
+                output_dir=output_dir,
+                dataset="tiny_binary",
+                subject_mod="fewshot",
+                k_shot=1,
+                seed=11,
+            )
+
+            result = run_module_c_preflight_selection(
+                args=args,
+                model=_TinyBinaryGram(),
+                data_loader_train=support_loader,
+                data_loader_val=validation_loader,
+                device=torch.device("cpu"),
+            )
+
+            self.assertTrue(result.decision.selected_modules)
+            self.assertEqual(set(result.decision.per_class_effect), {0, 1})
+            self.assertEqual(args.module_c_resolved_selected, ",".join(result.decision.selected_modules))
 
 
 if __name__ == "__main__":
