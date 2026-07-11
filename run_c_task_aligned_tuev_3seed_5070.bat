@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 
 cd /d D:\code\codepy\EEG_code\AdaBrain-Bench-main
 
-rem Formal Module C validation-risk TUEV 3-seed runner.
+rem Formal Module C task-aligned TUEV 3-seed runner.
 rem Module C always selects a nonempty B/D/E subset from support and
 rem validation data before the final LoRA model is created.
 
@@ -34,7 +34,7 @@ set "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 set "OMP_NUM_THREADS=4"
 
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "STAMP=%%i"
-set "COL_C=col_c_validation_risk_tuev_3seed_5070_%STAMP%"
+set "COL_C=col_c_task_aligned_tuev_3seed_5070_%STAMP%"
 
 set "DRYRUN=0"
 if /I "%~1"=="--dry-run" set "DRYRUN=1"
@@ -47,7 +47,7 @@ set "C_ARGS=--lora_target module_c --module_c_candidates B,D,E --module_c_prefli
 set "FB_ARGS=--fb_enable --fb_probe --fb_recipe manual --fb_split_check --fb_collect --fb_collect_name %COL_C%"
 set "MODULE_BE_ARGS=--module_b_sites both --module_e_mode dynamic_pressure_gate --module_e_warmup_steps 0"
 
-echo [RUN] Formal Module C validation-risk TUEV 3-seed runner
+echo [RUN] Formal Module C task-aligned TUEV 3-seed runner
 echo [RUN] Root: %CD%
 echo [RUN] Dataset: %DATASET%
 echo [RUN] GPU: RTX 5070 profile, CUDA_VISIBLE_DEVICES=%CUDA_VISIBLE_DEVICES%
@@ -71,7 +71,7 @@ if "%DRYRUN%"=="0" (
   mkdir "%COL_C%"
   echo model,seed,dataset,phase,subject_mod,finetune_mod,lora_target,module_c_candidates,preflight_train_batches,preflight_val_batches,reference_csv,run_tag,status,return_code>"%COL_C%\run_status.csv"
   if not exist "runner_logs" mkdir "runner_logs"
-  echo %COL_C%>runner_logs\c_validation_risk_tuev_3seed_5070_latest.txt
+  echo %COL_C%>runner_logs\c_task_aligned_tuev_3seed_5070_latest.txt
 ) else (
   echo [DRYRUN] would create %COL_C%
 )
@@ -92,7 +92,7 @@ if "%DRYRUN%"=="0" (
 )
 
 echo.
-echo [RUN] Formal Module C validation-risk TUEV 3-seed runner finished. Collection: %COL_C%
+echo [RUN] Formal Module C task-aligned TUEV 3-seed runner finished. Collection: %COL_C%
 echo [RUN] Failed runs: %FAIL_COUNT%
 if not "%FAIL_COUNT%"=="0" exit /b 1
 exit /b 0
@@ -133,17 +133,17 @@ exit /b 0
 set "MODEL=%~1"
 set "PREFIX=%~2"
 set "SEED=%~3"
-set "TAG=%PREFIX%_c_validation_risk_tuev_s%SEED%_%STAMP%"
+set "TAG=%PREFIX%_c_task_aligned_tuev_s%SEED%_%STAMP%"
 call :set_extra "%MODEL%"
 call :set_reference_args "%PREFIX%" "%SEED%"
 set "COMMON_ARGS=--dataset %DATASET% --task_mod Classification --k_shot %KSHOT% --epochs %EPOCHS% --batch_size %BATCH_SIZE% --lr %LR% --weight_decay %WEIGHT_DECAY% --num_workers %NUM_WORKERS% --loader_prefetch_factor %LOADER_PREFETCH% --seed %SEED%"
 
 echo.
-echo [C-Risk+A] model=%MODEL% seed=%SEED% tag=%TAG%
+echo [C-TaskAligned+A] model=%MODEL% seed=%SEED% tag=%TAG%
 if "%REF%"=="" (
-  echo [C-Risk+A] no seed-specific reference CSV found; skipping Module D SBR eval for this run.
+  echo [C-TaskAligned+A] no seed-specific reference CSV found; skipping Module D SBR eval for this run.
 ) else (
-  echo [C-Risk+A] reference=%REF%
+  echo [C-TaskAligned+A] reference=%REF%
 )
 
 if "%DRYRUN%"=="1" (

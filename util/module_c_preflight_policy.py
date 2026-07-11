@@ -1,49 +1,113 @@
-"""Module C B/D/E selection from first-order validation-loss effects.
+"""Task-aligned, matched low-budget search for Module C.
 
-The disposable preflight model is never reused for final training. It measures
-one full support-set gradient, derives one virtual optimizer update per action,
-and evaluates the corresponding class-wise validation-loss effect. This keeps
-the selector independent of test labels and avoids training B/D/E combinations
-just to choose one.
+The probe is disposable.  It anchors the downstream head for one support pass,
+then gives every measured B/D/E subset the same one-pass training budget from
+the same anchored state.  Selection uses paired validation log-loss only; no
+probe parameters, optimizer state, or head weights enter formal training.
 """
 
 from __future__ import annotations
 
+import copy
 import csv
+import hashlib
+import itertools
 import json
+import math
 import os
-from contextlib import contextmanager
-from dataclasses import dataclass, replace
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+import random
+import time
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import ConcatDataset, SequentialSampler, Subset
 
 from .lora import apply_lora_to_eegfm, freeze_all_parameters
 from .module_c_lora_search import DEFAULT_CANDIDATE_MODULES, build_module_c_recipe, parse_module_ids
-from .module_c_risk_policy import ValidationRiskDecision, select_validation_risk_subset
+from .module_c_risk_policy import (
+    ActionTrial,
+    MODULE_C_ALPHA,
+    PairedRiskEvidence,
+    SearchDecision,
+    choose_action,
+    choose_floating_deletion,
+    cluster_jackknife_evidence,
+)
 from .module_e_structural_routing import (
-    STRUCTURAL_ROUTING_BLOCKS,
+    attach_module_e_dynamic_pressure_controller,
     module_e_branch_from_lora_param_name,
-    module_e_module_prefix_from_name,
-    structural_inventory_from_model,
 )
 from .optim_factory import LayerDecayValueAssigner, create_optimizer
 
 
-MODULE_C_PREFLIGHT_SELECTION_RULE = "validation_risk_first_order_preflight"
+MODULE_C_PREFLIGHT_SELECTION_RULE = "task_aligned_matched_validation_search"
 MODULE_C_PREFLIGHT_SCORE_FILE = "module_c_preflight_scores.csv"
 MODULE_C_PREFLIGHT_DECISION_FILE = "module_c_preflight_decision.json"
-_NUMERICAL_TOLERANCE = 1e-12
+
+
+@dataclass(frozen=True)
+class ModuleCDecision:
+    selected_modules: Tuple[str, ...]
+    reason: str
+    evidence_strength: str
+    search_steps: Tuple[Dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class ActionOwnership:
+    action_parameter_names: Mapping[str, Tuple[str, ...]]
+    action_replacement_names: Mapping[str, Tuple[str, ...]]
+    adapter_parameter_owner: Mapping[str, str]
+    parameter_counts: Mapping[str, int]
+    replaced_modules: Tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class ModuleCPreflightResult:
-    decision: ValidationRiskDecision
+    decision: ModuleCDecision
     diagnostics_by_module: Mapping[str, Mapping[str, Any]]
+    ownership: ActionOwnership
+    head_anchor: Mapping[str, Any]
+    branch_traces: Mapping[Tuple[str, ...], Mapping[str, Any]]
     replaced_modules: Tuple[str, ...]
     score_csv_path: str = ""
     decision_json_path: str = ""
+
+
+@dataclass(frozen=True)
+class _BranchEvaluation:
+    subset: Tuple[str, ...]
+    per_sample_loss: Tuple[float, ...]
+    labels: Tuple[int, ...]
+    subjects: Tuple[str, ...]
+    per_class_loss: Dict[int, float]
+    class_balanced_loss: float
+    support_loss: Optional[float]
+    support_examples: int
+    optimizer_steps: int
+    adapter_parameter_count: int
+    trainable_parameter_count: int
+    support_fingerprint: str
+    elapsed_seconds: float
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "subset": list(self.subset),
+            "support_loss": None if self.support_loss is None else float(self.support_loss),
+            "support_examples": int(self.support_examples),
+            "optimizer_steps": int(self.optimizer_steps),
+            "validation_per_class_loss": {int(k): float(v) for k, v in self.per_class_loss.items()},
+            "validation_class_balanced_loss": float(self.class_balanced_loss),
+            "validation_examples": len(self.per_sample_loss),
+            "validation_loss_source": "direct_per_example_log_loss",
+            "adapter_parameter_count": int(self.adapter_parameter_count),
+            "trainable_parameter_count": int(self.trainable_parameter_count),
+            "support_fingerprint": self.support_fingerprint,
+            "elapsed_seconds": float(self.elapsed_seconds),
+        }
 
 
 def _is_module_c_execution_target(target: Any) -> bool:
@@ -51,8 +115,6 @@ def _is_module_c_execution_target(target: Any) -> bool:
 
 
 def module_c_preflight_requested(args: Any) -> bool:
-    """Return whether Module C must automatically resolve a nonempty B/D/E set."""
-
     if args is None:
         return False
     if str(getattr(args, "finetune_mod", "") or "").lower() != "lora":
@@ -66,6 +128,41 @@ def module_c_preflight_requested(args: Any) -> bool:
     return len(selected) == 0 and len(resolved) == 0
 
 
+def capture_module_c_rng_state(data_loaders: Sequence[Any] = ()) -> Dict[str, Any]:
+    """Capture process and explicit loader-generator state for exact restoration."""
+
+    loader_states = []
+    for loader in data_loaders:
+        entries = []
+        for owner_name, owner in (
+            ("loader", loader),
+            ("sampler", getattr(loader, "sampler", None)),
+            ("batch_sampler", getattr(loader, "batch_sampler", None)),
+        ):
+            generator = getattr(owner, "generator", None) if owner is not None else None
+            if isinstance(generator, torch.Generator):
+                entries.append((owner_name, generator, generator.get_state().clone()))
+        loader_states.append(entries)
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state().clone(),
+        "torch_cuda": [state.clone() for state in torch.cuda.get_rng_state_all()] if torch.cuda.is_available() else [],
+        "loaders": loader_states,
+    }
+
+
+def restore_module_c_rng_state(state: Mapping[str, Any]) -> None:
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    if torch.cuda.is_available() and state.get("torch_cuda"):
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+    for entries in state.get("loaders", ()):
+        for _owner_name, generator, generator_state in entries:
+            generator.set_state(generator_state)
+
+
 def _prepare_batch(args: Any, batch: Sequence[Any], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     samples = batch[0]
     labels_raw = batch[1]
@@ -73,20 +170,15 @@ def _prepare_batch(args: Any, batch: Sequence[Any], device: torch.device) -> Tup
         samples = samples.float().to(device, non_blocking=True) * float(getattr(args, "mv_norm_value", 0.01))
     else:
         samples = samples.float().to(device, non_blocking=True)
-
     labels = labels_raw.to(device, non_blocking=True)
-    if str(getattr(args, "task_mod", "")) == "Regression":
-        targets = labels.float()
-    elif int(getattr(args, "nb_classes", 0)) == 1:
+    if int(getattr(args, "nb_classes", 0)) == 1:
         targets = labels.float().view(-1, 1)
     else:
-        targets = labels.int().long()
+        targets = labels.long().view(-1)
     return samples, targets, labels
 
 
-def _classification_labels(labels: torch.Tensor, args: Any) -> Optional[torch.Tensor]:
-    if str(getattr(args, "task_mod", "")) != "Classification":
-        return None
+def _classification_labels(labels: torch.Tensor, args: Any) -> torch.Tensor:
     if int(getattr(args, "nb_classes", 0)) == 1:
         return labels.detach().view(-1).long().clamp(min=0, max=1)
     return labels.detach().view(-1).long()
@@ -94,21 +186,16 @@ def _classification_labels(labels: torch.Tensor, args: Any) -> Optional[torch.Te
 
 def _default_criterion(args: Any, device: torch.device) -> nn.Module:
     del device
-    if str(getattr(args, "task_mod", "")) == "Regression":
-        return nn.MSELoss()
     if int(getattr(args, "nb_classes", 0)) == 1:
         return nn.BCEWithLogitsLoss()
     return nn.CrossEntropyLoss()
 
 
-def _per_sample_loss(output: torch.Tensor, targets: torch.Tensor, args: Any) -> torch.Tensor:
-    if str(getattr(args, "task_mod", "")) == "Regression":
-        loss = (output.view_as(targets.float()) - targets.float()).pow(2)
-        return loss.view(loss.shape[0], -1).mean(dim=1)
+def _per_sample_log_loss(output: torch.Tensor, targets: torch.Tensor, args: Any) -> torch.Tensor:
     if int(getattr(args, "nb_classes", 0)) == 1:
         return torch.nn.functional.binary_cross_entropy_with_logits(
             output.view(-1), targets.float().view(-1), reduction="none"
-        ).view(-1)
+        )
     return torch.nn.functional.cross_entropy(output, targets.long(), reduction="none")
 
 
@@ -117,17 +204,11 @@ def _forward_output(model: nn.Module, samples: torch.Tensor) -> torch.Tensor:
     return output[0] if isinstance(output, (list, tuple)) else output
 
 
-def _forward_loss(model: nn.Module, samples: torch.Tensor, targets: torch.Tensor, criterion: nn.Module) -> torch.Tensor:
-    return criterion(_forward_output(model, samples), targets)
-
-
 def _collect_probe_batches(data_loader: Any, max_batches: int) -> List[Sequence[Any]]:
-    """Collect the full split by default; positive caps are explicit debug controls."""
-
     batches: List[Sequence[Any]] = []
+    limit = int(max_batches)
     if data_loader is None:
         return batches
-    limit = int(max_batches)
     for batch_index, batch in enumerate(data_loader):
         if limit > 0 and batch_index >= limit:
             break
@@ -136,33 +217,56 @@ def _collect_probe_batches(data_loader: Any, max_batches: int) -> List[Sequence[
     return batches
 
 
-def _strip_lora_param_suffix(param_name: str) -> str:
-    name = str(param_name or "")
-    lower = name.lower()
-    for marker in (".lora_a.", ".lora_b.", ".lora_a", ".lora_b"):
-        index = lower.find(marker)
-        if index >= 0:
-            return name[:index]
-    return name
+def _support_fingerprint(batches: Sequence[Sequence[Any]]) -> str:
+    digest = hashlib.sha256()
+    for index, batch in enumerate(batches):
+        samples = batch[0]
+        labels = batch[1]
+        digest.update(str(index).encode("ascii"))
+        digest.update(str(tuple(samples.shape)).encode("ascii"))
+        digest.update(str(tuple(labels.shape)).encode("ascii"))
+        digest.update(labels.detach().cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()
 
 
-def _prefix_match(name: str, prefix: str) -> bool:
-    return name == prefix or name.startswith(prefix + ".") or prefix.startswith(name + ".")
+def _metadata_entry(dataset: Any, index: int) -> Optional[Mapping[str, Any]]:
+    if isinstance(dataset, Subset):
+        return _metadata_entry(dataset.dataset, int(dataset.indices[index]))
+    if isinstance(dataset, ConcatDataset):
+        if index < 0:
+            index += len(dataset)
+        dataset_index = 0
+        while dataset_index < len(dataset.cumulative_sizes) and index >= dataset.cumulative_sizes[dataset_index]:
+            dataset_index += 1
+        if dataset_index >= len(dataset.datasets):
+            return None
+        previous = 0 if dataset_index == 0 else dataset.cumulative_sizes[dataset_index - 1]
+        return _metadata_entry(dataset.datasets[dataset_index], index - previous)
+    data = getattr(dataset, "data", None)
+    if isinstance(data, Sequence) and 0 <= int(index) < len(data):
+        entry = data[int(index)]
+        return entry if isinstance(entry, Mapping) else None
+    return None
 
 
-def _replacement_owner(
-    replacement: str,
-    candidate_modules: Sequence[str],
-    structural_prefixes: Sequence[str],
-) -> str:
-    name = str(replacement or "")
-    lower = name.lower()
-    candidates = set(candidate_modules)
-    if "B" in candidates and (name == "input_side_lora" or lower.endswith("chan_conv") or ".chan_conv" in lower):
-        return "B"
-    if "E" in candidates and any(prefix and _prefix_match(name, prefix) for prefix in structural_prefixes):
-        return "E"
-    return "D" if "D" in candidates else ""
+def _validation_subject_ids(data_loader: Any, batch_count: int, example_count: int) -> Tuple[str, ...]:
+    if not isinstance(getattr(data_loader, "sampler", None), SequentialSampler):
+        raise ValueError(
+            "Module C clustered evidence requires a sequential validation sampler so subject_id metadata stays aligned."
+        )
+    planned_batches = list(data_loader.batch_sampler)[: int(batch_count)]
+    indices = [int(index) for batch_indices in planned_batches for index in batch_indices]
+    if len(indices) != int(example_count):
+        raise RuntimeError("Module C validation metadata count does not match the evaluated examples.")
+    subjects = []
+    for index in indices:
+        entry = _metadata_entry(data_loader.dataset, index)
+        if entry is None or "subject_id" not in entry:
+            raise ValueError(
+                "Module C subject-clustered evidence requires subject_id metadata in every validation dataset entry."
+            )
+        subjects.append(str(entry["subject_id"]))
+    return tuple(subjects)
 
 
 def _is_adapter_parameter(name: str) -> bool:
@@ -170,111 +274,88 @@ def _is_adapter_parameter(name: str) -> bool:
     return ".lora_a" in lower or ".lora_b" in lower or lower.endswith("lora_a") or lower.endswith("lora_b")
 
 
-def _build_adapter_param_to_module(
+def install_module_c_action_registry(
     model: nn.Module,
     model_name: str,
     candidate_modules: Sequence[str],
-    replaced_modules: Sequence[str],
-) -> Tuple[Dict[str, str], Dict[str, int]]:
-    structural_prefixes = tuple(
-        sorted(
-            {
-                module_e_module_prefix_from_name(name)
-                for name in structural_inventory_from_model(str(model_name), model)
-                if module_e_module_prefix_from_name(name)
-            },
-            key=len,
-            reverse=True,
-        )
-    )
-    replacement_owner = {
-        str(replacement): _replacement_owner(str(replacement), candidate_modules, structural_prefixes)
-        for replacement in replaced_modules
-    }
-    replacement_owner = {name: module_id for name, module_id in replacement_owner.items() if module_id}
+    module_b_sites: str,
+    r: int,
+    alpha: float,
+    dropout: float,
+) -> ActionOwnership:
+    """Install each action separately and audit exact, disjoint LoRA ownership."""
 
-    param_to_module: Dict[str, str] = {}
-    parameter_counts = {module_id: 0 for module_id in candidate_modules}
-    for name, param in model.named_parameters():
-        if not _is_adapter_parameter(name):
-            continue
-        module_prefix = _strip_lora_param_suffix(name)
-        owner = ""
-        best_length = -1
-        for replacement, module_id in replacement_owner.items():
-            if _prefix_match(module_prefix, replacement) and len(replacement) > best_length:
-                owner = module_id
-                best_length = len(replacement)
-        if not owner:
-            continue
-        param_to_module[name] = owner
-        parameter_counts[owner] = parameter_counts.get(owner, 0) + int(param.numel())
-    return param_to_module, parameter_counts
-
-
-def _configure_adapter_trainability(model: nn.Module, adapter_param_to_module: Mapping[str, str]) -> None:
-    freeze_all_parameters(model)
-    for name, parameter in model.named_parameters():
-        if name in adapter_param_to_module:
-            parameter.requires_grad_(True)
-
-
-def _named_adapter_parameters(model: nn.Module, adapter_param_to_module: Mapping[str, str]) -> Dict[str, nn.Parameter]:
-    named = dict(model.named_parameters())
-    missing = sorted(set(adapter_param_to_module) - set(named))
-    if missing:
-        raise RuntimeError(f"Module C lost probe adapter parameters: {missing[:3]}")
-    return {name: named[name] for name in adapter_param_to_module}
-
-
-def _full_support_gradients(
-    args: Any,
-    model: nn.Module,
-    batches: Sequence[Sequence[Any]],
-    device: torch.device,
-    criterion: nn.Module,
-    named_parameters: Mapping[str, nn.Parameter],
-) -> Dict[str, torch.Tensor]:
-    """Return the gradient of the mean support loss for every probe adapter."""
-
-    gradients = {name: torch.zeros_like(parameter, device="cpu") for name, parameter in named_parameters.items()}
-    total_examples = 0
-    original_training = bool(model.training)
-    try:
-        model.eval()
-        for batch in batches:
-            samples, targets, _labels = _prepare_batch(args, batch, device)
-            batch_size = int(samples.shape[0])
-            if batch_size <= 0:
-                continue
-            loss = _forward_loss(model, samples, targets, criterion)
-            if loss.ndim != 0:
-                loss = loss.mean()
-            if not bool(torch.isfinite(loss.detach()).item()):
-                raise RuntimeError("Module C support gradient scan produced a non-finite loss.")
-            values = torch.autograd.grad(
-                loss * float(batch_size),
-                tuple(named_parameters.values()),
-                allow_unused=True,
+    candidates = tuple(parse_module_ids(candidate_modules))
+    if not candidates:
+        raise ValueError("Module C requires at least one B/D/E registry action.")
+    action_parameters: Dict[str, Tuple[str, ...]] = {}
+    action_replacements: Dict[str, Tuple[str, ...]] = {}
+    owner: Dict[str, str] = {}
+    counts: Dict[str, int] = {}
+    all_replacements: List[str] = []
+    for action in candidates:
+        before = {name for name, _ in model.named_parameters() if _is_adapter_parameter(name)}
+        replaced = tuple(
+            apply_lora_to_eegfm(
+                model=model,
+                model_name=str(model_name),
+                lora_target="module_c",
+                module_c_selected=(action,),
+                module_b_sites=module_b_sites,
+                r=int(r),
+                alpha=float(alpha),
+                dropout=float(dropout),
+                verbose=False,
             )
-            for name, value in zip(named_parameters, values):
-                if value is not None:
-                    gradients[name].add_(value.detach().to(device="cpu", dtype=gradients[name].dtype))
-            total_examples += batch_size
-    finally:
-        model.zero_grad(set_to_none=True)
-        model.train(original_training)
+        )
+        after_named = dict(model.named_parameters())
+        after = {name for name in after_named if _is_adapter_parameter(name)}
+        created = tuple(sorted(after - before))
+        if not replaced or not created:
+            raise RuntimeError(f"Module C action {action} owns no injected LoRA surface for model={model_name}.")
+        overlap = sorted(set(replaced).intersection(all_replacements))
+        if overlap:
+            raise RuntimeError(f"Module C action surfaces overlap for model={model_name}: {overlap[:5]}")
+        action_parameters[action] = created
+        action_replacements[action] = tuple(sorted(replaced))
+        counts[action] = sum(int(after_named[name].numel()) for name in created)
+        for name in created:
+            if name in owner:
+                raise RuntimeError(f"Module C adapter parameter has multiple owners: {name}")
+            owner[name] = action
+        all_replacements.extend(replaced)
+    final_adapter_names = {name for name, _ in model.named_parameters() if _is_adapter_parameter(name)}
+    unowned = sorted(final_adapter_names - set(owner))
+    if unowned:
+        raise RuntimeError(f"Module C found unowned injected LoRA tensors: {unowned[:5]}")
+    return ActionOwnership(
+        action_parameter_names=action_parameters,
+        action_replacement_names=action_replacements,
+        adapter_parameter_owner=owner,
+        parameter_counts=counts,
+        replaced_modules=tuple(all_replacements),
+    )
 
-    if total_examples <= 0:
-        raise RuntimeError("Module C support gradient scan saw no usable examples.")
-    for gradient in gradients.values():
-        gradient.div_(float(total_examples))
-    return gradients
+
+def _head_parameter_names(model: nn.Module) -> Tuple[str, ...]:
+    named = dict(model.named_parameters())
+    head_ids = set()
+    task_head = getattr(model, "task_head", None)
+    if isinstance(task_head, nn.Module):
+        head_ids.update(id(parameter) for parameter in task_head.parameters())
+    names = [name for name, parameter in named.items() if id(parameter) in head_ids]
+    if names:
+        return tuple(sorted(names))
+    fallback_suffixes = (
+        "main_model.model.cls_head.weight",
+        "main_model.model.cls_head.bias",
+        "classification_head.weight",
+        "classification_head.bias",
+    )
+    return tuple(sorted(name for name in named if name.endswith(fallback_suffixes)))
 
 
 def _optimizer_layer_decay_callbacks(args: Any, model: nn.Module) -> Tuple[Optional[Callable[[str], int]], Optional[Callable[[int], float]]]:
-    """Mirror the layer-wise learning-rate scales used by final fine-tuning."""
-
     model_name = str(getattr(args, "model_name", "") or "")
     main_model = getattr(model, "main_model", None)
     layer_count: Optional[int] = None
@@ -291,354 +372,266 @@ def _optimizer_layer_decay_callbacks(args: Any, model: nn.Module) -> Tuple[Optio
     return assigner.get_layer_id, assigner.get_scale
 
 
-def _optimizer_step_from_gradients(
-    args: Any,
+def _create_probe_optimizer(args: Any, model: nn.Module) -> torch.optim.Optimizer:
+    get_num_layer, get_layer_scale = _optimizer_layer_decay_callbacks(args, model)
+    optimizer = create_optimizer(
+        args,
+        model,
+        skip_list=[],
+        get_num_layer=get_num_layer,
+        get_layer_scale=get_layer_scale,
+    )
+    base_lr = float(getattr(args, "lr", 0.0))
+    for group in optimizer.param_groups:
+        group["lr"] = base_lr * float(group.get("lr_scale", 1.0))
+    return optimizer
+
+
+def _configure_branch_trainability(
     model: nn.Module,
-    named_parameters: Mapping[str, nn.Parameter],
-    adapter_param_to_module: Mapping[str, str],
-    gradients: Mapping[str, torch.Tensor],
-    selected_modules: Sequence[str],
-    restore_parameters: bool,
-) -> Dict[str, Dict[str, torch.Tensor]]:
-    """Apply one configured optimizer step from cached support gradients.
+    args: Any,
+    subset: Sequence[str],
+    ownership: ActionOwnership,
+) -> None:
+    active = set(subset)
+    base_update = str(getattr(args, "lora_base_update", "freeze") or "freeze").lower()
+    if base_update == "freeze":
+        freeze_all_parameters(model)
+    elif base_update == "full":
+        for parameter in model.parameters():
+            parameter.requires_grad_(True)
+    else:
+        raise ValueError(f"Unknown lora_base_update={base_update}")
 
-    No additional support forward/backward pass is needed. ``restore_parameters``
-    is used for isolated virtual updates; the confirmation update keeps its
-    parameters so validation can inspect the resulting subset.
-    """
+    named = dict(model.named_parameters())
+    with torch.no_grad():
+        for name, owner in ownership.adapter_parameter_owner.items():
+            parameter = named[name]
+            is_active = owner in active
+            parameter.requires_grad_(is_active)
+            if not is_active:
+                parameter.zero_()
 
-    selected = set(selected_modules)
-    if not selected:
-        raise ValueError("Module C optimizer step requires at least one B/D/E module.")
-    original_requires_grad = {name: bool(parameter.requires_grad) for name, parameter in named_parameters.items()}
-    before: Dict[str, torch.Tensor] = {}
-    try:
-        for name, parameter in named_parameters.items():
-            active = adapter_param_to_module[name] in selected
-            parameter.requires_grad_(active)
-            if active:
-                before[name] = parameter.detach().clone()
-                gradient = gradients.get(name)
-                parameter.grad = None if gradient is None else gradient.to(parameter.device, dtype=parameter.dtype).clone()
-            else:
-                parameter.grad = None
+    head_names = set(_head_parameter_names(model))
+    train_head = bool(getattr(args, "lora_train_head", True))
+    if base_update == "freeze" and train_head:
+        for name in head_names:
+            named[name].requires_grad_(True)
+    if base_update == "full" and not train_head:
+        for name in head_names:
+            named[name].requires_grad_(False)
 
-        get_num_layer, get_layer_scale = _optimizer_layer_decay_callbacks(args, model)
-        optimizer = create_optimizer(
-            args,
-            model,
-            skip_list=[],
-            get_num_layer=get_num_layer,
-            get_layer_scale=get_layer_scale,
-        )
-        for group in optimizer.param_groups:
-            group["lr"] = float(getattr(args, "lr", 0.0)) * float(group.get("lr_scale", 1.0))
-        active_parameters = [parameter for name, parameter in named_parameters.items() if adapter_param_to_module[name] in selected]
-        clip_grad = getattr(args, "clip_grad", None)
-        if clip_grad is not None:
-            torch.nn.utils.clip_grad_norm_(active_parameters, float(clip_grad))
-        optimizer.step()
+    if base_update == "freeze" and bool(getattr(args, "lora_train_chan_conv", False)):
+        for name, parameter in named.items():
+            if name == "chan_conv" or name.startswith("chan_conv."):
+                parameter.requires_grad_(True)
 
-        updates: Dict[str, Dict[str, torch.Tensor]] = {module_id: {} for module_id in selected}
-        for name, parameter in named_parameters.items():
-            module_id = adapter_param_to_module[name]
-            if module_id in selected:
-                updates[module_id][name] = (parameter.detach() - before[name]).to(device="cpu").clone()
-        return updates
-    finally:
-        if restore_parameters:
-            with torch.no_grad():
-                for name, value in before.items():
-                    named_parameters[name].copy_(value)
-        for name, parameter in named_parameters.items():
-            parameter.grad = None
-            parameter.requires_grad_(original_requires_grad[name])
-        model.zero_grad(set_to_none=True)
+    if str(getattr(args, "model_name", "")) == "CBraMod":
+        if base_update == "freeze" and bool(getattr(args, "cbra_train_patch_embed_when_frozen", False)):
+            for name, parameter in named.items():
+                if "main_model.patch_embedding" in name:
+                    parameter.requires_grad_(True)
+        if base_update == "full" and bool(getattr(args, "cbra_freeze_patch_embed_in_full", False)):
+            for name, parameter in named.items():
+                if "main_model.patch_embedding" in name:
+                    parameter.requires_grad_(False)
+        if bool(getattr(args, "cbra_train_norm_bias", False)):
+            train_bias = not bool(getattr(args, "cbra_train_norm_only", False))
+            for name, parameter in named.items():
+                lower = name.lower()
+                if "norm" in lower or "layernorm" in lower or ".ln" in lower or (train_bias and lower.endswith(".bias")):
+                    parameter.requires_grad_(True)
 
 
-def _class_grouped_validation_gradients(
+def _run_support_pass(
     args: Any,
     model: nn.Module,
     batches: Sequence[Sequence[Any]],
     device: torch.device,
-    named_parameters: Mapping[str, nn.Parameter],
-    adapter_param_to_module: Mapping[str, str],
-    candidate_modules: Sequence[str],
-) -> Tuple[Dict[str, Dict[int, Dict[str, torch.Tensor]]], Dict[int, int]]:
-    """Collect one validation forward per batch and one backward per present class."""
+    criterion: nn.Module,
+    controller: Any = None,
+) -> Tuple[Optional[float], int, int]:
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not trainable:
+        return None, 0, 0
+    optimizer = _create_probe_optimizer(args, model)
+    optimizer.zero_grad(set_to_none=True)
+    update_freq = max(1, int(getattr(args, "update_freq", 1)))
+    total_loss = 0.0
+    total_examples = 0
+    optimizer_steps = 0
+    model.train(True)
+    for batch_index, batch in enumerate(batches):
+        samples, targets, _labels = _prepare_batch(args, batch, device)
+        output = _forward_output(model, samples)
+        loss = criterion(output, targets)
+        if loss.ndim != 0:
+            loss = loss.mean()
+        if not bool(torch.isfinite(loss.detach()).item()):
+            raise RuntimeError("Module C support pass produced a non-finite loss.")
+        batch_size = int(samples.shape[0])
+        total_loss += float(loss.detach().cpu().item()) * batch_size
+        total_examples += batch_size
+        (loss / float(update_freq)).backward()
+        should_step = (batch_index + 1) % update_freq == 0 or batch_index + 1 == len(batches)
+        if should_step:
+            clip_grad = getattr(args, "clip_grad", None)
+            if clip_grad is not None:
+                torch.nn.utils.clip_grad_norm_(trainable, float(clip_grad))
+            optimizer.step()
+            optimizer_steps += 1
+            if controller is not None:
+                controller.finish_step(global_step=optimizer_steps - 1, epoch=1)
+            optimizer.zero_grad(set_to_none=True)
+    return float(total_loss / total_examples), total_examples, optimizer_steps
 
-    gradients: Dict[str, Dict[int, Dict[str, torch.Tensor]]] = {module_id: {} for module_id in candidate_modules}
-    counts: Dict[int, int] = {}
-    original_training = bool(model.training)
-    try:
-        model.eval()
+
+def _validation_losses(
+    args: Any,
+    model: nn.Module,
+    batches: Sequence[Sequence[Any]],
+    device: torch.device,
+) -> Tuple[Tuple[float, ...], Tuple[int, ...], Dict[int, float], float]:
+    losses_out: List[float] = []
+    labels_out: List[int] = []
+    model.eval()
+    with torch.no_grad():
         for batch in batches:
             samples, targets, labels_raw = _prepare_batch(args, batch, device)
             labels = _classification_labels(labels_raw, args)
-            if labels is None:
-                raise ValueError("Module C validation-risk selection requires multi-class classification labels.")
-            output = _forward_output(model, samples)
-            losses = _per_sample_loss(output, targets, args)
-            class_ids = [int(value) for value in torch.unique(labels).detach().cpu().tolist()]
-            for class_index, class_id in enumerate(class_ids):
-                mask = labels == class_id
-                class_count = int(mask.sum().item())
-                if class_count <= 0:
-                    continue
-                class_loss_sum = losses[mask].sum()
-                values = torch.autograd.grad(
-                    class_loss_sum,
-                    tuple(named_parameters.values()),
-                    retain_graph=class_index < len(class_ids) - 1,
-                    allow_unused=True,
-                )
-                counts[class_id] = counts.get(class_id, 0) + class_count
-                for name, value in zip(named_parameters, values):
-                    if value is None:
-                        continue
-                    module_id = adapter_param_to_module[name]
-                    class_map = gradients[module_id].setdefault(class_id, {})
-                    detached = value.detach().to(device="cpu")
-                    if name in class_map:
-                        class_map[name].add_(detached)
-                    else:
-                        class_map[name] = detached.clone()
-    finally:
-        model.zero_grad(set_to_none=True)
-        model.train(original_training)
-
-    class_ids = tuple(sorted(counts))
-    if len(class_ids) < 2:
-        raise ValueError("Module C validation-risk selection requires at least two observed validation labels.")
-    for module_id in candidate_modules:
-        for class_id in class_ids:
-            vectors = gradients[module_id].setdefault(class_id, {})
-            for name, parameter in named_parameters.items():
-                if adapter_param_to_module[name] != module_id:
-                    continue
-                if name not in vectors:
-                    vectors[name] = torch.zeros_like(parameter, device="cpu")
-                vectors[name].div_(float(counts[class_id]))
-    return gradients, counts
+            losses = _per_sample_log_loss(_forward_output(model, samples), targets, args)
+            losses_out.extend(float(value) for value in losses.detach().cpu().tolist())
+            labels_out.extend(int(value) for value in labels.detach().cpu().tolist())
+    per_class = {
+        class_id: float(np.mean([loss for loss, label in zip(losses_out, labels_out) if label == class_id]))
+        for class_id in sorted(set(labels_out))
+    }
+    if len(per_class) < 2:
+        raise ValueError("Module C requires at least two observed validation labels.")
+    return tuple(losses_out), tuple(labels_out), per_class, float(np.mean(list(per_class.values())))
 
 
-def first_order_effects_from_snapshots(
-    validation_gradients: Mapping[Any, Mapping[Any, Mapping[str, torch.Tensor]]],
-    virtual_updates: Mapping[Any, Mapping[str, torch.Tensor]],
-) -> Dict[str, Dict[int, float]]:
-    """Estimate class-wise validation-loss reduction ``-<g_val, delta>``.
-
-    The result is positive when the virtual support update is predicted to
-    lower that class's validation loss. It uses the same adapter tensors and
-    optimizer-produced parameter displacement as final LoRA training.
-    """
-
-    effects: Dict[str, Dict[int, float]] = {}
-    for raw_module, by_class in validation_gradients.items():
-        module_id = str(raw_module).upper()
-        updates = virtual_updates.get(raw_module, virtual_updates.get(module_id, {}))
-        effects[module_id] = {}
-        for raw_class, gradients in by_class.items():
-            value = 0.0
-            for name, validation_gradient in gradients.items():
-                update = updates.get(name)
-                if update is None:
-                    continue
-                gradient_vector = validation_gradient.detach().float().reshape(-1)
-                update_vector = update.detach().float().reshape(-1)
-                if gradient_vector.numel() != update_vector.numel():
-                    raise ValueError(f"Module C gradient/update shape mismatch for {module_id}:{name}.")
-                value -= float(torch.dot(gradient_vector, update_vector).item())
-            effects[module_id][int(raw_class)] = float(value)
-    return effects
+def _remove_dynamic_controller(model: nn.Module) -> None:
+    controller = getattr(model, "_module_e_dynamic_pressure_controller", None)
+    if controller is None:
+        return
+    for handle in getattr(controller, "_hook_handles", ()):
+        handle.remove()
+    delattr(model, "_module_e_dynamic_pressure_controller")
 
 
-def _classwise_validation_loss(
+def _anchor_task_head(
     args: Any,
     model: nn.Module,
-    batches: Sequence[Sequence[Any]],
+    support_batches: Sequence[Sequence[Any]],
+    validation_batches: Sequence[Sequence[Any]],
     device: torch.device,
-) -> Dict[int, float]:
-    loss_sum: Dict[int, float] = {}
-    counts: Dict[int, int] = {}
-    original_training = bool(model.training)
-    try:
-        model.eval()
-        with torch.no_grad():
-            for batch in batches:
-                samples, targets, labels_raw = _prepare_batch(args, batch, device)
-                labels = _classification_labels(labels_raw, args)
-                if labels is None:
-                    raise ValueError("Module C confirmation requires multi-class classification labels.")
-                losses = _per_sample_loss(_forward_output(model, samples), targets, args)
-                for raw_class in torch.unique(labels).detach().cpu().tolist():
-                    class_id = int(raw_class)
-                    mask = labels == class_id
-                    class_count = int(mask.sum().item())
-                    if class_count <= 0:
-                        continue
-                    loss_sum[class_id] = loss_sum.get(class_id, 0.0) + float(losses[mask].sum().detach().cpu().item())
-                    counts[class_id] = counts.get(class_id, 0) + class_count
-    finally:
-        model.train(original_training)
-    return {class_id: float(loss_sum[class_id] / float(counts[class_id])) for class_id in sorted(counts)}
-
-
-@contextmanager
-def _masked_module_adapter(model: nn.Module, adapter_param_to_module: Mapping[str, str], module_id: str) -> Iterator[None]:
-    named_parameters = dict(model.named_parameters())
-    saved = {
-        name: named_parameters[name].detach().clone()
-        for name, owner in adapter_param_to_module.items()
-        if owner == module_id
-    }
-    try:
-        with torch.no_grad():
-            for name in saved:
-                named_parameters[name].zero_()
-        yield
-    finally:
-        with torch.no_grad():
-            for name, value in saved.items():
-                named_parameters[name].copy_(value)
-
-
-def _loss_metrics(per_class_loss: Mapping[int, float]) -> Tuple[float, float]:
-    values = [float(value) for _, value in sorted(per_class_loss.items())]
-    if not values:
-        raise ValueError("Module C confirmation received no validation class losses.")
-    return sum(values) / float(len(values)), max(values)
-
-
-def prune_harmful_confirmation_additions(
-    selected_modules: Sequence[str],
-    primary_module: str,
-    full_per_class_loss: Mapping[int, float],
-    masked_per_class_loss: Mapping[str, Mapping[int, float]],
-) -> Tuple[Tuple[str, ...], Dict[str, Dict[str, Any]]]:
-    """Remove only added branches whose masking is Pareto-nonworse on validation.
-
-    The first selected module is protected to preserve Module C's nonempty
-    protocol. A later module is pruned only when masking it leaves both the
-    class-balanced mean loss and the worst-class loss no higher, with one
-    strictly lower. The numerical tolerance is floating-point housekeeping,
-    not a selectable method threshold.
-    """
-
-    selected = tuple(str(module_id).upper() for module_id in selected_modules)
-    if not selected:
-        raise ValueError("Module C confirmation cannot prune an empty selection.")
-    if selected[0] != str(primary_module).upper():
-        raise ValueError("Module C confirmation primary module must be the first selected module.")
-    full_classes = tuple(sorted(int(class_id) for class_id in full_per_class_loss))
-    full_mean, full_worst = _loss_metrics(full_per_class_loss)
-    diagnostics: Dict[str, Dict[str, Any]] = {
-        selected[0]: {
-            "checked": False,
-            "pruned": False,
-            "reason": "protected_primary_nonempty",
-        }
-    }
-    retained = [selected[0]]
-    for module_id in selected[1:]:
-        masked = masked_per_class_loss.get(module_id)
-        if masked is None or tuple(sorted(int(class_id) for class_id in masked)) != full_classes:
-            diagnostics[module_id] = {
-                "checked": False,
-                "pruned": False,
-                "reason": "missing_or_incomplete_masked_validation_loss",
-            }
-            retained.append(module_id)
-            continue
-        masked_mean, masked_worst = _loss_metrics(masked)
-        nonworse = masked_mean <= full_mean + _NUMERICAL_TOLERANCE and masked_worst <= full_worst + _NUMERICAL_TOLERANCE
-        strictly_better = masked_mean < full_mean - _NUMERICAL_TOLERANCE or masked_worst < full_worst - _NUMERICAL_TOLERANCE
-        pruned = bool(nonworse and strictly_better)
-        diagnostics[module_id] = {
-            "checked": True,
-            "pruned": pruned,
-            "full_mean_loss": float(full_mean),
-            "full_worst_class_loss": float(full_worst),
-            "masked_mean_loss": float(masked_mean),
-            "masked_worst_class_loss": float(masked_worst),
-            "reason": "masked_branch_pareto_nonworse" if pruned else "masked_branch_needed_or_inconclusive",
-        }
-        if not pruned:
-            retained.append(module_id)
-    return tuple(retained), diagnostics
-
-
-def _combined_effects(module_effects: Mapping[str, Mapping[int, float]], selected_modules: Sequence[str]) -> Dict[int, float]:
-    class_ids = tuple(sorted(next(iter(module_effects.values()))))
+    criterion: nn.Module,
+    effective_classes: int,
+) -> Dict[str, Any]:
+    initial_losses, _labels, initial_per_class, initial_macro = _validation_losses(
+        args, model, validation_batches, device
+    )
+    del initial_losses
+    head_names = _head_parameter_names(model)
+    named = dict(model.named_parameters())
+    before = {name: named[name].detach().cpu().clone() for name in head_names}
+    freeze_all_parameters(model)
+    for name in head_names:
+        named[name].requires_grad_(True)
+    anchor_rng = capture_module_c_rng_state()
+    restore_module_c_rng_state(anchor_rng)
+    support_loss, support_examples, optimizer_steps = _run_support_pass(
+        args, model, support_batches, device, criterion
+    ) if head_names else (None, 0, 0)
+    _final_losses, _labels, final_per_class, final_macro = _validation_losses(
+        args, model, validation_batches, device
+    )
+    parameter_delta_sq = 0.0
+    for name in head_names:
+        delta = named[name].detach().cpu().float() - before[name].float()
+        parameter_delta_sq += float(torch.sum(delta * delta).item())
+    uniform_reference = float(math.log(effective_classes))
     return {
-        class_id: float(sum(float(module_effects[module_id][class_id]) for module_id in selected_modules))
-        for class_id in class_ids
+        "status": "trained" if head_names else "no_exposed_head_parameters",
+        "parameter_names": list(head_names),
+        "parameter_count": sum(int(named[name].numel()) for name in head_names),
+        "parameter_delta_l2": float(math.sqrt(parameter_delta_sq)),
+        "support_passes": 1 if head_names else 0,
+        "support_examples": int(support_examples),
+        "optimizer_steps": int(optimizer_steps),
+        "support_loss": None if support_loss is None else float(support_loss),
+        "validation_loss_before": float(initial_macro),
+        "validation_loss_after": float(final_macro),
+        "validation_loss_improvement": float(initial_macro - final_macro),
+        "validation_per_class_before": initial_per_class,
+        "validation_per_class_after": final_per_class,
+        "uniform_log_loss_reference": uniform_reference,
+        "below_uniform_reference": bool(final_macro < uniform_reference),
+        "validity_role": "diagnostic_only_not_a_selection_gate",
     }
 
 
-def _vector_norm(vectors: Mapping[str, torch.Tensor]) -> float:
-    total = 0.0
-    for vector in vectors.values():
-        total += float(vector.detach().float().pow(2).sum().item())
-    return float(total ** 0.5)
+def _paired_evidence(reference: _BranchEvaluation, candidate: _BranchEvaluation) -> PairedRiskEvidence:
+    if reference.labels != candidate.labels or reference.subjects != candidate.subjects:
+        raise RuntimeError("Module C matched branches lost validation sample alignment.")
+    grouped: Dict[str, Dict[int, List[float]]] = {}
+    for reference_loss, candidate_loss, class_id, subject_id in zip(
+        reference.per_sample_loss,
+        candidate.per_sample_loss,
+        reference.labels,
+        reference.subjects,
+    ):
+        grouped.setdefault(subject_id, {}).setdefault(class_id, []).append(
+            float(reference_loss - candidate_loss)
+        )
+    return cluster_jackknife_evidence(grouped)
 
 
-def _module_e_reference_diagnostic(model: nn.Module, model_name: str) -> Dict[str, Any]:
-    branches = set()
-    for name in structural_inventory_from_model(str(model_name), model):
-        branch = module_e_branch_from_lora_param_name(str(model_name), name)
-        if branch in STRUCTURAL_ROUTING_BLOCKS:
-            branches.add(branch)
-    covered = tuple(sorted(branches))
-    return {
-        "structural_branches_observed": list(covered),
-        "structural_branch_count": len(covered),
-        "structural_reference_status": "identified" if len(covered) >= 2 else "not_identifiable",
-        "structural_reference_used_for_ranking": 0,
-    }
+def _canonical_subset(actions: Sequence[str], candidate_order: Sequence[str]) -> Tuple[str, ...]:
+    requested = set(actions)
+    return tuple(action for action in candidate_order if action in requested)
 
 
-def _build_diagnostics(
-    args: Any,
-    model: nn.Module,
-    candidate_modules: Sequence[str],
-    decision: ValidationRiskDecision,
-    module_effects: Mapping[str, Mapping[int, float]],
-    adapter_param_to_module: Mapping[str, str],
-    parameter_counts: Mapping[str, int],
-    support_gradients: Mapping[str, torch.Tensor],
-    virtual_updates: Mapping[str, Mapping[str, torch.Tensor]],
-    confirmation: Mapping[str, Any],
-) -> Dict[str, Dict[str, Any]]:
-    diagnostics: Dict[str, Dict[str, Any]] = {}
-    for module_id in candidate_modules:
-        record = dict(decision.candidate_decisions[module_id])
-        module_vectors = {
-            name: value
-            for name, value in support_gradients.items()
-            if adapter_param_to_module.get(name) == module_id
-        }
-        diagnostics[module_id] = {
-            "module_id": module_id,
-            "functional_name": DEFAULT_CANDIDATE_MODULES[module_id]["name"],
-            "functional_role": DEFAULT_CANDIDATE_MODULES[module_id]["role"],
-            "functional_blocks": list(DEFAULT_CANDIDATE_MODULES[module_id]["blocks"]),
-            "functional_diagnostics_role": "reference_only_not_used_for_ranking",
-            "adapter_parameter_count": int(parameter_counts.get(module_id, 0)),
-            "support_gradient_l2": _vector_norm(module_vectors),
-            "virtual_update_l2": _vector_norm(virtual_updates.get(module_id, {})),
-            "first_order_effect_by_class": {str(class_id): float(value) for class_id, value in module_effects[module_id].items()},
-            "mean_first_order_effect": float(record["overall_effect"]),
-            "worst_class_first_order_effect": float(record["worst_class_effect"]),
-            "primary_gate": record.get("gate", ""),
-            "dominated_by": list(record.get("dominated_by", ())),
-            "selected_before_confirmation": int(module_id in confirmation["selected_before"]),
-            "selected_after_confirmation": int(module_id in confirmation["selected_after"]),
-            "confirmation": dict(confirmation["pruning"].get(module_id, {})),
-        }
-        if module_id == "E":
-            diagnostics[module_id].update(_module_e_reference_diagnostic(model, str(getattr(args, "model_name", ""))))
-    return diagnostics
+def _validate_probe_training_controls(args: Any) -> None:
+    """Reject formal controls that the one-pass probe cannot mirror exactly."""
+
+    unsupported = []
+    if float(getattr(args, "lora_delta_lambda", 0.0)) != 0.0:
+        unsupported.append("lora_delta_lambda")
+    if float(getattr(args, "cbra_l2sp_lambda", 0.0)) != 0.0:
+        unsupported.append("cbra_l2sp_lambda")
+    if bool(getattr(args, "cbra_train_wrapped_base", False)):
+        unsupported.append("cbra_train_wrapped_base")
+    for name in (
+        "cbra_grad_scale_wrapped_base",
+        "cbra_grad_scale_patch",
+        "cbra_grad_scale_norm_bias",
+    ):
+        if float(getattr(args, name, 1.0)) != 1.0:
+            unsupported.append(name)
+    if bool(getattr(args, "enable_deepspeed", False)):
+        unsupported.append("enable_deepspeed")
+    if unsupported:
+        raise ValueError(
+            "Module C matched probe does not silently approximate these formal training controls: "
+            + ", ".join(unsupported)
+        )
+
+
+def _trial_from_branches(
+    label: str,
+    base: _BranchEvaluation,
+    candidate: _BranchEvaluation,
+) -> ActionTrial:
+    return ActionTrial(
+        label=label,
+        base_subset=base.subset,
+        candidate_subset=candidate.subset,
+        added_actions=tuple(action for action in candidate.subset if action not in base.subset),
+        parameter_count=int(candidate.adapter_parameter_count),
+        evidence=_paired_evidence(base, candidate),
+    )
 
 
 def _write_csv(path: str, rows: Sequence[Mapping[str, Any]]) -> str:
@@ -672,73 +665,20 @@ def _write_json(path: str, payload: Mapping[str, Any]) -> str:
     return path
 
 
-def _write_decision_json(
-    path: str,
-    args: Any,
-    decision: ValidationRiskDecision,
-    candidate_modules: Sequence[str],
-    diagnostics: Mapping[str, Mapping[str, Any]],
-    confirmation: Mapping[str, Any],
-    validation_class_counts: Mapping[int, int],
-    parameter_counts: Mapping[str, int],
-    replaced_modules: Sequence[str],
-) -> str:
-    recipe = build_module_c_recipe(
-        decision.selected_modules,
-        registry=DEFAULT_CANDIDATE_MODULES,
-        candidate_modules=candidate_modules,
-        module_scores={module_id: decision.candidate_decisions[module_id]["overall_effect"] for module_id in candidate_modules},
-    )
-    train_cap = int(getattr(args, "module_c_preflight_train_batches", 0))
-    val_cap = int(getattr(args, "module_c_preflight_val_batches", 0))
-    payload = {
-        "module_c_selection_rule": MODULE_C_PREFLIGHT_SELECTION_RULE,
-        "test_used_for_selection": 0,
-        "model_name": str(getattr(args, "model_name", "") or ""),
-        "dataset": str(getattr(args, "dataset", "") or ""),
-        "subject_mod": str(getattr(args, "subject_mod", "") or ""),
-        "k_shot": getattr(args, "k_shot", ""),
-        "seed": getattr(args, "seed", ""),
-        "candidate_modules": list(candidate_modules),
-        "selected_modules": list(decision.selected_modules),
-        "forced_nonempty": bool(decision.forced_nonempty),
-        "selection_reason": decision.reason,
-        "first_order_effect_definition": "q[a,c] = -sum_p <grad_validation[a,c,p], virtual_update[a,p]>",
-        "effect_sign": "positive predicts lower validation loss for that class",
-        "primary_rule": "safe non-dominated action, then highest class-balanced mean effect, highest worst-class effect, and fewer adapter parameters",
-        "addition_rule": "add only when class-balanced mean effect rises and worst-class effect does not fall",
-        "nonempty_rule": "if no safe action exists, select the least-harmful B/D/E action by worst-class effect",
-        "confirmation_rule": "after one support optimizer update, prune only added branches whose masking is Pareto-nonworse on class-balanced and worst-class validation loss",
-        "numerical_tolerance": _NUMERICAL_TOLERANCE,
-        "optimizer_for_virtual_and_confirmation_step": {
-            "name": str(getattr(args, "opt", "")),
-            "lr": float(getattr(args, "lr", 0.0)),
-            "weight_decay": float(getattr(args, "weight_decay", 0.0)),
-            "layer_decay": float(getattr(args, "layer_decay", 1.0)),
-            "clip_grad": getattr(args, "clip_grad", None),
-            "lr_rule": "configured base learning rate times the final model layer scale, before epoch scheduling",
-        },
-        "probe_scope": {
-            "support_batch_cap": train_cap,
-            "validation_batch_cap": val_cap,
-            "support_split": "full" if train_cap <= 0 else "debug_capped",
-            "validation_split": "full" if val_cap <= 0 else "debug_capped",
-            "model_mode": "eval",
-            "probe_adapter_dropout": 0.0,
-            "validation_class_counts": {str(class_id): int(count) for class_id, count in validation_class_counts.items()},
-        },
-        "parameter_counts": {module_id: int(parameter_counts.get(module_id, 0)) for module_id in candidate_modules},
-        "candidate_decisions": decision.candidate_decisions,
-        "search_steps": list(decision.search_steps),
-        "predicted_selected_effect_by_class": {str(class_id): float(value) for class_id, value in decision.per_class_effect.items()},
-        "predicted_class_balanced_effect": float(decision.overall_effect),
-        "predicted_worst_class_effect": float(decision.worst_class_effect),
-        "confirmation": confirmation,
-        "diagnostics_by_module": diagnostics,
-        "replaced_probe_modules": list(replaced_modules),
-        "recipe": recipe,
-    }
-    return _write_json(path, payload)
+def _decision_rows(search_steps: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for step_index, step in enumerate(search_steps, start=1):
+        for label, record in step.get("trial_diagnostics", {}).items():
+            rows.append(
+                {
+                    "step": step_index,
+                    "stage": step.get("stage", ""),
+                    "trial": label,
+                    "selected_after_stage": step.get("selected_after", []),
+                    **record,
+                }
+            )
+    return rows
 
 
 def run_module_c_preflight_selection(
@@ -750,183 +690,392 @@ def run_module_c_preflight_selection(
     criterion_builder: Optional[Callable[[Any, torch.device], nn.Module]] = None,
     is_main_process: bool = True,
 ) -> ModuleCPreflightResult:
-    """Resolve a nonempty B/D/E subset before the real LoRA model is built."""
+    """Resolve a nonempty B/D/E subset with matched one-pass branch trials."""
 
-    raw_nb_classes = int(getattr(args, "nb_classes", 0))
-    effective_classes = 2 if raw_nb_classes == 1 else raw_nb_classes
+    started = time.perf_counter()
+    raw_classes = int(getattr(args, "nb_classes", 0))
+    effective_classes = 2 if raw_classes == 1 else raw_classes
     if str(getattr(args, "task_mod", "")) != "Classification" or effective_classes < 2:
-        raise ValueError(
-            "Module C validation-risk selection supports classification tasks with at least two classes; "
-            "binary BCE uses nb_classes=1."
-        )
+        raise ValueError("Module C task-aligned search supports classification with at least two labels.")
+    _validate_probe_training_controls(args)
     candidate_modules = tuple(parse_module_ids(getattr(args, "module_c_candidates", "B,D,E")))
     if not candidate_modules:
-        raise RuntimeError("Module C requires at least one B/D/E candidate.")
+        raise ValueError("Module C requires at least one B/D/E candidate.")
     if data_loader_train is None or data_loader_val is None:
-        raise RuntimeError("Module C preflight requires distinct support/train and validation dataloaders.")
+        raise RuntimeError("Module C requires distinct support/train and validation dataloaders.")
 
-    train_batches = _collect_probe_batches(data_loader_train, int(getattr(args, "module_c_preflight_train_batches", 0)))
-    val_batches = _collect_probe_batches(data_loader_val, int(getattr(args, "module_c_preflight_val_batches", 0)))
-    if not train_batches or not val_batches:
-        raise RuntimeError("Module C preflight could not collect both support and validation batches.")
+    support_batches = _collect_probe_batches(
+        data_loader_train, int(getattr(args, "module_c_preflight_train_batches", 0))
+    )
+    validation_batches = _collect_probe_batches(
+        data_loader_val, int(getattr(args, "module_c_preflight_val_batches", 0))
+    )
+    if not support_batches or not validation_batches:
+        raise RuntimeError("Module C could not collect both support and validation batches.")
+    support_fingerprint = _support_fingerprint(support_batches)
 
-    original_training = bool(model.training)
-    original_requires_grad = {name: bool(parameter.requires_grad) for name, parameter in model.named_parameters()}
-    try:
-        model.to(device)
-        replaced = apply_lora_to_eegfm(
-            model=model,
-            model_name=str(getattr(args, "model_name", "")),
-            lora_target="module_c",
-            module_c_selected=candidate_modules,
-            module_b_sites=getattr(args, "module_b_sites", "both"),
-            r=int(getattr(args, "lora_rank", 4)),
-            alpha=float(getattr(args, "lora_alpha", 8.0)),
-            dropout=0.0,
-            verbose=False,
+    model.to(device)
+    criterion = criterion_builder(args, device) if criterion_builder is not None else _default_criterion(args, device)
+    head_anchor = _anchor_task_head(
+        args,
+        model,
+        support_batches,
+        validation_batches,
+        device,
+        criterion,
+        effective_classes,
+    )
+    model.to(torch.device("cpu"))
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    ownership = install_module_c_action_registry(
+        model=model,
+        model_name=str(getattr(args, "model_name", "")),
+        candidate_modules=candidate_modules,
+        module_b_sites=str(getattr(args, "module_b_sites", "both")),
+        r=int(getattr(args, "lora_rank", 4)),
+        alpha=float(getattr(args, "lora_alpha", 8.0)),
+        dropout=float(getattr(args, "lora_dropout", 0.0)),
+    )
+    initial_state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
+    model.to(device)
+    injection_complete_rng = capture_module_c_rng_state()
+
+    validation_example_count = sum(int(batch[1].numel()) for batch in validation_batches)
+    validation_subjects = _validation_subject_ids(
+        data_loader_val, len(validation_batches), validation_example_count
+    )
+    expected_classes = set(range(effective_classes))
+
+    branch_cache: Dict[Tuple[str, ...], _BranchEvaluation] = {}
+
+    def evaluate_subset(raw_subset: Sequence[str]) -> _BranchEvaluation:
+        subset = _canonical_subset(raw_subset, candidate_modules)
+        if subset in branch_cache:
+            return branch_cache[subset]
+        branch_started = time.perf_counter()
+        model.load_state_dict(initial_state, strict=True)
+        _remove_dynamic_controller(model)
+        _configure_branch_trainability(model, args, subset, ownership)
+        restore_module_c_rng_state(injection_complete_rng)
+        branch_args = copy.copy(args)
+        branch_args.output_dir = ""
+        controller = None
+        if "E" in subset and str(getattr(args, "module_e_mode", "")) == "dynamic_pressure_gate":
+            controller = attach_module_e_dynamic_pressure_controller(branch_args, model)
+        branch_criterion = (
+            criterion_builder(branch_args, device) if criterion_builder is not None else _default_criterion(branch_args, device)
         )
-        if not replaced:
-            raise RuntimeError(
-                f"Module C preflight injected no B/D/E probe adapters for model={getattr(args, 'model_name', '')}."
+        support_loss, support_examples, optimizer_steps = _run_support_pass(
+            branch_args,
+            model,
+            support_batches,
+            device,
+            branch_criterion,
+            controller=controller,
+        )
+        losses, labels, per_class_loss, macro_loss = _validation_losses(
+            branch_args, model, validation_batches, device
+        )
+        observed_classes = set(labels)
+        if observed_classes != expected_classes:
+            raise ValueError(
+                f"Module C validation split must contain every expected label; expected={sorted(expected_classes)}, "
+                f"observed={sorted(observed_classes)}."
             )
-        model.eval()
-        adapter_param_to_module, parameter_counts = _build_adapter_param_to_module(
-            model=model,
-            model_name=str(getattr(args, "model_name", "")),
-            candidate_modules=candidate_modules,
-            replaced_modules=replaced,
+        if len(losses) != len(validation_subjects):
+            raise RuntimeError("Module C validation loss and subject metadata lengths differ.")
+        named = dict(model.named_parameters())
+        adapter_count = sum(
+            int(named[name].numel())
+            for name, owner in ownership.adapter_parameter_owner.items()
+            if owner in set(subset)
         )
-        if not adapter_param_to_module:
-            raise RuntimeError("Module C preflight could not map injected LoRA adapter parameters to B/D/E.")
-        _configure_adapter_trainability(model, adapter_param_to_module)
-        named_parameters = _named_adapter_parameters(model, adapter_param_to_module)
-        criterion = criterion_builder(args, device) if criterion_builder is not None else _default_criterion(args, device)
+        evaluation = _BranchEvaluation(
+            subset=subset,
+            per_sample_loss=losses,
+            labels=labels,
+            subjects=validation_subjects,
+            per_class_loss=per_class_loss,
+            class_balanced_loss=macro_loss,
+            support_loss=support_loss,
+            support_examples=support_examples,
+            optimizer_steps=optimizer_steps,
+            adapter_parameter_count=adapter_count,
+            trainable_parameter_count=sum(int(parameter.numel()) for parameter in model.parameters() if parameter.requires_grad),
+            support_fingerprint=support_fingerprint,
+            elapsed_seconds=float(time.perf_counter() - branch_started),
+        )
+        _remove_dynamic_controller(model)
+        branch_cache[subset] = evaluation
+        return evaluation
 
-        support_gradients = _full_support_gradients(
-            args, model, train_batches, device, criterion, named_parameters
-        )
-        virtual_updates: Dict[str, Dict[str, torch.Tensor]] = {}
-        for module_id in candidate_modules:
-            virtual_updates[module_id] = _optimizer_step_from_gradients(
-                args=args,
-                model=model,
-                named_parameters=named_parameters,
-                adapter_param_to_module=adapter_param_to_module,
-                gradients=support_gradients,
-                selected_modules=(module_id,),
-                restore_parameters=True,
-            ).get(module_id, {})
-
-        validation_gradients, validation_class_counts = _class_grouped_validation_gradients(
-            args=args,
-            model=model,
-            batches=val_batches,
-            device=device,
-            named_parameters=named_parameters,
-            adapter_param_to_module=adapter_param_to_module,
-            candidate_modules=candidate_modules,
-        )
-        module_effects = first_order_effects_from_snapshots(validation_gradients, virtual_updates)
-        decision = select_validation_risk_subset(module_effects, parameter_counts)
-        selected_before = tuple(decision.selected_modules)
-
-        _optimizer_step_from_gradients(
-            args=args,
-            model=model,
-            named_parameters=named_parameters,
-            adapter_param_to_module=adapter_param_to_module,
-            gradients=support_gradients,
-            selected_modules=selected_before,
-            restore_parameters=False,
-        )
-        full_validation_loss = _classwise_validation_loss(args, model, val_batches, device)
-        masked_validation_loss: Dict[str, Dict[int, float]] = {}
-        for module_id in selected_before[1:]:
-            with _masked_module_adapter(model, adapter_param_to_module, module_id):
-                masked_validation_loss[module_id] = _classwise_validation_loss(args, model, val_batches, device)
-        selected_after, pruning = prune_harmful_confirmation_additions(
-            selected_modules=selected_before,
-            primary_module=selected_before[0],
-            full_per_class_loss=full_validation_loss,
-            masked_per_class_loss=masked_validation_loss,
-        )
-        for module_id, record in decision.candidate_decisions.items():
-            record["selected_before_confirmation"] = int(module_id in selected_before)
-            record["selected_after_confirmation"] = int(module_id in selected_after)
-            record["selected"] = int(module_id in selected_after)
-        if selected_after != selected_before:
-            confirmed_effect = _combined_effects(module_effects, selected_after)
-            confirmed_mean = sum(confirmed_effect.values()) / float(len(confirmed_effect))
-            confirmed_worst = min(confirmed_effect.values())
-            decision = replace(
-                decision,
-                selected_modules=selected_after,
-                per_class_effect=confirmed_effect,
-                overall_effect=float(confirmed_mean),
-                worst_class_effect=float(confirmed_worst),
-                reason=f"{decision.reason}_confirmation_pruned",
-            )
-        confirmation = {
-            "selected_before": list(selected_before),
-            "selected_after": list(selected_after),
-            "full_per_class_loss": {str(class_id): float(value) for class_id, value in full_validation_loss.items()},
-            "masked_per_class_loss": {
-                module_id: {str(class_id): float(value) for class_id, value in per_class.items()}
-                for module_id, per_class in masked_validation_loss.items()
-            },
-            "pruning": pruning,
+    search_steps: List[Dict[str, Any]] = []
+    visited = set()
+    empty_branch = evaluate_subset(())
+    primary_trials = [
+        _trial_from_branches(action, empty_branch, evaluate_subset((action,)))
+        for action in candidate_modules
+    ]
+    primary = choose_action(primary_trials, require_nonempty=True, alpha=MODULE_C_ALPHA)
+    if primary.selected_trial is None:
+        raise RuntimeError("Module C nonempty primary selection returned no action.")
+    selected = tuple(primary.selected_subset)
+    visited.add(selected)
+    search_steps.append(
+        {
+            "stage": "primary",
+            "reference_subset": [],
+            "selected_after": list(selected),
+            "reason": primary.reason,
+            "evidence_strength": primary.evidence_strength,
+            "trial_diagnostics": primary.trial_diagnostics,
         }
-        diagnostics = _build_diagnostics(
-            args=args,
-            model=model,
-            candidate_modules=candidate_modules,
-            decision=decision,
-            module_effects=module_effects,
-            adapter_param_to_module=adapter_param_to_module,
-            parameter_counts=parameter_counts,
-            support_gradients=support_gradients,
-            virtual_updates=virtual_updates,
-            confirmation=confirmation,
-        )
+    )
 
-        setattr(args, "module_c_enable", True)
-        setattr(args, "module_c_resolved_candidates", ",".join(candidate_modules))
-        setattr(args, "module_c_resolved_selected", ",".join(decision.selected_modules))
-        setattr(args, "module_c_selection_rule", MODULE_C_PREFLIGHT_SELECTION_RULE)
-
-        output_dir = str(getattr(args, "output_dir", "") or "")
-        score_path = ""
-        decision_path = ""
-        if is_main_process and output_dir:
-            score_rows = [diagnostics[module_id] for module_id in candidate_modules]
-            score_path = _write_csv(os.path.join(output_dir, MODULE_C_PREFLIGHT_SCORE_FILE), score_rows)
-            decision_path = _write_decision_json(
-                path=os.path.join(output_dir, MODULE_C_PREFLIGHT_DECISION_FILE),
-                args=args,
-                decision=decision,
-                candidate_modules=candidate_modules,
-                diagnostics=diagnostics,
-                confirmation=confirmation,
-                validation_class_counts=validation_class_counts,
-                parameter_counts=parameter_counts,
-                replaced_modules=replaced,
+    stop_reason = "all_registry_actions_selected"
+    while len(selected) < len(candidate_modules):
+        reference = evaluate_subset(selected)
+        remaining = [action for action in candidate_modules if action not in selected]
+        addition_trials = []
+        for action in remaining:
+            candidate_subset = _canonical_subset((*selected, action), candidate_modules)
+            if candidate_subset in visited:
+                continue
+            addition_trials.append(
+                _trial_from_branches(
+                    "+".join(candidate_subset), reference, evaluate_subset(candidate_subset)
+                )
             )
-        print(
-            "[ModuleC] validation-risk selected "
-            f"{','.join(decision.selected_modules)} ({decision.reason}); "
-            f"predicted mean={decision.overall_effect:.6g}, worst={decision.worst_class_effect:.6g}."
+        addition: Optional[SearchDecision] = None
+        if addition_trials:
+            addition = choose_action(addition_trials, require_nonempty=False, alpha=MODULE_C_ALPHA)
+            search_steps.append(
+                {
+                    "stage": "conditional_addition",
+                    "reference_subset": list(selected),
+                    "selected_after": list(addition.selected_subset or selected),
+                    "reason": addition.reason,
+                    "evidence_strength": addition.evidence_strength,
+                    "trial_diagnostics": addition.trial_diagnostics,
+                }
+            )
+        if addition is not None and addition.selected_trial is not None:
+            selected = tuple(addition.selected_subset)
+            visited.add(selected)
+        else:
+            pair_trials = []
+            if len(remaining) >= 2:
+                for pair in itertools.combinations(remaining, 2):
+                    candidate_subset = _canonical_subset((*selected, *pair), candidate_modules)
+                    if candidate_subset in visited:
+                        continue
+                    pair_trials.append(
+                        _trial_from_branches(
+                            "+".join(candidate_subset), reference, evaluate_subset(candidate_subset)
+                        )
+                    )
+            if pair_trials:
+                rescue = choose_action(pair_trials, require_nonempty=False, alpha=MODULE_C_ALPHA)
+                search_steps.append(
+                    {
+                        "stage": "pair_rescue",
+                        "reference_subset": list(selected),
+                        "selected_after": list(rescue.selected_subset or selected),
+                        "reason": rescue.reason,
+                        "evidence_strength": rescue.evidence_strength,
+                        "trial_diagnostics": rescue.trial_diagnostics,
+                    }
+                )
+                if rescue.selected_trial is not None:
+                    selected = tuple(rescue.selected_subset)
+                    visited.add(selected)
+                else:
+                    stop_reason = "no_supported_conditional_or_pair_gain"
+                    break
+            else:
+                stop_reason = "no_supported_conditional_gain"
+                break
+
+        if len(selected) > 1:
+            full_branch = evaluate_subset(selected)
+            deletion_trials = []
+            for action in selected:
+                smaller = tuple(item for item in selected if item != action)
+                if not smaller:
+                    continue
+                deletion_trials.append(
+                    _trial_from_branches(
+                        f"drop-{action}", full_branch, evaluate_subset(smaller)
+                    )
+                )
+            deletion = choose_floating_deletion(deletion_trials, alpha=MODULE_C_ALPHA)
+            search_steps.append(
+                {
+                    "stage": "floating_deletion",
+                    "reference_subset": list(selected),
+                    "selected_after": list(deletion.selected_subset or selected),
+                    "reason": deletion.reason,
+                    "evidence_strength": deletion.evidence_strength,
+                    "trial_diagnostics": deletion.trial_diagnostics,
+                }
+            )
+            if deletion.selected_trial is not None:
+                deleted_to = tuple(deletion.selected_subset)
+                if deleted_to in visited:
+                    selected = deleted_to
+                    stop_reason = "floating_deletion_returned_visited_subset"
+                    break
+                selected = deleted_to
+                visited.add(selected)
+
+    final_reason = f"{primary.reason};{stop_reason}"
+    final_decision = ModuleCDecision(
+        selected_modules=tuple(selected),
+        reason=final_reason,
+        evidence_strength=primary.evidence_strength,
+        search_steps=tuple(search_steps),
+    )
+
+    primary_diagnostics = search_steps[0]["trial_diagnostics"]
+    diagnostics_by_module: Dict[str, Dict[str, Any]] = {}
+    for action in candidate_modules:
+        replacements = ownership.action_replacement_names[action]
+        structural_branches = sorted(
+            {
+                branch
+                for name in replacements
+                for branch in [module_e_branch_from_lora_param_name(str(getattr(args, "model_name", "")), name)]
+                if branch is not None
+            }
         )
-        return ModuleCPreflightResult(
-            decision=decision,
-            diagnostics_by_module=diagnostics,
-            replaced_modules=tuple(replaced),
-            score_csv_path=score_path,
-            decision_json_path=decision_path,
+        diagnostics_by_module[action] = {
+            "module_id": action,
+            "functional_name": DEFAULT_CANDIDATE_MODULES[action]["name"],
+            "functional_role": DEFAULT_CANDIDATE_MODULES[action]["role"],
+            "functional_blocks": list(DEFAULT_CANDIDATE_MODULES[action]["blocks"]),
+            "functional_diagnostics_used_for_ranking": 0,
+            "common_ranking_measure": "paired_class_balanced_validation_log_loss",
+            "adapter_parameter_count": int(ownership.parameter_counts[action]),
+            "adapter_parameter_names": list(ownership.action_parameter_names[action]),
+            "replacement_names": list(replacements),
+            "structural_branches_reference_only": structural_branches,
+            "selected": int(action in selected),
+            "primary_trial": primary_diagnostics.get(action, {}),
+        }
+
+    setattr(args, "module_c_enable", True)
+    setattr(args, "module_c_resolved_candidates", ",".join(candidate_modules))
+    setattr(args, "module_c_resolved_selected", ",".join(selected))
+    setattr(args, "module_c_selection_rule", MODULE_C_PREFLIGHT_SELECTION_RULE)
+
+    branch_summaries = {subset: evaluation.summary() for subset, evaluation in branch_cache.items()}
+    train_cap = int(getattr(args, "module_c_preflight_train_batches", 0))
+    val_cap = int(getattr(args, "module_c_preflight_val_batches", 0))
+    total_seconds = float(time.perf_counter() - started)
+    payload = {
+        "module_c_selection_rule": MODULE_C_PREFLIGHT_SELECTION_RULE,
+        "test_used_for_selection": 0,
+        "candidate_modules": list(candidate_modules),
+        "selected_modules": list(selected),
+        "selection_reason": final_reason,
+        "primary_evidence_strength": primary.evidence_strength,
+        "score_definition": "paired_validation_log_loss: loss(reference_subset) - loss(candidate_subset)",
+        "positive_sign": "candidate branch lowers validation log-loss",
+        "aggregation_order": "windows_within_subject_class_then_subjects_within_class_then_equal_class_mean",
+        "uncertainty": {
+            "method": "delete_one_subject_cluster_jackknife",
+            "minimum_subject_clusters": 3,
+            "minimum_cluster_reason": "estimate between-subject dispersion with at least two t-test degrees of freedom",
+            "alpha": MODULE_C_ALPHA,
+            "alpha_source": "conventional_fixed_type_I_error_rate",
+            "gain_multiplicity": "Holm correction across candidate gains within each measured search stage",
+            "harm_multiplicity": "Holm correction across every candidate-by-class harm test within each measured search stage",
+            "window_independence_claimed": 0,
+            "inference_role": "within_stage_stability_screen_not_post_selection_inference",
+            "adaptive_reuse_note": "the same validation split guides sequential stages, so p-values are evidence controls rather than confirmatory guarantees",
+        },
+        "nonempty_rule": {
+            "supported": "choose the largest supported paired gain with no supported class harm",
+            "weak": "if required, choose the largest observed gain without supported class harm",
+            "mandatory": "if every action has supported harm, maximize the worst observed class effect",
+        },
+        "search": {
+            "strategy": "forward_conditional_addition_pair_rescue_and_floating_deletion",
+            "supported_candidate_ranking": "largest paired class-balanced gain, then largest worst-class gain, then fewer adapter parameters only on an exact evidence tie",
+            "complexity_policy": "parameter count is reported and used only as an exact tie-break; no unexplained weighted penalty is added",
+            "pair_order": 2,
+            "pair_order_reason": "lowest interaction order that can represent synergy or conflict",
+            "search_steps": search_steps,
+        },
+        "head_anchor": head_anchor,
+        "probe_training": {
+            "support_passes_per_branch": 1,
+            "budget_unit_reason": "one complete exposure to the selected support split",
+            "optimizer": str(getattr(args, "opt", "")),
+            "base_learning_rate": float(getattr(args, "lr", 0.0)),
+            "learning_rate_rule": "configured downstream base LR, constant within the one-pass probe",
+            "weight_decay": float(getattr(args, "weight_decay", 0.0)),
+            "lora_base_update": str(getattr(args, "lora_base_update", "")),
+            "lora_rank": int(getattr(args, "lora_rank", 0)),
+            "lora_alpha": float(getattr(args, "lora_alpha", 0.0)),
+            "lora_dropout": float(getattr(args, "lora_dropout", 0.0)),
+            "support_batch_cap": train_cap,
+            "validation_batch_cap": val_cap,
+            "support_scope": "full" if train_cap <= 0 else "debug_capped",
+            "validation_scope": "full" if val_cap <= 0 else "debug_capped",
+            "formal_state_transfer": 0,
+        },
+        "action_ownership": {
+            action: {
+                "parameter_count": int(ownership.parameter_counts[action]),
+                "parameter_names": list(ownership.action_parameter_names[action]),
+                "replacement_names": list(ownership.action_replacement_names[action]),
+            }
+            for action in candidate_modules
+        },
+        "branches": {"+".join(subset) if subset else "EMPTY": trace for subset, trace in branch_summaries.items()},
+        "diagnostics_by_module": diagnostics_by_module,
+        "runtime": {
+            "total_seconds": total_seconds,
+            "branch_count": len(branch_cache),
+            "support_pass_count": len(branch_cache) + int(head_anchor["support_passes"]),
+            "validation_pass_count": len(branch_cache) + 2,
+        },
+        "claim_boundary": "low_fidelity_validation_guided_subset_search_not_a_guarantee_of_the_final_test_winner",
+        "recipe": build_module_c_recipe(
+            selected,
+            registry=DEFAULT_CANDIDATE_MODULES,
+            candidate_modules=candidate_modules,
+        ),
+    }
+
+    output_dir = str(getattr(args, "output_dir", "") or "")
+    score_path = ""
+    decision_path = ""
+    if is_main_process and output_dir:
+        score_path = _write_csv(
+            os.path.join(output_dir, MODULE_C_PREFLIGHT_SCORE_FILE),
+            _decision_rows(search_steps),
         )
-    finally:
-        model.zero_grad(set_to_none=True)
-        model.train(original_training)
-        current_parameters = dict(model.named_parameters())
-        for name, requires_grad in original_requires_grad.items():
-            if name in current_parameters:
-                current_parameters[name].requires_grad_(requires_grad)
+        decision_path = _write_json(
+            os.path.join(output_dir, MODULE_C_PREFLIGHT_DECISION_FILE),
+            payload,
+        )
+
+    print(
+        "[ModuleC] task-aligned search selected "
+        f"{','.join(selected)}; primary_evidence={primary.evidence_strength}; "
+        f"branches={len(branch_cache)}, elapsed={total_seconds:.1f}s."
+    )
+    return ModuleCPreflightResult(
+        decision=final_decision,
+        diagnostics_by_module=diagnostics_by_module,
+        ownership=ownership,
+        head_anchor=head_anchor,
+        branch_traces=branch_summaries,
+        replaced_modules=ownership.replaced_modules,
+        score_csv_path=score_path,
+        decision_json_path=decision_path,
+    )

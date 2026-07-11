@@ -1,206 +1,374 @@
-"""Parameter-free B/D/E subset selection from class-wise validation effects."""
+"""Paired, class-balanced validation-risk evidence for Module C.
+
+The policy is intentionally model agnostic.  It receives paired validation
+log-loss reductions from matched branches and decides whether an action has
+enough downstream evidence to enter the B/D/E subset.  Action-specific Module
+B, D, and E diagnostics never alter this common score.
+"""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
+from statistics import mean, stdev
+from typing import Any, Dict, Hashable, Mapping, Optional, Sequence, Tuple
+
+from scipy.stats import t as student_t
 
 
-MODULE_C_ACTIONS = ("B", "D", "E")
-_EPSILON = 1e-12
+MODULE_C_ALPHA = 0.05
 
 
 @dataclass(frozen=True)
-class ValidationRiskDecision:
-    selected_modules: Tuple[str, ...]
-    per_class_effect: Dict[int, float]
-    overall_effect: float
-    worst_class_effect: float
-    candidate_decisions: Dict[str, Dict[str, Any]]
-    search_steps: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
-    forced_nonempty: bool = False
-    reason: str = ""
+class PairedRiskEvidence:
+    """Subject-clustered evidence for one matched branch comparison.
+
+    Every value is in validation log-loss reduction units.  Positive values
+    mean that the candidate branch has lower loss than its matched reference.
+    """
+
+    subject_class_gain: Dict[str, Dict[int, float]]
+    class_gain: Dict[int, float]
+    overall_gain: float
+    worst_class_gain: float
+    cluster_count: int
+    class_cluster_counts: Dict[int, int]
+    overall_standard_error: float
+    class_standard_error: Dict[int, float]
+    overall_gain_p_value: float
+    class_harm_p_values: Dict[int, float]
+    confidence_status: str
 
 
-def _normalize_effects(module_effects: Mapping[Any, Mapping[Any, Any]]) -> Dict[str, Dict[int, float]]:
-    normalized: Dict[str, Dict[int, float]] = {}
-    class_ids = None
-    for raw_module, raw_effects in module_effects.items():
-        module_id = str(raw_module or "").strip().upper()
-        if module_id not in MODULE_C_ACTIONS:
-            raise ValueError(f"Module C accepts only B, D, and E; got {module_id!r}.")
-        effects = {int(cls): float(value) for cls, value in raw_effects.items()}
-        if not effects:
-            raise ValueError(f"Module C received no class-wise validation effects for {module_id}.")
-        if class_ids is None:
-            class_ids = tuple(sorted(effects))
-        elif tuple(sorted(effects)) != class_ids:
-            raise ValueError("All Module C candidates must cover the same validation classes.")
-        normalized[module_id] = effects
-    if len(normalized) == 0:
-        raise ValueError("Module C requires at least one B/D/E candidate.")
-    if class_ids is None or len(class_ids) < 2:
-        raise ValueError("Module C unified-risk selection requires class-wise validation effects for at least two classes.")
+@dataclass(frozen=True)
+class ActionTrial:
+    """One measured reference-subset versus candidate-subset comparison."""
+
+    label: str
+    base_subset: Tuple[str, ...]
+    candidate_subset: Tuple[str, ...]
+    added_actions: Tuple[str, ...]
+    parameter_count: int
+    evidence: PairedRiskEvidence
+
+
+@dataclass(frozen=True)
+class SearchDecision:
+    """Result of one forward, rescue, or floating-deletion search stage."""
+
+    selected_trial: Optional[ActionTrial]
+    reason: str
+    evidence_strength: str
+    trial_diagnostics: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    @property
+    def selected_subset(self) -> Tuple[str, ...]:
+        if self.selected_trial is None:
+            return tuple()
+        return tuple(self.selected_trial.candidate_subset)
+
+
+def _validate_subject_class_windows(
+    subject_class_windows: Mapping[Any, Mapping[Any, Sequence[Any]]],
+) -> Dict[str, Dict[int, Tuple[float, ...]]]:
+    normalized: Dict[str, Dict[int, Tuple[float, ...]]] = {}
+    for raw_subject, raw_classes in subject_class_windows.items():
+        subject_id = str(raw_subject)
+        class_map: Dict[int, Tuple[float, ...]] = {}
+        for raw_class, raw_values in raw_classes.items():
+            class_id = int(raw_class)
+            values = tuple(float(value) for value in raw_values)
+            if not values:
+                continue
+            if not all(math.isfinite(value) for value in values):
+                raise ValueError("Module C paired validation losses must be finite.")
+            class_map[class_id] = values
+        if class_map:
+            normalized[subject_id] = class_map
+    if not normalized:
+        raise ValueError("Module C received no subject-class paired validation losses.")
+    class_ids = sorted({class_id for class_map in normalized.values() for class_id in class_map})
+    if len(class_ids) < 2:
+        raise ValueError("Module C requires paired validation losses for at least two observed classes.")
     return normalized
 
 
-def _metrics(per_class_effect: Mapping[int, float]) -> Tuple[float, float]:
-    values = tuple(float(value) for _, value in sorted(per_class_effect.items()))
-    return sum(values) / float(len(values)), min(values)
+def _standard_error(values: Sequence[float]) -> float:
+    if len(values) < 2:
+        return float("nan")
+    return float(stdev(values) / math.sqrt(float(len(values))))
 
 
-def _dominates(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
-    left_gain = float(left["overall_effect"])
-    left_worst = float(left["worst_class_effect"])
-    right_gain = float(right["overall_effect"])
-    right_worst = float(right["worst_class_effect"])
-    return (
-        left_gain >= right_gain - _EPSILON
-        and left_worst >= right_worst - _EPSILON
-        and (left_gain > right_gain + _EPSILON or left_worst > right_worst + _EPSILON)
-    )
+def _one_sided_p_value(estimate: float, standard_error: float, degrees_of_freedom: int, direction: str) -> float:
+    if degrees_of_freedom < 1 or not math.isfinite(standard_error):
+        return 1.0
+    if standard_error == 0.0:
+        if estimate == 0.0:
+            return 0.5
+        if direction == "greater":
+            return 0.0 if estimate > 0.0 else 1.0
+        if direction == "less":
+            return 0.0 if estimate < 0.0 else 1.0
+        raise ValueError(f"Unknown one-sided direction: {direction}")
+    statistic = float(estimate / standard_error)
+    if direction == "greater":
+        return float(student_t.sf(statistic, degrees_of_freedom))
+    if direction == "less":
+        return float(student_t.cdf(statistic, degrees_of_freedom))
+    raise ValueError(f"Unknown one-sided direction: {direction}")
 
 
-def _is_safe(record: Mapping[str, Any]) -> bool:
-    return float(record["overall_effect"]) > _EPSILON and float(record["worst_class_effect"]) >= -_EPSILON
+def cluster_jackknife_evidence(
+    subject_class_windows: Mapping[Any, Mapping[Any, Sequence[Any]]],
+) -> PairedRiskEvidence:
+    """Aggregate window gains and estimate uncertainty at the subject level.
 
-
-def _safe_rank(record: Mapping[str, Any]) -> Tuple[float, float, int, str]:
-    return (
-        -float(record["overall_effect"]),
-        -float(record["worst_class_effect"]),
-        int(record["parameter_count"]),
-        str(record["module_id"]),
-    )
-
-
-def _forced_rank(record: Mapping[str, Any]) -> Tuple[float, float, int, str]:
-    return (
-        -float(record["worst_class_effect"]),
-        -float(record["overall_effect"]),
-        int(record["parameter_count"]),
-        str(record["module_id"]),
-    )
-
-
-def _combined_effect(
-    current: Mapping[int, float],
-    addition: Mapping[int, float],
-) -> Dict[int, float]:
-    return {int(cls): float(current[int(cls)]) + float(addition[int(cls)]) for cls in current}
-
-
-def select_validation_risk_subset(
-    module_effects: Mapping[Any, Mapping[Any, Any]],
-    parameter_counts: Mapping[Any, Any],
-    allow_empty: bool = False,
-) -> ValidationRiskDecision:
-    """Select a nonempty B/D/E subset from common class-wise loss effects.
-
-    Positive effects lower validation loss. A primary action must improve the
-    class-balanced mean without predicting harm to any class. Later actions
-    are accepted only when they improve the mean and do not lower the current
-    worst-class effect.
+    The aggregation order is fixed: windows within ``(subject, class)``, then
+    subjects within class, then classes.  Delete-one-subject jackknife
+    pseudo-values prevent densely windowed recordings from masquerading as
+    independent evidence.
     """
 
-    if allow_empty:
-        raise ValueError("Module C never permits empty selection; its candidates are only B, D, and E.")
-
-    effects = _normalize_effects(module_effects)
-    records: Dict[str, Dict[str, Any]] = {}
-    for module_id, by_class in effects.items():
-        overall, worst = _metrics(by_class)
-        records[module_id] = {
-            "module_id": module_id,
-            "per_class_effect": dict(by_class),
-            "overall_effect": float(overall),
-            "worst_class_effect": float(worst),
-            "parameter_count": int(parameter_counts.get(module_id, 0)),
-            "dominated_by": [],
-            "gate": "",
-        }
-
-    for module_id, record in records.items():
-        record["dominated_by"] = [
-            other_id
-            for other_id, other in records.items()
-            if other_id != module_id and _dominates(other, record)
+    windows = _validate_subject_class_windows(subject_class_windows)
+    subject_class_gain = {
+        subject_id: {class_id: float(mean(values)) for class_id, values in class_map.items()}
+        for subject_id, class_map in windows.items()
+    }
+    class_ids = tuple(sorted({class_id for class_map in subject_class_gain.values() for class_id in class_map}))
+    class_values = {
+        class_id: [
+            class_map[class_id]
+            for class_map in subject_class_gain.values()
+            if class_id in class_map
         ]
-        if not _is_safe(record):
-            record["gate"] = "unsafe_class_harm" if record["worst_class_effect"] < -_EPSILON else "no_positive_mean_effect"
-        elif record["dominated_by"]:
-            record["gate"] = "dominated"
-        else:
-            record["gate"] = "safe_candidate"
+        for class_id in class_ids
+    }
+    class_gain = {class_id: float(mean(values)) for class_id, values in class_values.items()}
+    overall_gain = float(mean(class_gain.values()))
+    worst_class_gain = float(min(class_gain.values()))
 
-    viable = [record for record in records.values() if record["gate"] == "safe_candidate"]
-    forced_nonempty = False
-    if viable:
-        primary = min(viable, key=_safe_rank)
-        reason = "selected_safe_validation_effect"
-    else:
-        primary = min(records.values(), key=_forced_rank)
-        forced_nonempty = True
-        reason = "forced_nonempty_least_harm"
-        primary["gate"] = "forced_nonempty_least_harm"
-
-    selected = [str(primary["module_id"])]
-    current_effect = dict(primary["per_class_effect"])
-    current_gain, current_worst = _metrics(current_effect)
-    steps = [
-        {
-            "step": 1,
-            "selected_modules": list(selected),
-            "overall_effect": float(current_gain),
-            "worst_class_effect": float(current_worst),
-            "forced_nonempty": bool(forced_nonempty),
-        }
-    ]
-
-    while len(selected) < len(effects):
-        additions = []
-        for module_id, by_class in effects.items():
-            if module_id in selected:
-                continue
-            combined = _combined_effect(current_effect, by_class)
-            combined_gain, combined_worst = _metrics(combined)
-            if combined_gain > current_gain + _EPSILON and combined_worst >= current_worst - _EPSILON:
-                additions.append(
-                    {
-                        "module_id": module_id,
-                        "per_class_effect": combined,
-                        "overall_effect": combined_gain,
-                        "worst_class_effect": combined_worst,
-                        "parameter_count": sum(int(records[m]["parameter_count"]) for m in (*selected, module_id)),
-                    }
-                )
-        if not additions:
+    subjects = tuple(sorted(subject_class_gain))
+    overall_pseudo_values = []
+    for held_out in subjects:
+        leave_one_class_gain: Dict[int, float] = {}
+        for class_id in class_ids:
+            remaining = [
+                class_map[class_id]
+                for subject_id, class_map in subject_class_gain.items()
+                if subject_id != held_out and class_id in class_map
+            ]
+            if not remaining:
+                leave_one_class_gain = {}
+                break
+            leave_one_class_gain[class_id] = float(mean(remaining))
+        if not leave_one_class_gain:
+            overall_pseudo_values = []
             break
-        chosen = min(additions, key=_safe_rank)
-        selected.append(str(chosen["module_id"]))
-        current_effect = dict(chosen["per_class_effect"])
-        current_gain = float(chosen["overall_effect"])
-        current_worst = float(chosen["worst_class_effect"])
-        steps.append(
-            {
-                "step": len(selected),
-                "selected_modules": list(selected),
-                "overall_effect": current_gain,
-                "worst_class_effect": current_worst,
-                "forced_nonempty": False,
-            }
+        leave_one_overall = float(mean(leave_one_class_gain.values()))
+        n_subjects = len(subjects)
+        overall_pseudo_values.append(float(n_subjects * overall_gain - (n_subjects - 1) * leave_one_overall))
+
+    overall_standard_error = _standard_error(overall_pseudo_values)
+    class_standard_error: Dict[int, float] = {}
+    class_harm_p_values: Dict[int, float] = {}
+    class_cluster_counts: Dict[int, int] = {}
+    for class_id, values in class_values.items():
+        count = len(values)
+        class_cluster_counts[class_id] = count
+        standard_error = _standard_error(values)
+        class_standard_error[class_id] = standard_error
+        class_harm_p_values[class_id] = _one_sided_p_value(
+            class_gain[class_id], standard_error, count - 1, "less"
         )
 
-    for module_id, record in records.items():
-        record["selected"] = int(module_id in selected)
+    confidence_available = (
+        len(subjects) >= 3
+        and len(overall_pseudo_values) == len(subjects)
+        and all(count >= 2 for count in class_cluster_counts.values())
+        and math.isfinite(overall_standard_error)
+    )
+    confidence_status = "cluster_jackknife" if confidence_available else "insufficient_subject_clusters"
+    overall_gain_p_value = (
+        _one_sided_p_value(overall_gain, overall_standard_error, len(subjects) - 1, "greater")
+        if confidence_available
+        else 1.0
+    )
+    if not confidence_available:
+        class_harm_p_values = {class_id: 1.0 for class_id in class_ids}
 
-    return ValidationRiskDecision(
-        selected_modules=tuple(selected),
-        per_class_effect={int(cls): float(value) for cls, value in current_effect.items()},
-        overall_effect=float(current_gain),
-        worst_class_effect=float(current_worst),
-        candidate_decisions=records,
-        search_steps=tuple(steps),
-        forced_nonempty=bool(forced_nonempty),
-        reason=reason,
+    return PairedRiskEvidence(
+        subject_class_gain=subject_class_gain,
+        class_gain=class_gain,
+        overall_gain=overall_gain,
+        worst_class_gain=worst_class_gain,
+        cluster_count=len(subjects),
+        class_cluster_counts=class_cluster_counts,
+        overall_standard_error=overall_standard_error,
+        class_standard_error=class_standard_error,
+        overall_gain_p_value=overall_gain_p_value,
+        class_harm_p_values=class_harm_p_values,
+        confidence_status=confidence_status,
+    )
+
+
+def holm_adjust(p_values: Mapping[Hashable, Any]) -> Dict[Hashable, float]:
+    """Return Holm-adjusted p-values for one explicitly defined test family."""
+
+    if not p_values:
+        return {}
+    ordered = sorted(
+        ((key, min(1.0, max(0.0, float(value)))) for key, value in p_values.items()),
+        key=lambda item: (item[1], str(item[0])),
+    )
+    adjusted: Dict[Hashable, float] = {}
+    running_max = 0.0
+    family_size = len(ordered)
+    for rank, (key, value) in enumerate(ordered):
+        corrected = min(1.0, float((family_size - rank) * value))
+        running_max = max(running_max, corrected)
+        adjusted[key] = running_max
+    return adjusted
+
+
+def _trial_rank(trial: ActionTrial) -> Tuple[float, float, int, Tuple[str, ...]]:
+    return (
+        -float(trial.evidence.overall_gain),
+        -float(trial.evidence.worst_class_gain),
+        int(trial.parameter_count),
+        tuple(trial.candidate_subset),
+    )
+
+
+def _minimax_rank(trial: ActionTrial) -> Tuple[float, float, int, Tuple[str, ...]]:
+    return (
+        -float(trial.evidence.worst_class_gain),
+        -float(trial.evidence.overall_gain),
+        int(trial.parameter_count),
+        tuple(trial.candidate_subset),
+    )
+
+
+def _stage_diagnostics(
+    trials: Sequence[ActionTrial],
+    alpha: float,
+) -> Dict[str, Dict[str, Any]]:
+    labels = [trial.label for trial in trials]
+    if len(labels) != len(set(labels)):
+        raise ValueError("Module C trial labels must be unique within a search stage.")
+    gain_adjusted = holm_adjust({trial.label: trial.evidence.overall_gain_p_value for trial in trials})
+    harm_adjusted_flat = holm_adjust(
+        {
+            (trial.label, class_id): p_value
+            for trial in trials
+            for class_id, p_value in trial.evidence.class_harm_p_values.items()
+        }
+    )
+    diagnostics: Dict[str, Dict[str, Any]] = {}
+    for trial in trials:
+        adjusted_harm = {
+            int(class_id): float(harm_adjusted_flat[(trial.label, class_id)])
+            for class_id in trial.evidence.class_harm_p_values
+        }
+        supported_harm = tuple(sorted(class_id for class_id, value in adjusted_harm.items() if value < alpha))
+        supported_gain = (
+            trial.evidence.confidence_status == "cluster_jackknife"
+            and trial.evidence.overall_gain > 0.0
+            and float(gain_adjusted[trial.label]) < alpha
+        )
+        diagnostics[trial.label] = {
+            "base_subset": list(trial.base_subset),
+            "candidate_subset": list(trial.candidate_subset),
+            "added_actions": list(trial.added_actions),
+            "parameter_count": int(trial.parameter_count),
+            "overall_gain": float(trial.evidence.overall_gain),
+            "worst_class_gain": float(trial.evidence.worst_class_gain),
+            "class_gain": dict(trial.evidence.class_gain),
+            "confidence_status": trial.evidence.confidence_status,
+            "gain_p_value": float(trial.evidence.overall_gain_p_value),
+            "gain_p_value_holm": float(gain_adjusted[trial.label]),
+            "class_harm_p_value_holm": adjusted_harm,
+            "supported_gain": bool(supported_gain),
+            "supported_harm_classes": list(supported_harm),
+            "gate": "supported_gain_no_supported_class_harm" if supported_gain and not supported_harm else (
+                "supported_class_harm" if supported_harm else "gain_not_supported"
+            ),
+        }
+    return diagnostics
+
+
+def choose_action(
+    trials: Sequence[ActionTrial],
+    require_nonempty: bool,
+    alpha: float = MODULE_C_ALPHA,
+) -> SearchDecision:
+    """Choose one measured branch without combining independent action scores."""
+
+    trials = tuple(trials)
+    if not trials:
+        raise ValueError("Module C requires at least one measured trial in a search stage.")
+    diagnostics = _stage_diagnostics(trials, alpha=float(alpha))
+    safe = [
+        trial
+        for trial in trials
+        if diagnostics[trial.label]["supported_gain"]
+        and not diagnostics[trial.label]["supported_harm_classes"]
+    ]
+    if safe:
+        chosen = min(safe, key=_trial_rank)
+        reason = "supported_primary_gain" if not chosen.base_subset else "supported_conditional_gain"
+        return SearchDecision(chosen, reason, "supported", diagnostics)
+
+    if not require_nonempty:
+        return SearchDecision(None, "no_supported_safe_gain", "none", diagnostics)
+
+    no_supported_harm = [
+        trial for trial in trials if not diagnostics[trial.label]["supported_harm_classes"]
+    ]
+    if no_supported_harm:
+        chosen = min(no_supported_harm, key=_trial_rank)
+        return SearchDecision(
+            chosen,
+            "nonempty_weak_best_observed_gain",
+            "weak",
+            diagnostics,
+        )
+
+    chosen = min(trials, key=_minimax_rank)
+    return SearchDecision(
+        chosen,
+        "nonempty_mandatory_minimax_harm",
+        "mandatory",
+        diagnostics,
+    )
+
+
+def choose_floating_deletion(
+    trials: Sequence[ActionTrial],
+    alpha: float = MODULE_C_ALPHA,
+) -> SearchDecision:
+    """Prefer a smaller measured subset only when observed risk is nonworse.
+
+    This is a parsimony rule, not an equivalence claim: the smaller subset must
+    have a nonnegative paired class-balanced point gain and no supported class
+    harm.  No arbitrary noninferiority margin is introduced.
+    """
+
+    trials = tuple(trials)
+    if not trials:
+        return SearchDecision(None, "no_floating_deletion_trial", "none", {})
+    diagnostics = _stage_diagnostics(trials, alpha=float(alpha))
+    eligible = [
+        trial
+        for trial in trials
+        if trial.evidence.overall_gain >= 0.0
+        and not diagnostics[trial.label]["supported_harm_classes"]
+    ]
+    if not eligible:
+        return SearchDecision(None, "floating_delete_rejected", "none", diagnostics)
+    chosen = min(eligible, key=_trial_rank)
+    return SearchDecision(
+        chosen,
+        "floating_delete_observed_nonworse",
+        "parsimony",
+        diagnostics,
     )

@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import math
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 
-MODULE_C_CURRENT = "unified_validation_risk_selector"
+MODULE_C_CURRENT = "task_aligned_matched_validation_search"
 MODULE_C_ROLE = "nonempty_bde_adapter_action_selector"
 MODULE_C_SELECTION_SCOPE = "bde_only_nonempty_subset"
-MODULE_C_SELECTION_RULE = "unified_validation_risk_preflight"
+MODULE_C_SELECTION_RULE = "task_aligned_matched_validation_search"
 
 
 DEFAULT_CANDIDATE_MODULES: Dict[str, Dict[str, Any]] = {
@@ -48,9 +47,10 @@ def parse_module_ids(
     """Parse a Module C candidate list and reject anything outside its registry."""
 
     registry = registry or DEFAULT_CANDIDATE_MODULES
-    allowed = {normalize_module_id(module_id) for module_id in registry}
+    allowed_order = tuple(normalize_module_id(module_id) for module_id in registry)
+    allowed = set(allowed_order)
     if modules is None:
-        raw: List[str] = list(allowed)
+        raw: List[str] = list(allowed_order)
     elif isinstance(modules, str):
         raw = [item.strip() for item in modules.replace(";", ",").replace("|", ",").split(",")]
     else:
@@ -74,19 +74,10 @@ def parse_module_ids(
     return parsed
 
 
-def _safe_float(value: Any) -> Optional[float]:
-    try:
-        result = float(value)
-    except Exception:
-        return None
-    return result if math.isfinite(result) else None
-
-
 def build_module_c_recipe(
     selected_modules: Sequence[Any],
     registry: Optional[Mapping[str, Mapping[str, Any]]] = None,
     candidate_modules: Optional[Sequence[Any]] = None,
-    module_scores: Optional[Mapping[Any, Any]] = None,
 ) -> Dict[str, Any]:
     """Build final-training metadata without introducing non-B/D/E controls."""
 
@@ -113,22 +104,12 @@ def build_module_c_recipe(
             "blocks": list(blocks) if not isinstance(blocks, str) else [blocks],
         }
 
-    score_summary: Dict[str, float] = {}
-    for raw_module, raw_score in (module_scores or {}).items():
-        module_id = normalize_module_id(raw_module)
-        if module_id not in candidates:
-            continue
-        score = _safe_float(raw_score)
-        if score is not None:
-            score_summary[module_id] = score
-
     return {
         "module_c_current": MODULE_C_CURRENT,
         "module_c_role": MODULE_C_ROLE,
         "candidate_modules": list(candidates),
         "selected_modules": list(selected),
         "module_actions": actions,
-        "module_score_summary": score_summary,
         "selection_scope": MODULE_C_SELECTION_SCOPE,
         "selection_rule": MODULE_C_SELECTION_RULE,
         "requires_nonempty_selection": True,

@@ -34,7 +34,7 @@ models/                        EEG model wrappers and backbone integrations
 util/lora.py                   LoRA injection and trainable-parameter control
 util/fb_*.py                   Functional-block registry, policy, probes, and collection
 util/module_b_*.py             Signal/input-side adaptation helpers
-util/module_c_*.py             Zero-update Module C preflight selector and subset scoring
+util/module_c_*.py             Matched low-budget Module C functional-action search
 util/module_d_*.py             Semantic refinement utilities
 util/module_e_*.py             Structural routing and pressure-guided helpers
 
@@ -156,7 +156,7 @@ python run_finetuning.py \
   --fb_collect
 ```
 
-Module-C zero-update preflight selection:
+Module-C task-aligned B/D/E search:
 
 ```bash
 python run_finetuning.py \
@@ -168,9 +168,14 @@ python run_finetuning.py \
   --finetune_mod lora \
   --lora_target module_c \
   --module_c_candidates B,D,E \
-  --module_c_preflight_train_batches 4 \
-  --module_c_preflight_val_batches 4
+  --module_c_preflight_train_batches 0 \
+  --module_c_preflight_val_batches 0
 ```
+
+The default `0/0` scope uses the complete support and validation splits. Each
+visited subset receives one matched support pass, and ranking uses paired,
+subject-clustered validation log-loss. Add `--module_c_preflight_only` to write
+the decision and timing diagnostics without starting formal training.
 
 ## Reproducibility Notes
 

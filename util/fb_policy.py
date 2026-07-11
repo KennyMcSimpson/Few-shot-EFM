@@ -26,6 +26,7 @@ def add_fb_args(parser):
     parser.add_argument("--module_c_no_preflight", action="store_false", dest="module_c_preflight", help="Disable automatic Module C selection; requires an explicit nonempty --module_c_selected B/D/E set.")
     parser.add_argument("--module_c_preflight_train_batches", default=0, type=int, help="Module C train preflight batch cap. <=0 scans the full train split; positive values are debug caps.")
     parser.add_argument("--module_c_preflight_val_batches", default=0, type=int, help="Module C validation preflight batch cap. <=0 scans the full validation split; positive values are debug caps.")
+    parser.add_argument("--module_c_preflight_only", action="store_true", default=False, help="Run automatic Module C search, write diagnostics, and exit before formal training.")
     return parser
 MODEL_DEFAULT_RECIPE={"BIOT":"sem_lif","LaBraM":"sem_lif","EEGPT":"sig_align","CBraMod":"str_mix","Gram":"gram_diag","CSBrain":"csb_diag","NeurIPT":"probe_only"}
 MODULE_B_METADATA_KEYS=(
@@ -39,6 +40,12 @@ MODULE_C_METADATA_KEYS=("module_c_current","module_c_role","module_c_is_active",
 MODULE_METADATA_FLAT_KEYS=MODULE_B_METADATA_KEYS+MODULE_D_METADATA_KEYS+MODULE_E_METADATA_KEYS+MODULE_C_METADATA_KEYS
 def resolve_functional_args(args):
     module_c_target=str(getattr(args,"lora_target","") or "").lower() in ("module_c","module_c_auto","c_auto")
+    if bool(getattr(args,"module_c_preflight_only",False)) and not module_c_target:
+        raise ValueError("--module_c_preflight_only requires --lora_target module_c.")
+    if bool(getattr(args,"module_c_preflight_only",False)) and not bool(getattr(args,"module_c_preflight",True)):
+        raise ValueError("--module_c_preflight_only requires automatic Module C preflight to remain enabled.")
+    if bool(getattr(args,"module_c_preflight_only",False)) and parse_module_ids(getattr(args,"module_c_selected","")):
+        raise ValueError("--module_c_preflight_only is for automatic search and cannot use --module_c_selected.")
     if module_c_target:
         args.module_c_enable=True
     if bool(getattr(args,"module_c_enable",False)):

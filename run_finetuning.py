@@ -69,7 +69,9 @@ try:
     )
     from util.module_d_semantic_refinement import module_d_eval_row_from_details, save_module_d_sbr_eval
     from util.module_c_preflight_policy import (
+        capture_module_c_rng_state,
         module_c_preflight_requested,
+        restore_module_c_rng_state,
         run_module_c_preflight_selection,
     )
     from util.fb_runtime_hooks import run_signal_alignment_probe_after_training
@@ -90,6 +92,8 @@ except Exception as _fb_import_error:
     def module_d_eval_row_from_details(*args, **kwargs): return {}
     def save_module_d_sbr_eval(*args, **kwargs): return None
     def module_c_preflight_requested(*args, **kwargs): return False
+    def capture_module_c_rng_state(*args, **kwargs): return None
+    def restore_module_c_rng_state(*args, **kwargs): return None
     def run_module_c_preflight_selection(*args, **kwargs): return None
     def run_signal_alignment_probe_after_training(*args, **kwargs): return False
     print(f"[FB2][WARN] functional-block framework unavailable: {_fb_import_error}")
@@ -337,7 +341,7 @@ def get_args():
                             'signal_align for Module B input-front alignment, '
                             'temporal_attn/spatial_attn for structural routing, '
                             'bridge/input_bridge for EEGPT/BIOT input adapter.'
-                            ' module_c automatically selects a nonempty B/D/E subset from support and validation gradients unless --module_c_selected is provided.'
+                            ' module_c automatically selects a nonempty B/D/E subset with matched one-pass support training and paired validation log-loss unless --module_c_selected is provided.'
                         ))
     parser.add_argument('--module_b_sites', default='both', type=str,
                         choices=['both', 'input', 'bridge'],
@@ -1424,7 +1428,7 @@ def _register_cbra_grad_scale_hooks(model, args, verbose=True):
 
 
 def _build_module_c_preflight_probe_model(args, ch_names, num_t):
-    """Build a disposable base model for zero-update Module C probing."""
+    """Build the disposable pretrained model used by Module C search."""
     probe_args = copy.copy(args)
     probe_args.finetune_mod = "full"
     probe_args.lora_target = "none"
@@ -3384,10 +3388,13 @@ def main(args, ds_init):
         data_loader_test = None
     # ------------------------------------------------------------------------------------------
 
+    module_c_preflight_ran = False
     if module_c_preflight_requested(args):
-        print("[ModuleC] running zero-update preflight selection before real LoRA injection.")
-        probe_model = _build_module_c_preflight_probe_model(args, ch_names, dataset_info["num_t"])
+        print("[ModuleC] running matched low-budget search before formal LoRA training.")
+        preflight_rng_state = capture_module_c_rng_state((data_loader_train, data_loader_val))
+        probe_model = None
         try:
+            probe_model = _build_module_c_preflight_probe_model(args, ch_names, dataset_info["num_t"])
             probe_model.to(device)
             run_module_c_preflight_selection(
                 args=args,
@@ -3398,13 +3405,22 @@ def main(args, ds_init):
                 criterion_builder=_build_module_e_pressure_criterion,
                 is_main_process=utils.is_main_process(),
             )
+            module_c_preflight_ran = True
         finally:
-            del probe_model
+            if probe_model is not None:
+                del probe_model
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+            restore_module_c_rng_state(preflight_rng_state)
 
     write_resolved_recipe(args, args.output_dir)
     print(args)
+
+    if bool(getattr(args, "module_c_preflight_only", False)):
+        if not module_c_preflight_ran:
+            raise RuntimeError("--module_c_preflight_only requested, but automatic Module C search did not run.")
+        print("[ModuleC] preflight-only verification completed; formal training was not started.")
+        return
 
     # load the model
     model = get_models(args, ch_names, dataset_info['num_t'])
