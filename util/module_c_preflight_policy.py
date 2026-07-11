@@ -60,7 +60,9 @@ class ModuleCDecision:
 class ActionOwnership:
     action_parameter_names: Mapping[str, Tuple[str, ...]]
     action_replacement_names: Mapping[str, Tuple[str, ...]]
+    action_wrapped_base_parameter_names: Mapping[str, Tuple[str, ...]]
     adapter_parameter_owner: Mapping[str, str]
+    parameter_default_trainable: Mapping[str, bool]
     parameter_counts: Mapping[str, int]
     replaced_modules: Tuple[str, ...]
 
@@ -290,10 +292,15 @@ def install_module_c_action_registry(
         raise ValueError("Module C requires at least one B/D/E registry action.")
     action_parameters: Dict[str, Tuple[str, ...]] = {}
     action_replacements: Dict[str, Tuple[str, ...]] = {}
+    action_wrapped_base_ids: Dict[str, Tuple[int, ...]] = {}
     owner: Dict[str, str] = {}
     counts: Dict[str, int] = {}
     all_replacements: List[str] = []
+    initial_trainability = {id(parameter): bool(parameter.requires_grad) for parameter in model.parameters()}
+    owned_wrapped_base_ids = set()
     for action in candidates:
+        before_named = dict(model.named_parameters())
+        before_names_by_id = {id(parameter): name for name, parameter in before_named.items()}
         before = {name for name, _ in model.named_parameters() if _is_adapter_parameter(name)}
         replaced = tuple(
             apply_lora_to_eegfm(
@@ -309,6 +316,7 @@ def install_module_c_action_registry(
             )
         )
         after_named = dict(model.named_parameters())
+        after_names_by_id = {id(parameter): name for name, parameter in after_named.items()}
         after = {name for name in after_named if _is_adapter_parameter(name)}
         created = tuple(sorted(after - before))
         if not replaced or not created:
@@ -316,22 +324,52 @@ def install_module_c_action_registry(
         overlap = sorted(set(replaced).intersection(all_replacements))
         if overlap:
             raise RuntimeError(f"Module C action surfaces overlap for model={model_name}: {overlap[:5]}")
+        wrapped_base_ids = tuple(
+            sorted(
+                parameter_id
+                for parameter_id, before_name in before_names_by_id.items()
+                if parameter_id in after_names_by_id
+                and any(
+                    before_name == module_name or before_name.startswith(f"{module_name}.")
+                    for module_name in replaced
+                )
+            )
+        )
+        wrapped_overlap = sorted(set(wrapped_base_ids).intersection(owned_wrapped_base_ids))
+        if wrapped_overlap:
+            raise RuntimeError(
+                f"Module C actions wrap the same base parameters for model={model_name}: {wrapped_overlap[:5]}"
+            )
         action_parameters[action] = created
         action_replacements[action] = tuple(sorted(replaced))
+        action_wrapped_base_ids[action] = wrapped_base_ids
         counts[action] = sum(int(after_named[name].numel()) for name in created)
         for name in created:
             if name in owner:
                 raise RuntimeError(f"Module C adapter parameter has multiple owners: {name}")
             owner[name] = action
         all_replacements.extend(replaced)
+        owned_wrapped_base_ids.update(wrapped_base_ids)
     final_adapter_names = {name for name, _ in model.named_parameters() if _is_adapter_parameter(name)}
     unowned = sorted(final_adapter_names - set(owner))
     if unowned:
         raise RuntimeError(f"Module C found unowned injected LoRA tensors: {unowned[:5]}")
+    final_named = dict(model.named_parameters())
+    final_names_by_id = {id(parameter): name for name, parameter in final_named.items()}
+    action_wrapped_bases = {
+        action: tuple(sorted(final_names_by_id[parameter_id] for parameter_id in parameter_ids))
+        for action, parameter_ids in action_wrapped_base_ids.items()
+    }
+    parameter_default_trainable = {
+        name: bool(initial_trainability.get(id(parameter), False))
+        for name, parameter in final_named.items()
+    }
     return ActionOwnership(
         action_parameter_names=action_parameters,
         action_replacement_names=action_replacements,
+        action_wrapped_base_parameter_names=action_wrapped_bases,
         adapter_parameter_owner=owner,
+        parameter_default_trainable=parameter_default_trainable,
         parameter_counts=counts,
         replaced_modules=tuple(all_replacements),
     )
@@ -395,15 +433,29 @@ def _configure_branch_trainability(
 ) -> None:
     active = set(subset)
     base_update = str(getattr(args, "lora_base_update", "freeze") or "freeze").lower()
-    if base_update == "freeze":
-        freeze_all_parameters(model)
-    elif base_update == "full":
-        for parameter in model.parameters():
-            parameter.requires_grad_(True)
-    else:
+    if base_update not in ("freeze", "full"):
         raise ValueError(f"Unknown lora_base_update={base_update}")
 
+    # Every branch starts from the same frozen union model.  Full-update branches
+    # then restore the pre-injection trainability of original parameters only.
+    # This both preserves intentionally frozen/integer state and lets an inactive
+    # action behave exactly as if its wrapper had never been installed.
+    freeze_all_parameters(model)
     named = dict(model.named_parameters())
+    if base_update == "full":
+        for name, parameter in named.items():
+            restore = bool(ownership.parameter_default_trainable.get(name, False))
+            if restore and not (parameter.is_floating_point() or parameter.is_complex()):
+                raise RuntimeError(f"Module C cannot restore gradients for non-differentiable parameter {name}.")
+            parameter.requires_grad_(restore)
+
+        # Formal LoRA injection freezes the base weights owned by each active
+        # wrapper.  Bases belonging only to inactive actions keep their original
+        # trainability, so union injection does not change the measured recipe.
+        for action in active:
+            for name in ownership.action_wrapped_base_parameter_names.get(action, ()):
+                named[name].requires_grad_(False)
+
     with torch.no_grad():
         for name, owner in ownership.adapter_parameter_owner.items():
             parameter = named[name]
@@ -713,6 +765,9 @@ def run_module_c_preflight_selection(
     if not support_batches or not validation_batches:
         raise RuntimeError("Module C could not collect both support and validation batches.")
     support_fingerprint = _support_fingerprint(support_batches)
+    original_trainability = {
+        name: bool(parameter.requires_grad) for name, parameter in model.named_parameters()
+    }
 
     model.to(device)
     criterion = criterion_builder(args, device) if criterion_builder is not None else _default_criterion(args, device)
@@ -725,6 +780,11 @@ def run_module_c_preflight_selection(
         criterion,
         effective_classes,
     )
+    anchored_named = dict(model.named_parameters())
+    if set(anchored_named) != set(original_trainability):
+        raise RuntimeError("Module C head anchoring unexpectedly changed the model parameter registry.")
+    for name, parameter in anchored_named.items():
+        parameter.requires_grad_(original_trainability[name])
     model.to(torch.device("cpu"))
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -1032,6 +1092,7 @@ def run_module_c_preflight_selection(
                 "parameter_count": int(ownership.parameter_counts[action]),
                 "parameter_names": list(ownership.action_parameter_names[action]),
                 "replacement_names": list(ownership.action_replacement_names[action]),
+                "wrapped_base_parameter_names": list(ownership.action_wrapped_base_parameter_names[action]),
             }
             for action in candidate_modules
         },

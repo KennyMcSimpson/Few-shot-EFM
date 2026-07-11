@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 try:
     import torch
@@ -8,7 +9,10 @@ except ModuleNotFoundError:  # pragma: no cover - depends on the training env.
     nn = None
 
 if torch is not None:
-    from util.module_c_preflight_policy import install_module_c_action_registry
+    from util.module_c_preflight_policy import (
+        _configure_branch_trainability,
+        install_module_c_action_registry,
+    )
 
 
 if torch is not None:
@@ -135,11 +139,29 @@ class ModuleCLoraInterfaceTests(unittest.TestCase):
         return ownership
 
     def test_biot_assigns_qv_to_e_and_ffn_to_d(self):
-        ownership = self._audit(_TinyBIOT(), "BIOT")
+        model = _TinyBIOT()
+        ownership = self._audit(model, "BIOT")
 
         self.assertTrue(any("to_q" in name or "to_v" in name for name in ownership.action_replacement_names["E"]))
         self.assertFalse(any("w1" in name or "w2" in name for name in ownership.action_replacement_names["E"]))
         self.assertTrue(any("w1" in name or "w2" in name for name in ownership.action_replacement_names["D"]))
+
+        args = SimpleNamespace(
+            lora_base_update="full",
+            lora_train_head=True,
+            lora_train_chan_conv=False,
+            model_name="BIOT",
+        )
+        _configure_branch_trainability(model, args, ("D",), ownership)
+        named = dict(model.named_parameters())
+        self.assertTrue(ownership.action_wrapped_base_parameter_names["D"])
+        self.assertTrue(ownership.action_wrapped_base_parameter_names["E"])
+        self.assertTrue(
+            all(not named[name].requires_grad for name in ownership.action_wrapped_base_parameter_names["D"])
+        )
+        self.assertTrue(
+            all(named[name].requires_grad for name in ownership.action_wrapped_base_parameter_names["E"])
+        )
 
     def test_gram_actions_are_nonempty_and_disjoint(self):
         ownership = self._audit(_TinyGram(), "Gram")

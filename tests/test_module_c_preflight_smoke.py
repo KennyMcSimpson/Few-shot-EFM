@@ -68,6 +68,7 @@ if torch is not None:
             self.main_model = nn.Module()
             self.main_model.blocks = nn.ModuleList([_TinyBlock()])
             self.task_head = nn.Linear(4, classes)
+            self.integer_state = nn.Parameter(torch.tensor(0, dtype=torch.long), requires_grad=False)
 
         def forward(self, samples):
             hidden = samples.mean(dim=-1)
@@ -144,9 +145,13 @@ class ModuleCPreflightSmokeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as output_dir:
             args = _args(output_dir, classes=3)
+            model = _TinyGram(classes=3)
+            original_trainable_count = sum(
+                int(parameter.numel()) for parameter in model.parameters() if parameter.requires_grad
+            )
             result = run_module_c_preflight_selection(
                 args=args,
-                model=_TinyGram(classes=3),
+                model=model,
                 data_loader_train=support_loader,
                 data_loader_val=validation_loader,
                 device=torch.device("cpu"),
@@ -158,6 +163,10 @@ class ModuleCPreflightSmokeTests(unittest.TestCase):
             self.assertGreater(result.head_anchor["parameter_delta_l2"], 0.0)
             self.assertEqual(result.head_anchor["support_passes"], 1)
             self.assertIn(tuple(), result.branch_traces)
+            self.assertEqual(
+                result.branch_traces[tuple()]["trainable_parameter_count"],
+                original_trainable_count,
+            )
             self.assertTrue(all((action,) in result.branch_traces for action in ("B", "D", "E")))
             self.assertTrue(any(len(subset) == 2 for subset in result.branch_traces))
             fingerprints = {trace["support_fingerprint"] for trace in result.branch_traces.values()}
