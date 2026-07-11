@@ -19,24 +19,13 @@ def add_fb_args(parser):
     parser.add_argument("--fb_signal_probe_batches", default=4, type=int, help="Max validation batches for signal-alignment input-side LoRA probe. 0 disables.")
     parser.add_argument("--fb_collect", action="store_true", default=False, help="Copy small logs/csvs into a short collected folder.")
     parser.add_argument("--fb_collect_name", default="", type=str, help="Collected folder name, e.g. col_fb2s.")
-    parser.add_argument("--module_c_enable", action="store_true", default=False, help="Enable Module C LoRA-search metadata. This does not inject LoRA automatically.")
-    parser.add_argument("--module_c_candidates", default="B,D,E", type=str, help="Comma-separated candidate adaptation modules for Module C subset selection.")
-    parser.add_argument("--module_c_selected", default="", type=str, help="Comma-separated selected modules from a Module C policy/probe run.")
+    parser.add_argument("--module_c_enable", action="store_true", default=False, help="Enable Module C B/D/E selection metadata. This does not inject LoRA automatically.")
+    parser.add_argument("--module_c_candidates", default="B,D,E", type=str, help="Comma-separated B/D/E candidates for automatic Module C subset selection.")
+    parser.add_argument("--module_c_selected", default="", type=str, help="Explicit nonempty B/D/E selection for an ablation; otherwise Module C selects automatically.")
     parser.set_defaults(module_c_preflight=True)
-    parser.add_argument("--module_c_no_preflight", action="store_false", dest="module_c_preflight", help="Disable automatic zero-update Module C preflight selection; requires --module_c_selected for lora_target=module_c.")
+    parser.add_argument("--module_c_no_preflight", action="store_false", dest="module_c_preflight", help="Disable automatic Module C selection; requires an explicit nonempty --module_c_selected B/D/E set.")
     parser.add_argument("--module_c_preflight_train_batches", default=0, type=int, help="Module C train preflight batch cap. <=0 scans the full train split; positive values are debug caps.")
     parser.add_argument("--module_c_preflight_val_batches", default=0, type=int, help="Module C validation preflight batch cap. <=0 scans the full validation split; positive values are debug caps.")
-    parser.add_argument("--module_c_preflight_hard_k", default=0, type=int, help="Deprecated compatibility flag; Module C now defines focus classes by validation burden >= 1/C.")
-    parser.add_argument("--module_c_preflight_min_score", default=0.0, type=float, help="Minimum positive RGFS residual-burden marginal relief required to add a Module C action. Formal default is 0.")
-    parser.add_argument("--module_c_preflight_margin", default=0.0, type=float, help="RGFS tie tolerance. Formal default is 0, so complexity only breaks exact ties.")
-    parser.add_argument("--module_c_preflight_svd_max_numel", default=1000000, type=int, help="Maximum gradient tensor size used for Module C low-rank SVD fit; larger tensors are skipped.")
-    parser.add_argument("--module_c_preflight_max_profile_classes", default=0, type=int, help="Maximum validation classes used for Module C interaction profiles. <=0 uses all validation classes.")
-    parser.add_argument("--module_c_preflight_dropout", default=0.0, type=float, help="Dropout for temporary Module C probe LoRA branches.")
-    parser.add_argument("--module_c_probe_head_steps", default=3, type=int, help="Temporary head-only calibration steps on the disposable Module C probe model before RGFS gradients are measured.")
-    parser.add_argument("--module_c_probe_head_lr", default=1e-3, type=float, help="Learning rate for temporary Module C probe-head calibration.")
-    parser.add_argument("--module_c_rgfs_confidence_scale", default=0.0, type=float, help="Optional finite-sample cosine shrinkage scale. Formal full-split Module C default is 0.")
-    parser.add_argument("--module_c_rgfs_harm_threshold", default=0.0, type=float, help="Positive reliable harm threshold that blocks an action on focus classes. Formal default is 0.")
-    parser.add_argument("--module_c_rgfs_focus_ratio", default=1.0, type=float, help="Class burden ratio relative to uniform that defines RGFS focus classes. Formal default 1.0 means burden >= 1/C.")
     return parser
 MODEL_DEFAULT_RECIPE={"BIOT":"sem_lif","LaBraM":"sem_lif","EEGPT":"sig_align","CBraMod":"str_mix","Gram":"gram_diag","CSBrain":"csb_diag","NeurIPT":"probe_only"}
 MODULE_B_METADATA_KEYS=(
@@ -46,14 +35,17 @@ MODULE_B_METADATA_KEYS=(
 )
 MODULE_D_METADATA_KEYS=("module_d_current","module_d_role","module_d_is_active","module_d_touches_semantic_ffn","module_d_is_pure_isolation","module_d_is_composite","module_d_variant","module_d_reference_metric","module_d_attribution_note")
 MODULE_E_METADATA_KEYS=("module_e_current","module_e_role","module_e_is_active","module_e_is_pure_isolation","module_e_is_composite","module_e_variant","module_e_target_blocks","module_e_reference_metrics","module_e_attribution_note")
-MODULE_C_METADATA_KEYS=("module_c_current","module_c_role","module_c_is_active","module_c_candidates","module_c_selected_modules","module_c_selection_rule","module_c_no_qv_baseline")
+MODULE_C_METADATA_KEYS=("module_c_current","module_c_role","module_c_is_active","module_c_candidates","module_c_selected_modules","module_c_selection_rule","module_c_nonempty_bde_only")
 MODULE_METADATA_FLAT_KEYS=MODULE_B_METADATA_KEYS+MODULE_D_METADATA_KEYS+MODULE_E_METADATA_KEYS+MODULE_C_METADATA_KEYS
 def resolve_functional_args(args):
-    if str(getattr(args,"lora_target","") or "").lower()=="module_c":
+    module_c_target=str(getattr(args,"lora_target","") or "").lower() in ("module_c","module_c_auto","c_auto")
+    if module_c_target:
         args.module_c_enable=True
     if bool(getattr(args,"module_c_enable",False)):
         args.module_c_resolved_candidates=",".join(parse_module_ids(getattr(args,"module_c_candidates","B,D,E")))
         args.module_c_resolved_selected=",".join(parse_module_ids(getattr(args,"module_c_selected","")))
+        if module_c_target and not args.module_c_resolved_selected and not bool(getattr(args,"module_c_preflight",True)):
+            raise ValueError("Module C requires a nonempty --module_c_selected B/D/E set when automatic preflight is disabled.")
     if not bool(getattr(args,"fb_enable",False)): return args
     recipe=str(getattr(args,"fb_recipe","profile") or "profile")
     if recipe=="auto": recipe=MODEL_DEFAULT_RECIPE.get(str(getattr(args,"model_name","")),"profile")

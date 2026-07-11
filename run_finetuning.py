@@ -337,7 +337,7 @@ def get_args():
                             'signal_align for Module B input-front alignment, '
                             'temporal_attn/spatial_attn for structural routing, '
                             'bridge/input_bridge for EEGPT/BIOT input adapter.'
-                            ' module_c auto-runs zero-update preflight unless --module_c_selected is provided.'
+                            ' module_c automatically selects a nonempty B/D/E subset from support and validation gradients unless --module_c_selected is provided.'
                         ))
     parser.add_argument('--module_b_sites', default='both', type=str,
                         choices=['both', 'input', 'bridge'],
@@ -1239,7 +1239,12 @@ def _apply_lora_training_setup(model, args):
     ]
     explicit_target_none = str(args.lora_target).lower() == 'none'
     target_module_c_empty = _is_module_c_execution_target(args.lora_target) and len(module_c_selected_tokens) == 0
-    target_none = explicit_target_none or target_module_c_empty
+    if target_module_c_empty:
+        raise RuntimeError(
+            'Module C requires a nonempty B/D/E selection before LoRA injection. '
+            'Keep automatic preflight enabled or provide --module_c_selected.'
+        )
+    target_none = explicit_target_none
 
     if args.lora_base_update == 'freeze':
         freeze_all_parameters(model)
@@ -1247,10 +1252,7 @@ def _apply_lora_training_setup(model, args):
     if target_none:
         if explicit_target_none and args.lora_base_update != 'freeze':
             raise ValueError('lora_target=none is intended for frozen-backbone diagnosis only; use --lora_base_update freeze.')
-        if target_module_c_empty:
-            print(f'[ModuleC] RGFS selected no B/D/E modules: no qv/qv_ffn fallback will be injected; base_update={args.lora_base_update}.')
-        else:
-            print('[LoRA] lora_target=none: no LoRA modules will be injected. Selected modules will be unfrozen below.')
+        print('[LoRA] lora_target=none: no LoRA modules will be injected. Selected modules will be unfrozen below.')
         if args.lora_base_update == 'freeze':
             if args.lora_train_head and hasattr(model, 'task_head'):
                 unfreeze_module(model.task_head)

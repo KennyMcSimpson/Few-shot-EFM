@@ -1,11 +1,4 @@
-# --------------------------------------------------------
-# Module C: adapter action registry and metadata.
-#
-# The active selector is Module C-v2 RGFS, implemented in
-# util.module_c_rgfs_policy and called by module_c_preflight_policy. This file
-# intentionally no longer contains the old weighted subset selector; it keeps
-# only shared parsing/recipe utilities used by lora.py, fb_policy.py, and logs.
-# --------------------------------------------------------
+"""Module C B/D/E action registry, validation, and serializable metadata."""
 
 from __future__ import annotations
 
@@ -13,9 +6,10 @@ import math
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 
-MODULE_C_CURRENT = "rgfs_residual_guided_functional_search"
-MODULE_C_ROLE = "zero_update_adapter_action_selector"
-MODULE_C_SELECTION_SCOPE = "functional_action_subset_no_qv_baseline"
+MODULE_C_CURRENT = "unified_validation_risk_selector"
+MODULE_C_ROLE = "nonempty_bde_adapter_action_selector"
+MODULE_C_SELECTION_SCOPE = "bde_only_nonempty_subset"
+MODULE_C_SELECTION_RULE = "unified_validation_risk_preflight"
 
 
 DEFAULT_CANDIDATE_MODULES: Dict[str, Dict[str, Any]] = {
@@ -43,76 +37,49 @@ DEFAULT_CANDIDATE_MODULES: Dict[str, Dict[str, Any]] = {
 }
 
 
-MODULE_C_EXCLUDED_BASELINES = frozenset(
-    (
-        "QV",
-        "Q_V",
-        "QKVO",
-        "QV_FFN",
-        "QVFFN",
-        "QKVO_FFN",
-        "QKVOFFN",
-        "ATTN_FFN",
-        "ATTNFFN",
-        "LORA_BASELINE",
-        "BASELINE",
-        "CONTROL",
-    )
-)
-
-
 def normalize_module_id(module_id: Any) -> str:
     return str(module_id or "").strip().upper()
-
-
-def _canonical_module_token(module_id: Any) -> str:
-    token = normalize_module_id(module_id)
-    for sep in ("-", " ", "/", ".", ":"):
-        token = token.replace(sep, "_")
-    while "__" in token:
-        token = token.replace("__", "_")
-    return token.strip("_")
-
-
-def is_module_c_baseline_candidate(module_id: Any) -> bool:
-    """Return whether a candidate id is a qv-style baseline/control, not C."""
-    return _canonical_module_token(module_id) in MODULE_C_EXCLUDED_BASELINES
 
 
 def parse_module_ids(
     modules: Optional[str | Iterable[Any]],
     registry: Optional[Mapping[str, Mapping[str, Any]]] = None,
-    exclude_baselines: bool = True,
 ) -> List[str]:
-    """Parse a comma/semicolon separated module list without hard-coding B/D/E."""
-    registry = registry or DEFAULT_CANDIDATE_MODULES
-    if modules is None:
-        raw: List[str] = list(registry.keys())
-    elif isinstance(modules, str):
-        raw = [x.strip() for x in modules.replace(";", ",").replace("|", ",").split(",")]
-    else:
-        raw = [str(x).strip() for x in modules]
+    """Parse a Module C candidate list and reject anything outside its registry."""
 
-    out: List[str] = []
+    registry = registry or DEFAULT_CANDIDATE_MODULES
+    allowed = {normalize_module_id(module_id) for module_id in registry}
+    if modules is None:
+        raw: List[str] = list(allowed)
+    elif isinstance(modules, str):
+        raw = [item.strip() for item in modules.replace(";", ",").replace("|", ",").split(",")]
+    else:
+        raw = [str(item).strip() for item in modules]
+
+    parsed: List[str] = []
+    invalid: List[str] = []
     for item in raw:
         if not item:
             continue
         module_id = normalize_module_id(item)
-        if exclude_baselines and is_module_c_baseline_candidate(module_id):
+        if module_id not in allowed:
+            invalid.append(module_id)
             continue
-        if module_id not in out:
-            out.append(module_id)
-    return out
+        if module_id not in parsed:
+            parsed.append(module_id)
+    if invalid:
+        allowed_text = ",".join(sorted(allowed))
+        invalid_text = ",".join(invalid)
+        raise ValueError(f"Module C accepts only {allowed_text}; got {invalid_text}.")
+    return parsed
 
 
 def _safe_float(value: Any) -> Optional[float]:
     try:
-        out = float(value)
+        result = float(value)
     except Exception:
         return None
-    if not math.isfinite(out):
-        return None
-    return float(out)
+    return result if math.isfinite(result) else None
 
 
 def build_module_c_recipe(
@@ -121,21 +88,21 @@ def build_module_c_recipe(
     candidate_modules: Optional[Sequence[Any]] = None,
     module_scores: Optional[Mapping[Any, Any]] = None,
 ) -> Dict[str, Any]:
-    """Build a serializable recipe for the final training run."""
+    """Build final-training metadata without introducing non-B/D/E controls."""
+
     registry = registry or DEFAULT_CANDIDATE_MODULES
-    selected = tuple(
-        normalize_module_id(m)
-        for m in selected_modules
-        if normalize_module_id(m) and not is_module_c_baseline_candidate(m)
+    selected = tuple(parse_module_ids(selected_modules, registry=registry))
+    candidates = (
+        parse_module_ids(candidate_modules, registry=registry)
+        if candidate_modules is not None
+        else parse_module_ids(None, registry=registry)
     )
-    if candidate_modules is None:
-        candidates = parse_module_ids(registry.keys(), registry=registry)
-    else:
-        candidates = parse_module_ids(candidate_modules, registry=registry)
+    if any(module_id not in candidates for module_id in selected):
+        raise ValueError("Module C selected modules must be contained in its B/D/E candidates.")
 
     actions: Dict[str, Dict[str, Any]] = {}
     for module_id in selected:
-        meta = dict(registry.get(module_id, {}))
+        meta = dict(registry[module_id])
         blocks = meta.get("blocks", ())
         actions[module_id] = {
             "enabled": True,
@@ -147,13 +114,13 @@ def build_module_c_recipe(
         }
 
     score_summary: Dict[str, float] = {}
-    for raw_key, raw_value in (module_scores or {}).items():
-        module_id = normalize_module_id(raw_key)
-        if not module_id or is_module_c_baseline_candidate(module_id):
+    for raw_module, raw_score in (module_scores or {}).items():
+        module_id = normalize_module_id(raw_module)
+        if module_id not in candidates:
             continue
-        value = _safe_float(raw_value)
-        if value is not None:
-            score_summary[module_id] = float(value)
+        score = _safe_float(raw_score)
+        if score is not None:
+            score_summary[module_id] = score
 
     return {
         "module_c_current": MODULE_C_CURRENT,
@@ -163,8 +130,8 @@ def build_module_c_recipe(
         "module_actions": actions,
         "module_score_summary": score_summary,
         "selection_scope": MODULE_C_SELECTION_SCOPE,
-        "selection_rule": "rgfs_zero_update_preflight",
-        "qv_qvffn_role": "baseline_control_only_not_candidate",
+        "selection_rule": MODULE_C_SELECTION_RULE,
+        "requires_nonempty_selection": True,
         "test_used_for_selection": 0,
     }
 
@@ -174,28 +141,23 @@ def module_c_metadata(
     selected_modules: Optional[Sequence[Any]] = None,
     registry: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Return shared Module C metadata for logs, probes, and future runners."""
+    """Return Module C B/D/E metadata for logs and final-training artifacts."""
+
     registry = registry or DEFAULT_CANDIDATE_MODULES
     enabled = bool(getattr(args, "module_c_enable", False)) if args is not None else bool(selected_modules)
-    candidates = getattr(args, "module_c_candidates", "") if args is not None else ""
-    selection_rule = (
-        str(getattr(args, "module_c_selection_rule", "") or "").strip()
-        if args is not None
-        else ""
-    )
-    if not selection_rule:
-        selection_rule = "rgfs_zero_update_preflight"
-    resolved_candidates = parse_module_ids(candidates, registry=registry)
+    raw_candidates = getattr(args, "module_c_candidates", "") if args is not None else None
+    candidates = parse_module_ids(raw_candidates, registry=registry) if raw_candidates else parse_module_ids(None, registry=registry)
     selected = tuple(parse_module_ids(selected_modules or (), registry=registry))
-    recipe = build_module_c_recipe(selected, registry=registry, candidate_modules=resolved_candidates)
+    selection_rule = str(getattr(args, "module_c_selection_rule", "") or MODULE_C_SELECTION_RULE) if args is not None else MODULE_C_SELECTION_RULE
+    recipe = build_module_c_recipe(selected, registry=registry, candidate_modules=candidates)
     recipe["selection_rule"] = selection_rule
     return {
         "module_c_current": MODULE_C_CURRENT if enabled else "",
         "module_c_role": MODULE_C_ROLE if enabled else "",
         "module_c_is_active": int(enabled),
-        "module_c_candidates": ",".join(resolved_candidates),
+        "module_c_candidates": ",".join(candidates),
         "module_c_selected_modules": ",".join(selected),
         "module_c_selection_rule": selection_rule,
-        "module_c_no_qv_baseline": 1,
+        "module_c_nonempty_bde_only": int(enabled),
         "module_c_recipe": recipe,
     }

@@ -1,66 +1,49 @@
-# --------------------------------------------------------
-# Module C: zero-update preflight LoRA module selector.
-#
-# This file turns Module C from an offline candidate-training replay into a
-# cheap pre-training policy. It calibrates the disposable task head, inserts
-# temporary probe adapters, measures signed class-wise relief, writes
-# interpretable diagnostics, and lets RGFS pick the final B/D/E subset.
-# --------------------------------------------------------
+"""Module C B/D/E selection from first-order validation-loss effects.
+
+The disposable preflight model is never reused for final training. It measures
+one full support-set gradient, derives one virtual optimizer update per action,
+and evaluates the corresponding class-wise validation-loss effect. This keeps
+the selector independent of test labels and avoids training B/D/E combinations
+just to choose one.
+"""
 
 from __future__ import annotations
 
 import csv
 import json
-import math
 import os
-from dataclasses import dataclass
-from itertools import combinations
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 
 from .lora import apply_lora_to_eegfm, freeze_all_parameters
-from .module_c_lora_search import (
-    DEFAULT_CANDIDATE_MODULES,
-    build_module_c_recipe,
-    is_module_c_baseline_candidate,
-    parse_module_ids,
-)
-from .module_c_rgfs_policy import (
-    RGFSConfig,
-    RGFSDecision,
-    rgfs_config_dict,
-    select_rgfs_subset,
-)
+from .module_c_lora_search import DEFAULT_CANDIDATE_MODULES, build_module_c_recipe, parse_module_ids
+from .module_c_risk_policy import ValidationRiskDecision, select_validation_risk_subset
 from .module_e_structural_routing import (
     STRUCTURAL_ROUTING_BLOCKS,
     module_e_branch_from_lora_param_name,
     module_e_module_prefix_from_name,
     structural_inventory_from_model,
 )
+from .optim_factory import LayerDecayValueAssigner, create_optimizer
 
 
-MODULE_C_PREFLIGHT_SELECTION_RULE = "rgfs_zero_update_preflight_no_test"
+MODULE_C_PREFLIGHT_SELECTION_RULE = "validation_risk_first_order_preflight"
 MODULE_C_PREFLIGHT_SCORE_FILE = "module_c_preflight_scores.csv"
-MODULE_C_PREFLIGHT_INTERACTION_FILE = "module_c_preflight_interactions.csv"
 MODULE_C_PREFLIGHT_DECISION_FILE = "module_c_preflight_decision.json"
-MODULE_C_RGFS_RELIEF_FILE = "module_c_rgfs_relief.csv"
-MODULE_C_ACTION_OVERLAP_FILE = "module_c_action_overlap.json"
-MODULE_C_E_STRUCTURAL_RESIDUAL_ID = "E:structural_balance"
+_NUMERICAL_TOLERANCE = 1e-12
 
 
 @dataclass(frozen=True)
 class ModuleCPreflightResult:
-    decision: RGFSDecision
+    decision: ValidationRiskDecision
     diagnostics_by_module: Mapping[str, Mapping[str, Any]]
-    interaction_scores: Mapping[Tuple[str, str], float]
     replaced_modules: Tuple[str, ...]
     score_csv_path: str = ""
-    interaction_csv_path: str = ""
     decision_json_path: str = ""
-    relief_csv_path: str = ""
-    action_overlap_json_path: str = ""
 
 
 def _is_module_c_execution_target(target: Any) -> bool:
@@ -68,7 +51,8 @@ def _is_module_c_execution_target(target: Any) -> bool:
 
 
 def module_c_preflight_requested(args: Any) -> bool:
-    """Return whether this run should auto-resolve Module C before training."""
+    """Return whether Module C must automatically resolve a nonempty B/D/E set."""
+
     if args is None:
         return False
     if str(getattr(args, "finetune_mod", "") or "").lower() != "lora":
@@ -82,34 +66,15 @@ def module_c_preflight_requested(args: Any) -> bool:
     return len(selected) == 0 and len(resolved) == 0
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        out = float(value)
-    except Exception:
-        return float(default)
-    if not math.isfinite(out):
-        return float(default)
-    return out
-
-
-def _clip01(value: Any, default: float = 0.0) -> float:
-    out = _safe_float(value, default=default)
-    return float(max(0.0, min(1.0, out)))
-
-
-def _as_list(value: Iterable[Any]) -> List[Any]:
-    return list(value) if value is not None else []
-
-
 def _prepare_batch(args: Any, batch: Sequence[Any], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     samples = batch[0]
-    targets_raw = batch[1]
+    labels_raw = batch[1]
     if str(getattr(args, "norm_method", "")) == "mv":
         samples = samples.float().to(device, non_blocking=True) * float(getattr(args, "mv_norm_value", 0.01))
     else:
         samples = samples.float().to(device, non_blocking=True)
 
-    labels = targets_raw.to(device, non_blocking=True)
+    labels = labels_raw.to(device, non_blocking=True)
     if str(getattr(args, "task_mod", "")) == "Regression":
         targets = labels.float()
     elif int(getattr(args, "nb_classes", 0)) == 1:
@@ -141,22 +106,30 @@ def _per_sample_loss(output: torch.Tensor, targets: torch.Tensor, args: Any) -> 
         loss = (output.view_as(targets.float()) - targets.float()).pow(2)
         return loss.view(loss.shape[0], -1).mean(dim=1)
     if int(getattr(args, "nb_classes", 0)) == 1:
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(
-            output.view(-1),
-            targets.float().view(-1),
-            reduction="none",
-        )
-        return loss.view(-1)
+        return torch.nn.functional.binary_cross_entropy_with_logits(
+            output.view(-1), targets.float().view(-1), reduction="none"
+        ).view(-1)
     return torch.nn.functional.cross_entropy(output, targets.long(), reduction="none")
 
 
+def _forward_output(model: nn.Module, samples: torch.Tensor) -> torch.Tensor:
+    output = model(samples)
+    return output[0] if isinstance(output, (list, tuple)) else output
+
+
+def _forward_loss(model: nn.Module, samples: torch.Tensor, targets: torch.Tensor, criterion: nn.Module) -> torch.Tensor:
+    return criterion(_forward_output(model, samples), targets)
+
+
 def _collect_probe_batches(data_loader: Any, max_batches: int) -> List[Sequence[Any]]:
+    """Collect the full split by default; positive caps are explicit debug controls."""
+
     batches: List[Sequence[Any]] = []
     if data_loader is None:
         return batches
     limit = int(max_batches)
-    for batch_idx, batch in enumerate(data_loader):
-        if limit > 0 and batch_idx >= limit:
+    for batch_index, batch in enumerate(data_loader):
+        if limit > 0 and batch_index >= limit:
             break
         if isinstance(batch, (list, tuple)) and len(batch) >= 2:
             batches.append(batch)
@@ -166,22 +139,10 @@ def _collect_probe_batches(data_loader: Any, max_batches: int) -> List[Sequence[
 def _strip_lora_param_suffix(param_name: str) -> str:
     name = str(param_name or "")
     lower = name.lower()
-    markers = (
-        ".lora_a.",
-        ".lora_b.",
-        ".lora_a",
-        ".lora_b",
-        ".base.weight",
-        ".base.bias",
-        ".base.in_proj_weight",
-        ".base.in_proj_bias",
-        ".base.out_proj.weight",
-        ".base.out_proj.bias",
-    )
-    for marker in markers:
-        idx = lower.find(marker)
-        if idx >= 0:
-            return name[:idx]
+    for marker in (".lora_a.", ".lora_b.", ".lora_a", ".lora_b"):
+        index = lower.find(marker)
+        if index >= 0:
+            return name[:index]
     return name
 
 
@@ -199,21 +160,22 @@ def _replacement_owner(
     candidates = set(candidate_modules)
     if "B" in candidates and (name == "input_side_lora" or lower.endswith("chan_conv") or ".chan_conv" in lower):
         return "B"
-    if "E" in candidates:
-        for prefix in structural_prefixes:
-            if prefix and _prefix_match(name, prefix):
-                return "E"
-    if "D" in candidates:
-        return "D"
-    return ""
+    if "E" in candidates and any(prefix and _prefix_match(name, prefix) for prefix in structural_prefixes):
+        return "E"
+    return "D" if "D" in candidates else ""
 
 
-def _build_param_to_module(
+def _is_adapter_parameter(name: str) -> bool:
+    lower = str(name or "").lower()
+    return ".lora_a" in lower or ".lora_b" in lower or lower.endswith("lora_a") or lower.endswith("lora_b")
+
+
+def _build_adapter_param_to_module(
     model: nn.Module,
     model_name: str,
     candidate_modules: Sequence[str],
     replaced_modules: Sequence[str],
-) -> Tuple[Dict[str, str], Dict[str, int], Dict[str, int]]:
+) -> Tuple[Dict[str, str], Dict[str, int]]:
     structural_prefixes = tuple(
         sorted(
             {
@@ -225,274 +187,278 @@ def _build_param_to_module(
             reverse=True,
         )
     )
-    replacement_owner: Dict[str, str] = {}
-    for replacement in replaced_modules:
-        owner = _replacement_owner(replacement, candidate_modules, structural_prefixes)
-        if owner:
-            replacement_owner[str(replacement)] = owner
+    replacement_owner = {
+        str(replacement): _replacement_owner(str(replacement), candidate_modules, structural_prefixes)
+        for replacement in replaced_modules
+    }
+    replacement_owner = {name: module_id for name, module_id in replacement_owner.items() if module_id}
 
     param_to_module: Dict[str, str] = {}
-    adapter_params: Dict[str, int] = {m: 0 for m in candidate_modules}
-    probe_params: Dict[str, int] = {m: 0 for m in candidate_modules}
+    parameter_counts = {module_id: 0 for module_id in candidate_modules}
     for name, param in model.named_parameters():
+        if not _is_adapter_parameter(name):
+            continue
         module_prefix = _strip_lora_param_suffix(name)
         owner = ""
-        best_len = -1
-        for replacement, candidate in replacement_owner.items():
-            if _prefix_match(module_prefix, replacement) and len(replacement) > best_len:
-                owner = candidate
-                best_len = len(replacement)
+        best_length = -1
+        for replacement, module_id in replacement_owner.items():
+            if _prefix_match(module_prefix, replacement) and len(replacement) > best_length:
+                owner = module_id
+                best_length = len(replacement)
         if not owner:
             continue
         param_to_module[name] = owner
-        probe_params[owner] = probe_params.get(owner, 0) + int(param.numel())
-        if ".lora_" in name.lower() or "input_side_lora" in name:
-            adapter_params[owner] = adapter_params.get(owner, 0) + int(param.numel())
-    return param_to_module, adapter_params, probe_params
+        parameter_counts[owner] = parameter_counts.get(owner, 0) + int(param.numel())
+    return param_to_module, parameter_counts
 
 
-def _configure_probe_trainability(model: nn.Module, param_to_module: Mapping[str, str]) -> None:
+def _configure_adapter_trainability(model: nn.Module, adapter_param_to_module: Mapping[str, str]) -> None:
     freeze_all_parameters(model)
-    for name, param in model.named_parameters():
-        if name in param_to_module:
-            param.requires_grad_(True)
+    for name, parameter in model.named_parameters():
+        if name in adapter_param_to_module:
+            parameter.requires_grad_(True)
 
 
-def _is_base_gradient_name(name: str) -> bool:
-    lower = str(name or "").lower()
-    return ".lora_" not in lower and (
-        ".base.weight" in lower
-        or ".base.in_proj_weight" in lower
-        or ".base.out_proj.weight" in lower
-        or lower.endswith(".weight")
-    )
+def _named_adapter_parameters(model: nn.Module, adapter_param_to_module: Mapping[str, str]) -> Dict[str, nn.Parameter]:
+    named = dict(model.named_parameters())
+    missing = sorted(set(adapter_param_to_module) - set(named))
+    if missing:
+        raise RuntimeError(f"Module C lost probe adapter parameters: {missing[:3]}")
+    return {name: named[name] for name in adapter_param_to_module}
 
 
-def _low_rank_fit_from_grad(grad: torch.Tensor, rank: int, max_numel: int) -> Optional[float]:
-    if grad is None or grad.numel() == 0 or grad.dim() < 2:
-        return None
-    if max_numel > 0 and grad.numel() > max_numel:
-        return None
-    matrix = grad.detach().float().reshape(grad.shape[0], -1).cpu()
-    if matrix.numel() == 0 or min(matrix.shape) <= 0:
-        return None
-    try:
-        singular_values = torch.linalg.svdvals(matrix)
-    except Exception:
-        return None
-    energy = singular_values.pow(2)
-    denom = float(energy.sum().item())
-    if denom <= 0.0:
-        return None
-    k = max(1, min(int(rank), int(energy.numel())))
-    return float(energy[:k].sum().item() / denom)
-
-
-def _empty_snapshot(candidate_modules: Sequence[str]) -> Dict[str, Dict[str, Any]]:
-    return {
-        m: {
-            "energy": 0.0,
-            "param_count": 0,
-            "vectors": {},
-            "lrf_weighted": 0.0,
-            "lrf_energy": 0.0,
-            "lrf_total_energy": 0.0,
-            "lrf_measured_tensors": 0,
-            "lrf_skipped_tensors": 0,
-        }
-        for m in candidate_modules
-    }
-
-
-def _snapshot_gradients(
-    model: nn.Module,
-    param_to_module: Mapping[str, str],
-    candidate_modules: Sequence[str],
-    rank: int,
-    svd_max_numel: int,
-) -> Dict[str, Dict[str, Any]]:
-    snap = _empty_snapshot(candidate_modules)
-    for name, param in model.named_parameters():
-        module_id = param_to_module.get(name)
-        if not module_id or param.grad is None:
-            continue
-        grad = param.grad.detach().float()
-        energy = float(grad.pow(2).sum().cpu().item())
-        item = snap[module_id]
-        item["energy"] += energy
-        item["param_count"] += int(grad.numel())
-        item["vectors"][name] = grad.reshape(-1).cpu()
-        if _is_base_gradient_name(name):
-            if energy > 0.0:
-                item["lrf_total_energy"] += energy
-            fit = _low_rank_fit_from_grad(
-                grad,
-                rank=rank,
-                max_numel=svd_max_numel,
-            )
-            if fit is not None and energy > 0.0:
-                item["lrf_weighted"] += float(fit) * energy
-                item["lrf_energy"] += energy
-                item["lrf_measured_tensors"] += 1
-            elif energy > 0.0:
-                item["lrf_skipped_tensors"] += 1
-    return snap
-
-
-def _merge_snapshots(
-    target: Dict[str, Dict[str, Any]],
-    source: Mapping[str, Mapping[str, Any]],
-) -> None:
-    for module_id, src in source.items():
-        dst = target[module_id]
-        dst["energy"] += float(src.get("energy", 0.0))
-        dst["param_count"] = max(int(dst.get("param_count", 0)), int(src.get("param_count", 0)))
-        dst["lrf_weighted"] += float(src.get("lrf_weighted", 0.0))
-        dst["lrf_energy"] += float(src.get("lrf_energy", 0.0))
-        dst["lrf_total_energy"] += float(src.get("lrf_total_energy", src.get("lrf_energy", 0.0)))
-        dst["lrf_measured_tensors"] += int(src.get("lrf_measured_tensors", 0))
-        dst["lrf_skipped_tensors"] += int(src.get("lrf_skipped_tensors", 0))
-        dst_vectors = dst["vectors"]
-        for name, vector in src.get("vectors", {}).items():
-            if name in dst_vectors:
-                dst_vectors[name] = dst_vectors[name] + vector
-            else:
-                dst_vectors[name] = vector.clone()
-
-
-def _cosine_named_vectors(left: Mapping[str, torch.Tensor], right: Mapping[str, torch.Tensor]) -> float:
-    keys = sorted(set(left.keys()) & set(right.keys()))
-    if not keys:
-        return 0.0
-    dot = 0.0
-    left_norm = 0.0
-    right_norm = 0.0
-    for key in keys:
-        a = left[key].float().view(-1)
-        b = right[key].float().view(-1)
-        n = min(a.numel(), b.numel())
-        if n <= 0:
-            continue
-        a = a[:n]
-        b = b[:n]
-        dot += float(torch.dot(a, b).item())
-        left_norm += float(torch.dot(a, a).item())
-        right_norm += float(torch.dot(b, b).item())
-    denom = math.sqrt(max(left_norm, 0.0)) * math.sqrt(max(right_norm, 0.0))
-    if denom <= 0.0:
-        return 0.0
-    return float(max(-1.0, min(1.0, dot / denom)))
-
-
-def _forward_loss(model: nn.Module, samples: torch.Tensor, targets: torch.Tensor, criterion: nn.Module) -> torch.Tensor:
-    output = model(samples)
-    if isinstance(output, (list, tuple)):
-        output = output[0]
-    return criterion(output, targets)
-
-
-def _calibrate_probe_head(
+def _full_support_gradients(
     args: Any,
     model: nn.Module,
     batches: Sequence[Sequence[Any]],
     device: torch.device,
     criterion: nn.Module,
-) -> int:
-    """Briefly fit only the disposable task head before measuring RGFS evidence."""
-    steps = max(0, int(getattr(args, "module_c_probe_head_steps", 3)))
-    if steps <= 0 or not batches or not hasattr(model, "task_head"):
-        return 0
+    named_parameters: Mapping[str, nn.Parameter],
+) -> Dict[str, torch.Tensor]:
+    """Return the gradient of the mean support loss for every probe adapter."""
 
-    freeze_all_parameters(model)
-    params = []
-    for param in model.task_head.parameters():
-        param.requires_grad_(True)
-        params.append(param)
-    if not params:
-        return 0
-
-    lr = float(getattr(args, "module_c_probe_head_lr", 1e-3))
-    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
+    gradients = {name: torch.zeros_like(parameter, device="cpu") for name, parameter in named_parameters.items()}
+    total_examples = 0
     original_training = bool(model.training)
-    completed = 0
     try:
-        model.train(True)
-        for step in range(steps):
-            batch = batches[step % len(batches)]
+        model.eval()
+        for batch in batches:
             samples, targets, _labels = _prepare_batch(args, batch, device)
-            optimizer.zero_grad(set_to_none=True)
+            batch_size = int(samples.shape[0])
+            if batch_size <= 0:
+                continue
             loss = _forward_loss(model, samples, targets, criterion)
-            if not torch.isfinite(loss.detach()):
-                raise RuntimeError(f"Module C probe-head calibration produced non-finite loss: {float(loss.detach().cpu())}")
-            loss.backward()
-            optimizer.step()
-            completed += 1
+            if loss.ndim != 0:
+                loss = loss.mean()
+            if not bool(torch.isfinite(loss.detach()).item()):
+                raise RuntimeError("Module C support gradient scan produced a non-finite loss.")
+            values = torch.autograd.grad(
+                loss * float(batch_size),
+                tuple(named_parameters.values()),
+                allow_unused=True,
+            )
+            for name, value in zip(named_parameters, values):
+                if value is not None:
+                    gradients[name].add_(value.detach().to(device="cpu", dtype=gradients[name].dtype))
+            total_examples += batch_size
     finally:
-        optimizer.zero_grad(set_to_none=True)
         model.zero_grad(set_to_none=True)
         model.train(original_training)
-    return completed
+
+    if total_examples <= 0:
+        raise RuntimeError("Module C support gradient scan saw no usable examples.")
+    for gradient in gradients.values():
+        gradient.div_(float(total_examples))
+    return gradients
 
 
-def _backward_batches(
+def _optimizer_layer_decay_callbacks(args: Any, model: nn.Module) -> Tuple[Optional[Callable[[str], int]], Optional[Callable[[int], float]]]:
+    """Mirror the layer-wise learning-rate scales used by final fine-tuning."""
+
+    model_name = str(getattr(args, "model_name", "") or "")
+    main_model = getattr(model, "main_model", None)
+    layer_count: Optional[int] = None
+    if model_name == "LaBraM" and main_model is not None and hasattr(main_model, "get_num_layers"):
+        layer_count = int(main_model.get_num_layers())
+    elif model_name == "CBraMod" and main_model is not None and hasattr(main_model, "encoder"):
+        layers = getattr(main_model.encoder, "layers", None)
+        if layers is not None:
+            layer_count = len(layers)
+    if layer_count is None or layer_count < 0:
+        return None, None
+    layer_decay = float(getattr(args, "layer_decay", 1.0))
+    assigner = LayerDecayValueAssigner([layer_decay ** (layer_count + 1 - index) for index in range(layer_count + 2)])
+    return assigner.get_layer_id, assigner.get_scale
+
+
+def _optimizer_step_from_gradients(
+    args: Any,
+    model: nn.Module,
+    named_parameters: Mapping[str, nn.Parameter],
+    adapter_param_to_module: Mapping[str, str],
+    gradients: Mapping[str, torch.Tensor],
+    selected_modules: Sequence[str],
+    restore_parameters: bool,
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    """Apply one configured optimizer step from cached support gradients.
+
+    No additional support forward/backward pass is needed. ``restore_parameters``
+    is used for isolated virtual updates; the confirmation update keeps its
+    parameters so validation can inspect the resulting subset.
+    """
+
+    selected = set(selected_modules)
+    if not selected:
+        raise ValueError("Module C optimizer step requires at least one B/D/E module.")
+    original_requires_grad = {name: bool(parameter.requires_grad) for name, parameter in named_parameters.items()}
+    before: Dict[str, torch.Tensor] = {}
+    try:
+        for name, parameter in named_parameters.items():
+            active = adapter_param_to_module[name] in selected
+            parameter.requires_grad_(active)
+            if active:
+                before[name] = parameter.detach().clone()
+                gradient = gradients.get(name)
+                parameter.grad = None if gradient is None else gradient.to(parameter.device, dtype=parameter.dtype).clone()
+            else:
+                parameter.grad = None
+
+        get_num_layer, get_layer_scale = _optimizer_layer_decay_callbacks(args, model)
+        optimizer = create_optimizer(
+            args,
+            model,
+            skip_list=[],
+            get_num_layer=get_num_layer,
+            get_layer_scale=get_layer_scale,
+        )
+        for group in optimizer.param_groups:
+            group["lr"] = float(getattr(args, "lr", 0.0)) * float(group.get("lr_scale", 1.0))
+        active_parameters = [parameter for name, parameter in named_parameters.items() if adapter_param_to_module[name] in selected]
+        clip_grad = getattr(args, "clip_grad", None)
+        if clip_grad is not None:
+            torch.nn.utils.clip_grad_norm_(active_parameters, float(clip_grad))
+        optimizer.step()
+
+        updates: Dict[str, Dict[str, torch.Tensor]] = {module_id: {} for module_id in selected}
+        for name, parameter in named_parameters.items():
+            module_id = adapter_param_to_module[name]
+            if module_id in selected:
+                updates[module_id][name] = (parameter.detach() - before[name]).to(device="cpu").clone()
+        return updates
+    finally:
+        if restore_parameters:
+            with torch.no_grad():
+                for name, value in before.items():
+                    named_parameters[name].copy_(value)
+        for name, parameter in named_parameters.items():
+            parameter.grad = None
+            parameter.requires_grad_(original_requires_grad[name])
+        model.zero_grad(set_to_none=True)
+
+
+def _class_grouped_validation_gradients(
     args: Any,
     model: nn.Module,
     batches: Sequence[Sequence[Any]],
     device: torch.device,
-    criterion: nn.Module,
-    param_to_module: Mapping[str, str],
+    named_parameters: Mapping[str, nn.Parameter],
+    adapter_param_to_module: Mapping[str, str],
     candidate_modules: Sequence[str],
-    rank: int,
-    svd_max_numel: int,
-    class_filter: Optional[Iterable[int]] = None,
-) -> Tuple[Dict[str, Dict[str, Any]], int]:
-    aggregate = _empty_snapshot(candidate_modules)
-    filter_set = None if class_filter is None else set(int(x) for x in class_filter)
-    seen = 0
-    for batch in batches:
-        samples, targets, labels_raw = _prepare_batch(args, batch, device)
-        if filter_set is not None:
+) -> Tuple[Dict[str, Dict[int, Dict[str, torch.Tensor]]], Dict[int, int]]:
+    """Collect one validation forward per batch and one backward per present class."""
+
+    gradients: Dict[str, Dict[int, Dict[str, torch.Tensor]]] = {module_id: {} for module_id in candidate_modules}
+    counts: Dict[int, int] = {}
+    original_training = bool(model.training)
+    try:
+        model.eval()
+        for batch in batches:
+            samples, targets, labels_raw = _prepare_batch(args, batch, device)
             labels = _classification_labels(labels_raw, args)
             if labels is None:
-                continue
-            mask = torch.zeros_like(labels, dtype=torch.bool)
-            for cls in filter_set:
-                mask |= labels == int(cls)
-            if not bool(mask.any().item()):
-                continue
-            samples = samples[mask]
-            if int(getattr(args, "nb_classes", 0)) == 1:
-                targets = targets.view(-1, 1)[mask]
-            else:
-                targets = targets.view(-1)[mask]
-
+                raise ValueError("Module C validation-risk selection requires multi-class classification labels.")
+            output = _forward_output(model, samples)
+            losses = _per_sample_loss(output, targets, args)
+            class_ids = [int(value) for value in torch.unique(labels).detach().cpu().tolist()]
+            for class_index, class_id in enumerate(class_ids):
+                mask = labels == class_id
+                class_count = int(mask.sum().item())
+                if class_count <= 0:
+                    continue
+                class_loss_sum = losses[mask].sum()
+                values = torch.autograd.grad(
+                    class_loss_sum,
+                    tuple(named_parameters.values()),
+                    retain_graph=class_index < len(class_ids) - 1,
+                    allow_unused=True,
+                )
+                counts[class_id] = counts.get(class_id, 0) + class_count
+                for name, value in zip(named_parameters, values):
+                    if value is None:
+                        continue
+                    module_id = adapter_param_to_module[name]
+                    class_map = gradients[module_id].setdefault(class_id, {})
+                    detached = value.detach().to(device="cpu")
+                    if name in class_map:
+                        class_map[name].add_(detached)
+                    else:
+                        class_map[name] = detached.clone()
+    finally:
         model.zero_grad(set_to_none=True)
-        with torch.enable_grad():
-            loss = _forward_loss(model, samples, targets, criterion)
-            if not torch.isfinite(loss.detach()):
-                raise RuntimeError(f"Module C preflight produced non-finite loss: {float(loss.detach().cpu())}")
-            loss.backward()
-        snap = _snapshot_gradients(
-            model=model,
-            param_to_module=param_to_module,
-            candidate_modules=candidate_modules,
-            rank=rank,
-            svd_max_numel=svd_max_numel,
-        )
-        _merge_snapshots(aggregate, snap)
-        seen += 1
-    model.zero_grad(set_to_none=True)
-    return aggregate, seen
+        model.train(original_training)
+
+    class_ids = tuple(sorted(counts))
+    if len(class_ids) < 3:
+        raise ValueError("Module C validation-risk selection is defined only for classification tasks with at least three validation classes.")
+    for module_id in candidate_modules:
+        for class_id in class_ids:
+            vectors = gradients[module_id].setdefault(class_id, {})
+            for name, parameter in named_parameters.items():
+                if adapter_param_to_module[name] != module_id:
+                    continue
+                if name not in vectors:
+                    vectors[name] = torch.zeros_like(parameter, device="cpu")
+                vectors[name].div_(float(counts[class_id]))
+    return gradients, counts
 
 
-def _validation_class_stats(
+def first_order_effects_from_snapshots(
+    validation_gradients: Mapping[Any, Mapping[Any, Mapping[str, torch.Tensor]]],
+    virtual_updates: Mapping[Any, Mapping[str, torch.Tensor]],
+) -> Dict[str, Dict[int, float]]:
+    """Estimate class-wise validation-loss reduction ``-<g_val, delta>``.
+
+    The result is positive when the virtual support update is predicted to
+    lower that class's validation loss. It uses the same adapter tensors and
+    optimizer-produced parameter displacement as final LoRA training.
+    """
+
+    effects: Dict[str, Dict[int, float]] = {}
+    for raw_module, by_class in validation_gradients.items():
+        module_id = str(raw_module).upper()
+        updates = virtual_updates.get(raw_module, virtual_updates.get(module_id, {}))
+        effects[module_id] = {}
+        for raw_class, gradients in by_class.items():
+            value = 0.0
+            for name, validation_gradient in gradients.items():
+                update = updates.get(name)
+                if update is None:
+                    continue
+                gradient_vector = validation_gradient.detach().float().reshape(-1)
+                update_vector = update.detach().float().reshape(-1)
+                if gradient_vector.numel() != update_vector.numel():
+                    raise ValueError(f"Module C gradient/update shape mismatch for {module_id}:{name}.")
+                value -= float(torch.dot(gradient_vector, update_vector).item())
+            effects[module_id][int(raw_class)] = float(value)
+    return effects
+
+
+def _classwise_validation_loss(
     args: Any,
     model: nn.Module,
     batches: Sequence[Sequence[Any]],
     device: torch.device,
-) -> Tuple[Tuple[int, ...], Dict[int, int], Dict[int, float]]:
-    if str(getattr(args, "task_mod", "")) != "Classification":
-        return tuple(), {}, {}
+) -> Dict[int, float]:
     loss_sum: Dict[int, float] = {}
     counts: Dict[int, int] = {}
     original_training = bool(model.training)
@@ -503,584 +469,228 @@ def _validation_class_stats(
                 samples, targets, labels_raw = _prepare_batch(args, batch, device)
                 labels = _classification_labels(labels_raw, args)
                 if labels is None:
-                    continue
-                output = model(samples)
-                if isinstance(output, (list, tuple)):
-                    output = output[0]
-                losses = _per_sample_loss(output, targets, args)
-                for cls in torch.unique(labels).detach().cpu().tolist():
-                    cls = int(cls)
-                    mask = labels == cls
-                    if not bool(mask.any().item()):
+                    raise ValueError("Module C confirmation requires multi-class classification labels.")
+                losses = _per_sample_loss(_forward_output(model, samples), targets, args)
+                for raw_class in torch.unique(labels).detach().cpu().tolist():
+                    class_id = int(raw_class)
+                    mask = labels == class_id
+                    class_count = int(mask.sum().item())
+                    if class_count <= 0:
                         continue
-                    cls_losses = losses[mask]
-                    counts[cls] = counts.get(cls, 0) + int(mask.sum().item())
-                    loss_sum[cls] = loss_sum.get(cls, 0.0) + float(cls_losses.detach().sum().cpu().item())
+                    loss_sum[class_id] = loss_sum.get(class_id, 0.0) + float(losses[mask].sum().detach().cpu().item())
+                    counts[class_id] = counts.get(class_id, 0) + class_count
     finally:
         model.train(original_training)
-
-    loss_mean = {cls: loss_sum[cls] / max(1, counts.get(cls, 0)) for cls in loss_sum}
-    burden = _class_burden_from_loss(loss_mean)
-    uniform = 1.0 / float(len(burden)) if burden else 0.0
-    hard = tuple(sorted(cls for cls, amount in burden.items() if float(amount) >= uniform))
-    if not hard and burden:
-        hard = (max(burden, key=lambda cls: (float(burden[cls]), -int(cls))),)
-    return hard, counts, loss_mean
+    return {class_id: float(loss_sum[class_id] / float(counts[class_id])) for class_id in sorted(counts)}
 
 
-def _class_pressure_profiles(
-    args: Any,
-    model: nn.Module,
-    batches: Sequence[Sequence[Any]],
-    device: torch.device,
-    criterion: nn.Module,
-    param_to_module: Mapping[str, str],
-    candidate_modules: Sequence[str],
-    rank: int,
-    svd_max_numel: int,
-    classes: Sequence[int],
-) -> Dict[str, Dict[int, float]]:
-    profiles: Dict[str, Dict[int, float]] = {m: {} for m in candidate_modules}
-    max_classes = max(0, int(getattr(args, "module_c_preflight_max_profile_classes", 0)))
-    selected_classes = _as_list(classes)
-    if max_classes > 0:
-        selected_classes = selected_classes[:max_classes]
-    for cls in selected_classes:
-        snap, seen = _backward_batches(
-            args=args,
-            model=model,
-            batches=batches,
-            device=device,
-            criterion=criterion,
-            param_to_module=param_to_module,
-            candidate_modules=candidate_modules,
-            rank=rank,
-            svd_max_numel=svd_max_numel,
-            class_filter=(int(cls),),
-        )
-        if seen <= 0:
-            continue
-        for module_id in candidate_modules:
-            profiles[module_id][int(cls)] = float(snap[module_id]["energy"]) / float(seen)
-    return profiles
-
-
-def _profile_cosine(left: Mapping[int, float], right: Mapping[int, float], classes: Sequence[int]) -> float:
-    if not classes:
-        return 0.0
-    a = torch.tensor([float(left.get(int(cls), 0.0)) for cls in classes], dtype=torch.float32)
-    b = torch.tensor([float(right.get(int(cls), 0.0)) for cls in classes], dtype=torch.float32)
-    denom = float(a.norm().item() * b.norm().item())
-    if denom <= 0.0:
-        return 0.0
-    return float(max(-1.0, min(1.0, float(torch.dot(a, b).item() / denom))))
-
-
-def _complexity_values(adapter_param_counts: Mapping[str, int], candidate_modules: Sequence[str]) -> Dict[str, float]:
-    counts = [max(1, int(adapter_param_counts.get(m, 0))) for m in candidate_modules]
-    sorted_counts = sorted(counts)
-    if not sorted_counts:
-        return {}
-    median = float(sorted_counts[len(sorted_counts) // 2])
-    return {
-        m: float(max(0.5, min(1.5, max(1, int(adapter_param_counts.get(m, 0))) / max(1.0, median))))
-        for m in candidate_modules
+@contextmanager
+def _masked_module_adapter(model: nn.Module, adapter_param_to_module: Mapping[str, str], module_id: str) -> Iterator[None]:
+    named_parameters = dict(model.named_parameters())
+    saved = {
+        name: named_parameters[name].detach().clone()
+        for name, owner in adapter_param_to_module.items()
+        if owner == module_id
     }
+    try:
+        with torch.no_grad():
+            for name in saved:
+                named_parameters[name].zero_()
+        yield
+    finally:
+        with torch.no_grad():
+            for name, value in saved.items():
+                named_parameters[name].copy_(value)
 
 
-def _filter_named_vectors(vectors: Mapping[str, torch.Tensor], kind: str) -> Dict[str, torch.Tensor]:
-    out: Dict[str, torch.Tensor] = {}
-    want_lora = str(kind).lower() == "lora"
-    for name, vector in vectors.items():
-        lower = str(name or "").lower()
-        is_lora = "lora_" in lower or lower.endswith("lora_a") or lower.endswith("lora_b")
-        if want_lora == is_lora:
-            out[name] = vector
-    return out
-
-
-def _confidence_margin(args: Any, seen: int) -> float:
-    scale = max(0.0, float(getattr(args, "module_c_rgfs_confidence_scale", 0.0)))
-    if seen <= 0:
-        return 1.0 if scale > 0.0 else 0.0
-    return float(min(0.50, scale / math.sqrt(float(seen))))
-
-
-def _low_rank_evidence_from_snapshot(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
-    measured_energy = max(0.0, float(snapshot.get("lrf_energy", 0.0)))
-    total_energy = max(0.0, float(snapshot.get("lrf_total_energy", measured_energy)))
-    weighted = max(0.0, float(snapshot.get("lrf_weighted", 0.0)))
-    measured_tensors = int(snapshot.get("lrf_measured_tensors", 0))
-    skipped_tensors = int(snapshot.get("lrf_skipped_tensors", 0))
-    if total_energy <= 0.0:
-        return {
-            "fit": 0.0,
-            "coverage": 0.0,
-            "status": "unmeasured",
-            "measured_energy": 0.0,
-            "total_energy": 0.0,
-            "measured_tensors": measured_tensors,
-            "skipped_tensors": skipped_tensors,
-        }
-    coverage = max(0.0, min(1.0, measured_energy / total_energy))
-    effective_fit = max(0.0, min(1.0, weighted / total_energy))
-    if measured_energy <= 0.0:
-        status = "unmeasured"
-    elif measured_energy + 1e-12 < total_energy:
-        status = "partial"
-    else:
-        status = "measured"
-    return {
-        "fit": float(effective_fit),
-        "coverage": float(coverage),
-        "status": status,
-        "measured_energy": float(measured_energy),
-        "total_energy": float(total_energy),
-        "measured_tensors": measured_tensors,
-        "skipped_tensors": skipped_tensors,
-    }
-
-
-def _low_rank_fit_from_snapshot(snapshot: Mapping[str, Any]) -> float:
-    return float(_low_rank_evidence_from_snapshot(snapshot)["fit"])
-
-
-def _class_burden_from_loss(class_loss_mean: Mapping[int, float]) -> Dict[int, float]:
-    losses = {int(cls): max(0.0, float(loss)) for cls, loss in class_loss_mean.items()}
-    total = sum(losses.values())
-    if total <= 0.0 and losses:
-        uniform = 1.0 / float(len(losses))
-        return {cls: uniform for cls in losses}
-    if total <= 0.0:
-        return {}
-    return {cls: float(loss / total) for cls, loss in losses.items()}
-
-
-def _class_gradient_snapshots(
-    args: Any,
-    model: nn.Module,
-    batches: Sequence[Sequence[Any]],
-    device: torch.device,
-    criterion: nn.Module,
-    param_to_module: Mapping[str, str],
-    candidate_modules: Sequence[str],
-    rank: int,
-    svd_max_numel: int,
-    classes: Sequence[int],
-) -> Tuple[Dict[int, Dict[str, Dict[str, Any]]], Dict[int, int]]:
-    snapshots: Dict[int, Dict[str, Dict[str, Any]]] = {}
-    seen_by_class: Dict[int, int] = {}
-    max_classes = max(0, int(getattr(args, "module_c_preflight_max_profile_classes", 0)))
-    selected_classes = _as_list(classes)
-    if max_classes > 0:
-        selected_classes = selected_classes[:max_classes]
-    for cls in selected_classes:
-        snap, seen = _backward_batches(
-            args=args,
-            model=model,
-            batches=batches,
-            device=device,
-            criterion=criterion,
-            param_to_module=param_to_module,
-            candidate_modules=candidate_modules,
-            rank=rank,
-            svd_max_numel=svd_max_numel,
-            class_filter=(int(cls),),
-        )
-        if seen <= 0:
-            continue
-        snapshots[int(cls)] = snap
-        seen_by_class[int(cls)] = int(seen)
-    return snapshots, seen_by_class
-
-
-def _cosine_float_vectors(left: Mapping[int, float], right: Mapping[int, float], classes: Sequence[int]) -> float:
-    return _profile_cosine(left, right, classes)
-
-
-def _is_lora_b_vector_name(name: Any) -> bool:
-    lower = str(name or "").lower()
-    return ".lora_b" in lower or lower.endswith("lora_b")
-
-
-def _is_lora_vector_name(name: Any) -> bool:
-    lower = str(name or "").lower()
-    return "lora_" in lower or lower.endswith("lora_a") or lower.endswith("lora_b")
-
-
-def _structural_branch_pressure_profile(
-    snapshot: Mapping[str, Any],
-    model_name: str,
-) -> Tuple[Dict[str, float], str]:
-    vectors = snapshot.get("vectors", {}) if snapshot else {}
-    scopes = (
-        ("lora_b", _is_lora_b_vector_name),
-        ("all_lora", _is_lora_vector_name),
-        ("all_probe", lambda _name: True),
-    )
-    for scope_name, predicate in scopes:
-        energy = {branch: 0.0 for branch in STRUCTURAL_ROUTING_BLOCKS}
-        count = {branch: 0 for branch in STRUCTURAL_ROUTING_BLOCKS}
-        for name, vector in vectors.items():
-            if not predicate(name):
-                continue
-            branch = module_e_branch_from_lora_param_name(model_name, name)
-            if branch not in energy:
-                continue
-            vec = vector.detach().float().view(-1)
-            energy[branch] += float(torch.dot(vec, vec).item())
-            count[branch] += int(vec.numel())
-        if sum(count.values()) > 0:
-            return {
-                branch: float(energy[branch] / max(1, count[branch]))
-                for branch in STRUCTURAL_ROUTING_BLOCKS
-            }, scope_name
-    return {branch: 0.0 for branch in STRUCTURAL_ROUTING_BLOCKS}, "none"
-
-
-def _structural_pressure_concentration(profile: Mapping[str, float]) -> float:
-    values = [max(0.0, float(profile.get(branch, 0.0))) for branch in STRUCTURAL_ROUTING_BLOCKS]
-    total = sum(values)
-    n = len(values)
-    if total <= 0.0 or n <= 1:
-        return 0.0
-    probs = [value / total for value in values]
-    entropy = -sum(prob * math.log(max(prob, 1e-12)) for prob in probs) / math.log(n)
-    return _clip01(1.0 - entropy)
-
-
-def _structural_pressure_agreement(left: Mapping[str, float], right: Mapping[str, float]) -> float:
-    a = torch.tensor([float(left.get(branch, 0.0)) for branch in STRUCTURAL_ROUTING_BLOCKS], dtype=torch.float32)
-    b = torch.tensor([float(right.get(branch, 0.0)) for branch in STRUCTURAL_ROUTING_BLOCKS], dtype=torch.float32)
-    denom = float(a.norm().item() * b.norm().item())
-    if denom <= 0.0:
-        return 0.0
-    return _clip01(float(torch.dot(a, b).item() / denom))
-
-
-def _focused_burden_cap(args: Any, burden: Mapping[int, float]) -> float:
-    del args
-    if not burden:
-        return 0.0
-    values = [float(v) for v in burden.values() if float(v) > 0.0]
+def _loss_metrics(per_class_loss: Mapping[int, float]) -> Tuple[float, float]:
+    values = [float(value) for _, value in sorted(per_class_loss.items())]
     if not values:
-        return 0.0
-    threshold = 1.0 / max(1, len(burden))
-    focused = sorted(float(v) for v in burden.values() if float(v) >= threshold)
-    if not focused:
-        return max(values)
-    mid = len(focused) // 2
-    if len(focused) % 2:
-        return float(focused[mid])
-    return float(0.5 * (focused[mid - 1] + focused[mid]))
+        raise ValueError("Module C confirmation received no validation class losses.")
+    return sum(values) / float(len(values)), max(values)
 
 
-def _module_e_structural_residual_evidence(
-    args: Any,
-    train_snapshot: Mapping[str, Any],
-    val_snapshot: Mapping[str, Any],
-    burden: Mapping[int, float],
-    low_rank_fit: float,
-) -> Dict[str, Any]:
-    model_name = str(getattr(args, "model_name", "") or "")
-    train_profile, train_scope = _structural_branch_pressure_profile(train_snapshot, model_name)
-    val_profile, val_scope = _structural_branch_pressure_profile(val_snapshot, model_name)
-    imbalance = _structural_pressure_concentration(val_profile)
-    agreement = _structural_pressure_agreement(train_profile, val_profile)
-    fit = _clip01(low_rank_fit, default=0.0)
-    cap = _focused_burden_cap(args, burden)
-    residual_burden = float(cap * imbalance)
-    relief_lcb = float(agreement * fit)
+def prune_harmful_confirmation_additions(
+    selected_modules: Sequence[str],
+    primary_module: str,
+    full_per_class_loss: Mapping[int, float],
+    masked_per_class_loss: Mapping[str, Mapping[int, float]],
+) -> Tuple[Tuple[str, ...], Dict[str, Dict[str, Any]]]:
+    """Remove only added branches whose masking is Pareto-nonworse on validation.
+
+    The first selected module is protected to preserve Module C's nonempty
+    protocol. A later module is pruned only when masking it leaves both the
+    class-balanced mean loss and the worst-class loss no higher, with one
+    strictly lower. The numerical tolerance is floating-point housekeeping,
+    not a selectable method threshold.
+    """
+
+    selected = tuple(str(module_id).upper() for module_id in selected_modules)
+    if not selected:
+        raise ValueError("Module C confirmation cannot prune an empty selection.")
+    if selected[0] != str(primary_module).upper():
+        raise ValueError("Module C confirmation primary module must be the first selected module.")
+    full_classes = tuple(sorted(int(class_id) for class_id in full_per_class_loss))
+    full_mean, full_worst = _loss_metrics(full_per_class_loss)
+    diagnostics: Dict[str, Dict[str, Any]] = {
+        selected[0]: {
+            "checked": False,
+            "pruned": False,
+            "reason": "protected_primary_nonempty",
+        }
+    }
+    retained = [selected[0]]
+    for module_id in selected[1:]:
+        masked = masked_per_class_loss.get(module_id)
+        if masked is None or tuple(sorted(int(class_id) for class_id in masked)) != full_classes:
+            diagnostics[module_id] = {
+                "checked": False,
+                "pruned": False,
+                "reason": "missing_or_incomplete_masked_validation_loss",
+            }
+            retained.append(module_id)
+            continue
+        masked_mean, masked_worst = _loss_metrics(masked)
+        nonworse = masked_mean <= full_mean + _NUMERICAL_TOLERANCE and masked_worst <= full_worst + _NUMERICAL_TOLERANCE
+        strictly_better = masked_mean < full_mean - _NUMERICAL_TOLERANCE or masked_worst < full_worst - _NUMERICAL_TOLERANCE
+        pruned = bool(nonworse and strictly_better)
+        diagnostics[module_id] = {
+            "checked": True,
+            "pruned": pruned,
+            "full_mean_loss": float(full_mean),
+            "full_worst_class_loss": float(full_worst),
+            "masked_mean_loss": float(masked_mean),
+            "masked_worst_class_loss": float(masked_worst),
+            "reason": "masked_branch_pareto_nonworse" if pruned else "masked_branch_needed_or_inconclusive",
+        }
+        if not pruned:
+            retained.append(module_id)
+    return tuple(retained), diagnostics
+
+
+def _combined_effects(module_effects: Mapping[str, Mapping[int, float]], selected_modules: Sequence[str]) -> Dict[int, float]:
+    class_ids = tuple(sorted(next(iter(module_effects.values()))))
     return {
-        "functional_residual_id": MODULE_C_E_STRUCTURAL_RESIDUAL_ID,
-        "structural_branch_pressure_train": train_profile,
-        "structural_branch_pressure_val": val_profile,
-        "structural_pressure_scope_train": train_scope,
-        "structural_pressure_scope_val": val_scope,
-        "structural_imbalance": float(imbalance),
-        "structural_train_val_agreement": float(agreement),
-        "structural_low_rank_fit": float(fit),
-        "structural_residual_cap": float(cap),
-        "structural_residual_burden": float(residual_burden),
-        "structural_relief_lcb": float(relief_lcb),
-        "structural_residual_contribution": float(residual_burden * relief_lcb),
+        class_id: float(sum(float(module_effects[module_id][class_id]) for module_id in selected_modules))
+        for class_id in class_ids
     }
 
 
-def _build_rgfs_evidence(
+def _vector_norm(vectors: Mapping[str, torch.Tensor]) -> float:
+    total = 0.0
+    for vector in vectors.values():
+        total += float(vector.detach().float().pow(2).sum().item())
+    return float(total ** 0.5)
+
+
+def _module_e_reference_diagnostic(model: nn.Module, model_name: str) -> Dict[str, Any]:
+    branches = set()
+    for name in structural_inventory_from_model(str(model_name), model):
+        branch = module_e_branch_from_lora_param_name(str(model_name), name)
+        if branch in STRUCTURAL_ROUTING_BLOCKS:
+            branches.add(branch)
+    covered = tuple(sorted(branches))
+    return {
+        "structural_branches_observed": list(covered),
+        "structural_branch_count": len(covered),
+        "structural_reference_status": "identified" if len(covered) >= 2 else "not_identifiable",
+        "structural_reference_used_for_ranking": 0,
+    }
+
+
+def _build_diagnostics(
     args: Any,
+    model: nn.Module,
     candidate_modules: Sequence[str],
-    train_snap: Mapping[str, Mapping[str, Any]],
-    train_seen: int,
-    val_snap: Mapping[str, Mapping[str, Any]],
-    val_seen: int,
-    class_snaps: Mapping[int, Mapping[str, Mapping[str, Any]]],
-    class_seen: Mapping[int, int],
-    hard_classes: Sequence[int],
-    class_counts: Mapping[int, int],
-    class_loss_mean: Mapping[int, float],
-    adapter_param_counts: Mapping[str, int],
-    probe_param_counts: Mapping[str, int],
-) -> Tuple[Dict[str, Dict[str, Any]], Dict[Tuple[str, str], float], List[Dict[str, Any]], Dict[int, float], Dict[str, Dict[int, float]], Dict[str, Dict[int, float]], Dict[str, float], Dict[str, float], Dict[str, Dict[str, float]], Dict[str, Any]]:
-    class_ids = tuple(sorted(int(cls) for cls in class_loss_mean.keys()))
-    burden = _class_burden_from_loss(class_loss_mean)
-    train_energy = {m: float(train_snap[m]["energy"]) / max(1, train_seen) for m in candidate_modules}
-    val_energy = {m: float(val_snap[m]["energy"]) / max(1, val_seen) for m in candidate_modules}
-    per_param = {
-        m: (train_energy[m] + val_energy[m]) / max(1, int(probe_param_counts.get(m, 0)))
-        for m in candidate_modules
-    }
-    max_pressure = max([v for v in per_param.values() if v > 0.0], default=0.0)
-    complexity = _complexity_values(adapter_param_counts, candidate_modules)
-
-    relief_lcb: Dict[str, Dict[int, float]] = {m: {} for m in candidate_modules}
-    harm_lcb: Dict[str, Dict[int, float]] = {m: {} for m in candidate_modules}
-    functional_burden: Dict[str, float] = {}
-    functional_relief_lcb: Dict[str, Dict[str, float]] = {m: {} for m in candidate_modules}
-    relief_rows: List[Dict[str, Any]] = []
+    decision: ValidationRiskDecision,
+    module_effects: Mapping[str, Mapping[int, float]],
+    adapter_param_to_module: Mapping[str, str],
+    parameter_counts: Mapping[str, int],
+    support_gradients: Mapping[str, torch.Tensor],
+    virtual_updates: Mapping[str, Mapping[str, torch.Tensor]],
+    confirmation: Mapping[str, Any],
+) -> Dict[str, Dict[str, Any]]:
     diagnostics: Dict[str, Dict[str, Any]] = {}
-
     for module_id in candidate_modules:
-        lrf_info = _low_rank_evidence_from_snapshot(train_snap[module_id])
-        lrf = float(lrf_info["fit"])
-        train_vectors = train_snap[module_id].get("vectors", {})
-        val_vectors = val_snap[module_id].get("vectors", {})
-        train_val_cos = _cosine_named_vectors(train_vectors, val_vectors)
-        module_relief_sum = 0.0
-        module_harm_sum = 0.0
-        signed_lora_cos_by_class: Dict[int, float] = {}
-        signed_base_cos_by_class: Dict[int, float] = {}
-
-        for cls in class_ids:
-            cls_snap = class_snaps.get(int(cls), {})
-            cls_module_snap = cls_snap.get(module_id, {}) if cls_snap else {}
-            cls_vectors = cls_module_snap.get("vectors", {}) if cls_module_snap else {}
-            seen = int(class_seen.get(int(cls), 0))
-            margin = _confidence_margin(args, seen)
-
-            base_cos = _cosine_named_vectors(
-                _filter_named_vectors(train_vectors, "base"),
-                _filter_named_vectors(cls_vectors, "base"),
-            )
-            lora_cos = _cosine_named_vectors(
-                _filter_named_vectors(train_vectors, "lora"),
-                _filter_named_vectors(cls_vectors, "lora"),
-            )
-            base_lcb = base_cos - margin
-            base_ucb = base_cos + margin
-            lora_lcb = lora_cos - margin
-            lora_ucb = lora_cos + margin
-            relief = max(0.0, lrf * max(0.0, base_lcb), max(0.0, lora_lcb))
-            harm = max(0.0, -base_ucb, -lora_ucb)
-            relief_lcb[module_id][int(cls)] = float(relief)
-            harm_lcb[module_id][int(cls)] = float(harm)
-            module_relief_sum += float(burden.get(int(cls), 0.0)) * float(relief)
-            module_harm_sum += float(burden.get(int(cls), 0.0)) * float(harm)
-            signed_lora_cos_by_class[int(cls)] = float(lora_cos)
-            signed_base_cos_by_class[int(cls)] = float(base_cos)
-            relief_rows.append(
-                {
-                    "residual_type": "class",
-                    "module_id": module_id,
-                    "class_id": int(cls),
-                    "functional_residual_id": "",
-                    "class_count": int(class_counts.get(int(cls), 0)),
-                    "class_probe_batches": int(seen),
-                    "class_loss_mean": float(class_loss_mean.get(int(cls), 0.0)),
-                    "class_burden": float(burden.get(int(cls), 0.0)),
-                    "confidence_margin": float(margin),
-                    "low_rank_fit": float(lrf),
-                    "low_rank_coverage": float(lrf_info["coverage"]),
-                    "low_rank_status": str(lrf_info["status"]),
-                    "base_signed_cosine": float(base_cos),
-                    "base_relief_lcb": float(base_lcb),
-                    "lora_tangent_signed_cosine": float(lora_cos),
-                    "lora_tangent_relief_lcb": float(lora_lcb),
-                    "relief_lcb": float(relief),
-                    "harm_lcb": float(harm),
-                    "class_grad_energy": float(cls_module_snap.get("energy", 0.0)) / max(1, seen) if cls_module_snap else 0.0,
-                    "selection_rule": MODULE_C_PREFLIGHT_SELECTION_RULE,
-                    "test_used_for_selection": 0,
-                }
-            )
-
-        pressure_norm = 0.0 if max_pressure <= 0.0 else per_param[module_id] / max_pressure
-        pressure_gap = abs(train_energy[module_id] - val_energy[module_id]) / max(train_energy[module_id] + val_energy[module_id], 1e-12)
-        structural_diag: Dict[str, Any] = {}
-        if module_id == "E":
-            structural_diag = _module_e_structural_residual_evidence(
-                args=args,
-                train_snapshot=train_snap[module_id],
-                val_snapshot=val_snap[module_id],
-                burden=burden,
-                low_rank_fit=lrf,
-            )
-            structural_burden = float(structural_diag.get("structural_residual_burden", 0.0))
-            structural_relief = float(structural_diag.get("structural_relief_lcb", 0.0))
-            if structural_burden > 0.0 and structural_relief > 0.0:
-                functional_burden[MODULE_C_E_STRUCTURAL_RESIDUAL_ID] = structural_burden
-                functional_relief_lcb[module_id][MODULE_C_E_STRUCTURAL_RESIDUAL_ID] = structural_relief
-                relief_rows.append(
-                    {
-                        "residual_type": "functional",
-                        "module_id": module_id,
-                        "class_id": "",
-                        "functional_residual_id": MODULE_C_E_STRUCTURAL_RESIDUAL_ID,
-                        "class_count": "",
-                        "class_probe_batches": "",
-                        "class_loss_mean": "",
-                        "class_burden": "",
-                        "confidence_margin": "",
-                        "low_rank_fit": float(lrf),
-                        "low_rank_coverage": float(lrf_info["coverage"]),
-                        "low_rank_status": str(lrf_info["status"]),
-                        "base_signed_cosine": "",
-                        "base_relief_lcb": "",
-                        "lora_tangent_signed_cosine": "",
-                        "lora_tangent_relief_lcb": "",
-                        "relief_lcb": float(structural_relief),
-                        "harm_lcb": 0.0,
-                        "class_grad_energy": "",
-                        "structural_residual_burden": structural_burden,
-                        "structural_imbalance": float(structural_diag.get("structural_imbalance", 0.0)),
-                        "structural_train_val_agreement": float(structural_diag.get("structural_train_val_agreement", 0.0)),
-                        "structural_branch_pressure_train": json.dumps(structural_diag.get("structural_branch_pressure_train", {}), ensure_ascii=False),
-                        "structural_branch_pressure_val": json.dumps(structural_diag.get("structural_branch_pressure_val", {}), ensure_ascii=False),
-                        "selection_rule": MODULE_C_PREFLIGHT_SELECTION_RULE,
-                        "test_used_for_selection": 0,
-                    }
-                )
+        record = dict(decision.candidate_decisions[module_id])
+        module_vectors = {
+            name: value
+            for name, value in support_gradients.items()
+            if adapter_param_to_module.get(name) == module_id
+        }
         diagnostics[module_id] = {
             "module_id": module_id,
-            "metric_source": MODULE_C_PREFLIGHT_SELECTION_RULE,
-            "test_used_for_selection": 0,
-            "pressure": _clip01(pressure_norm),
-            "module_pressure_raw": per_param[module_id],
-            "low_rank_fit": float(lrf),
-            "low_rank_coverage": float(lrf_info["coverage"]),
-            "low_rank_status": str(lrf_info["status"]),
-            "low_rank_measured_energy": float(lrf_info["measured_energy"]),
-            "low_rank_relevant_energy": float(lrf_info["total_energy"]),
-            "low_rank_measured_tensors": int(lrf_info["measured_tensors"]),
-            "low_rank_skipped_tensors": int(lrf_info["skipped_tensors"]),
-            "train_val_signed_cosine": float(train_val_cos),
-            "train_val_agreement": max(0.0, float(train_val_cos)),
-            "train_val_mismatch_risk": _clip01(max(0.0, pressure_gap - 0.50) + max(0.0, -train_val_cos)),
-            "rgfs_weighted_relief": float(module_relief_sum),
-            "rgfs_weighted_harm": float(module_harm_sum),
-            "complexity": complexity.get(module_id, 1.0),
-            "train_grad_energy": train_energy[module_id],
-            "val_grad_energy": val_energy[module_id],
-            "adapter_param_count": int(adapter_param_counts.get(module_id, 0)),
-            "probe_param_count": int(probe_param_counts.get(module_id, 0)),
-            "focus_classes_by_validation_burden": ",".join(str(x) for x in hard_classes),
-            "focus_class_rule": "validation_loss_burden_at_or_above_uniform",
-            "class_loss_mean": json.dumps({str(k): v for k, v in sorted(class_loss_mean.items())}, ensure_ascii=False),
-            "class_burden": json.dumps({str(k): v for k, v in sorted(burden.items())}, ensure_ascii=False),
-            "relief_lcb_by_class": json.dumps({str(k): v for k, v in sorted(relief_lcb[module_id].items())}, ensure_ascii=False),
-            "harm_lcb_by_class": json.dumps({str(k): v for k, v in sorted(harm_lcb[module_id].items())}, ensure_ascii=False),
-            "signed_lora_cos_by_class": json.dumps({str(k): v for k, v in sorted(signed_lora_cos_by_class.items())}, ensure_ascii=False),
-            "signed_base_cos_by_class": json.dumps({str(k): v for k, v in sorted(signed_base_cos_by_class.items())}, ensure_ascii=False),
-            **{
-                key: json.dumps(value, ensure_ascii=False) if isinstance(value, dict) else value
-                for key, value in structural_diag.items()
-            },
+            "functional_name": DEFAULT_CANDIDATE_MODULES[module_id]["name"],
+            "functional_role": DEFAULT_CANDIDATE_MODULES[module_id]["role"],
+            "functional_blocks": list(DEFAULT_CANDIDATE_MODULES[module_id]["blocks"]),
+            "functional_diagnostics_role": "reference_only_not_used_for_ranking",
+            "adapter_parameter_count": int(parameter_counts.get(module_id, 0)),
+            "support_gradient_l2": _vector_norm(module_vectors),
+            "virtual_update_l2": _vector_norm(virtual_updates.get(module_id, {})),
+            "first_order_effect_by_class": {str(class_id): float(value) for class_id, value in module_effects[module_id].items()},
+            "mean_first_order_effect": float(record["overall_effect"]),
+            "worst_class_first_order_effect": float(record["worst_class_effect"]),
+            "primary_gate": record.get("gate", ""),
+            "dominated_by": list(record.get("dominated_by", ())),
+            "selected_before_confirmation": int(module_id in confirmation["selected_before"]),
+            "selected_after_confirmation": int(module_id in confirmation["selected_after"]),
+            "confirmation": dict(confirmation["pruning"].get(module_id, {})),
         }
-
-    overlap_scores: Dict[Tuple[str, str], float] = {}
-    overlap_payload: Dict[str, Any] = {
-        "selection_rule": MODULE_C_PREFLIGHT_SELECTION_RULE,
-        "residual_space": "class_plus_optional_functional",
-        "functional_burden": functional_burden,
-        "functional_relief_lcb": functional_relief_lcb,
-        "pairs": [],
-    }
-    for left, right in combinations(candidate_modules, 2):
-        cos = _cosine_float_vectors(relief_lcb.get(left, {}), relief_lcb.get(right, {}), class_ids)
-        overlap_scores[(left, right)] = float(cos)
-        overlap_payload["pairs"].append(
-            {
-                "left_module": left,
-                "right_module": right,
-                "relief_profile_cosine": float(cos),
-                "redundancy_level": "high" if cos >= 0.85 else "low",
-                "complementarity_level": "high" if cos <= 0.35 else "medium" if cos <= 0.70 else "low",
-            }
-        )
-    return diagnostics, overlap_scores, relief_rows, burden, relief_lcb, harm_lcb, complexity, functional_burden, functional_relief_lcb, overlap_payload
+        if module_id == "E":
+            diagnostics[module_id].update(_module_e_reference_diagnostic(model, str(getattr(args, "model_name", ""))))
+    return diagnostics
 
 
-def _write_csv(path: str, rows: Sequence[Mapping[str, Any]]) -> Optional[str]:
+def _write_csv(path: str, rows: Sequence[Mapping[str, Any]]) -> str:
     if not path or not rows:
-        return None
+        return ""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    keys: List[str] = []
+    fields: List[str] = []
     for row in rows:
-        for key in row.keys():
-            if key not in keys:
-                keys.append(key)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
+        for key in row:
+            if key not in fields:
+                fields.append(key)
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for row in rows:
-            writer.writerow(dict(row))
+            writer.writerow(
+                {
+                    key: json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list, tuple)) else value
+                    for key, value in row.items()
+                }
+            )
     return path
 
 
-def _write_json(path: str, payload: Mapping[str, Any]) -> Optional[str]:
+def _write_json(path: str, payload: Mapping[str, Any]) -> str:
     if not path:
-        return None
+        return ""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
     return path
 
 
 def _write_decision_json(
     path: str,
     args: Any,
-    decision: RGFSDecision,
+    decision: ValidationRiskDecision,
+    candidate_modules: Sequence[str],
     diagnostics: Mapping[str, Mapping[str, Any]],
-    overlap_scores: Mapping[Tuple[str, str], float],
-    action_overlap: Mapping[str, Any],
+    confirmation: Mapping[str, Any],
+    validation_class_counts: Mapping[int, int],
+    parameter_counts: Mapping[str, int],
     replaced_modules: Sequence[str],
-    relief_csv_path: str = "",
-    action_overlap_json_path: str = "",
-) -> Optional[str]:
-    if not path:
-        return None
-    candidate_modules = parse_module_ids(getattr(args, "module_c_candidates", "B,D,E"))
+) -> str:
     recipe = build_module_c_recipe(
         decision.selected_modules,
         registry=DEFAULT_CANDIDATE_MODULES,
         candidate_modules=candidate_modules,
-        module_scores={m: decision.candidate_decisions.get(m, {}).get("focus_marginal_gain", 0.0) for m in candidate_modules},
+        module_scores={module_id: decision.candidate_decisions[module_id]["overall_effect"] for module_id in candidate_modules},
     )
-    train_batch_cap = int(getattr(args, "module_c_preflight_train_batches", 0))
-    val_batch_cap = int(getattr(args, "module_c_preflight_val_batches", 0))
-    policy_config = {
-        **rgfs_config_dict(
-            RGFSConfig(
-                min_marginal_gain=float(getattr(args, "module_c_preflight_min_score", 0.0)),
-                tie_tolerance=float(getattr(args, "module_c_preflight_margin", 0.0)),
-                harm_veto_threshold=float(getattr(args, "module_c_rgfs_harm_threshold", 0.0)),
-                focus_burden_ratio=float(getattr(args, "module_c_rgfs_focus_ratio", 1.0)),
-                allow_empty=False,
-            )
-        ),
-        "train_batch_cap": train_batch_cap,
-        "val_batch_cap": val_batch_cap,
-        "probe_scope": "formal_full_split" if train_batch_cap <= 0 and val_batch_cap <= 0 else "debug_batch_cap",
-        "probe_head_steps": max(0, int(getattr(args, "module_c_probe_head_steps", 3))),
-        "probe_head_lr": float(getattr(args, "module_c_probe_head_lr", 1e-3)),
-        "relief_confidence_scale": float(getattr(args, "module_c_rgfs_confidence_scale", 0.0)),
-        "svd_max_numel": int(getattr(args, "module_c_preflight_svd_max_numel", 1000000)),
-        "functional_residual_role": "bounded_module_specific_residual",
-        "e_structural_residual_id": MODULE_C_E_STRUCTURAL_RESIDUAL_ID,
-        "e_structural_residual_definition": "branch_pressure_concentration_times_train_val_agreement_and_low_rank_fit",
-        "e_structural_residual_bound": "median_class_burden_at_or_above_uniform",
-        "test_used_for_selection": 0,
-    }
+    train_cap = int(getattr(args, "module_c_preflight_train_batches", 0))
+    val_cap = int(getattr(args, "module_c_preflight_val_batches", 0))
     payload = {
         "module_c_selection_rule": MODULE_C_PREFLIGHT_SELECTION_RULE,
         "test_used_for_selection": 0,
@@ -1089,28 +699,44 @@ def _write_decision_json(
         "subject_mod": str(getattr(args, "subject_mod", "") or ""),
         "k_shot": getattr(args, "k_shot", ""),
         "seed": getattr(args, "seed", ""),
-        "candidate_modules": candidate_modules,
+        "candidate_modules": list(candidate_modules),
         "selected_modules": list(decision.selected_modules),
-        "selected_score": float(decision.selected_score),
-        "reason": decision.reason,
-        "policy_config": policy_config,
-        "class_burden": {str(k): float(v) for k, v in decision.class_burden.items()},
-        "class_coverage": {str(k): float(v) for k, v in decision.class_coverage.items()},
-        "functional_burden": {str(k): float(v) for k, v in decision.functional_burden.items()},
-        "functional_coverage": {str(k): float(v) for k, v in decision.functional_coverage.items()},
-        "focus_classes": list(decision.focus_classes),
+        "forced_nonempty": bool(decision.forced_nonempty),
+        "selection_reason": decision.reason,
+        "first_order_effect_definition": "q[a,c] = -sum_p <grad_validation[a,c,p], virtual_update[a,p]>",
+        "effect_sign": "positive predicts lower validation loss for that class",
+        "primary_rule": "safe non-dominated action, then highest class-balanced mean effect, highest worst-class effect, and fewer adapter parameters",
+        "addition_rule": "add only when class-balanced mean effect rises and worst-class effect does not fall",
+        "nonempty_rule": "if no safe action exists, select the least-harmful B/D/E action by worst-class effect",
+        "confirmation_rule": "after one support optimizer update, prune only added branches whose masking is Pareto-nonworse on class-balanced and worst-class validation loss",
+        "numerical_tolerance": _NUMERICAL_TOLERANCE,
+        "optimizer_for_virtual_and_confirmation_step": {
+            "name": str(getattr(args, "opt", "")),
+            "lr": float(getattr(args, "lr", 0.0)),
+            "weight_decay": float(getattr(args, "weight_decay", 0.0)),
+            "layer_decay": float(getattr(args, "layer_decay", 1.0)),
+            "clip_grad": getattr(args, "clip_grad", None),
+            "lr_rule": "configured base learning rate times the final model layer scale, before epoch scheduling",
+        },
+        "probe_scope": {
+            "support_batch_cap": train_cap,
+            "validation_batch_cap": val_cap,
+            "support_split": "full" if train_cap <= 0 else "debug_capped",
+            "validation_split": "full" if val_cap <= 0 else "debug_capped",
+            "model_mode": "eval",
+            "probe_adapter_dropout": 0.0,
+            "validation_class_counts": {str(class_id): int(count) for class_id, count in validation_class_counts.items()},
+        },
+        "parameter_counts": {module_id: int(parameter_counts.get(module_id, 0)) for module_id in candidate_modules},
         "candidate_decisions": decision.candidate_decisions,
         "search_steps": list(decision.search_steps),
-        "module_scores": {m: float(decision.candidate_decisions.get(m, {}).get("focus_marginal_gain", 0.0)) for m in candidate_modules},
-        "subset_scores": {"+".join(decision.selected_modules) if decision.selected_modules else "none": float(decision.selected_score)},
-        "interaction_scores": {"+".join(key): float(value) for key, value in overlap_scores.items()},
-        "action_overlap": action_overlap,
+        "predicted_selected_effect_by_class": {str(class_id): float(value) for class_id, value in decision.per_class_effect.items()},
+        "predicted_class_balanced_effect": float(decision.overall_effect),
+        "predicted_worst_class_effect": float(decision.worst_class_effect),
+        "confirmation": confirmation,
         "diagnostics_by_module": diagnostics,
-        "relief_csv_path": relief_csv_path,
-        "action_overlap_json_path": action_overlap_json_path,
         "replaced_probe_modules": list(replaced_modules),
         "recipe": recipe,
-        "qv_qvffn_role": "baseline_control_only_not_module_c_candidate",
     }
     return _write_json(path, payload)
 
@@ -1124,183 +750,178 @@ def run_module_c_preflight_selection(
     criterion_builder: Optional[Callable[[Any, torch.device], nn.Module]] = None,
     is_main_process: bool = True,
 ) -> ModuleCPreflightResult:
-    """Resolve Module C selected modules with a zero-update RGFS probe.
+    """Resolve a nonempty B/D/E subset before the real LoRA model is built."""
 
-    The caller passes a disposable model. This function may briefly calibrate
-    the disposable task head and insert temporary probe adapters, but it never
-    updates or reuses the final training model.
-    """
+    if str(getattr(args, "task_mod", "")) != "Classification" or int(getattr(args, "nb_classes", 0)) < 3:
+        raise ValueError("Module C validation-risk selection supports only classification tasks with at least three classes.")
     candidate_modules = tuple(parse_module_ids(getattr(args, "module_c_candidates", "B,D,E")))
-    candidate_modules = tuple(m for m in candidate_modules if not is_module_c_baseline_candidate(m))
     if not candidate_modules:
-        raise RuntimeError("Module C preflight has no valid candidate modules after excluding qv-style baselines.")
-    if data_loader_train is None:
-        raise RuntimeError("Module C preflight requires a training dataloader.")
+        raise RuntimeError("Module C requires at least one B/D/E candidate.")
+    if data_loader_train is None or data_loader_val is None:
+        raise RuntimeError("Module C preflight requires distinct support/train and validation dataloaders.")
 
-    train_batches = _collect_probe_batches(
-        data_loader_train,
-        int(getattr(args, "module_c_preflight_train_batches", 0)),
-    )
-    val_batches = _collect_probe_batches(
-        data_loader_val if data_loader_val is not None else data_loader_train,
-        int(getattr(args, "module_c_preflight_val_batches", 0)),
-    )
+    train_batches = _collect_probe_batches(data_loader_train, int(getattr(args, "module_c_preflight_train_batches", 0)))
+    val_batches = _collect_probe_batches(data_loader_val, int(getattr(args, "module_c_preflight_val_batches", 0)))
     if not train_batches or not val_batches:
-        raise RuntimeError("Module C preflight could not collect train/validation probe batches.")
+        raise RuntimeError("Module C preflight could not collect both support and validation batches.")
 
     original_training = bool(model.training)
-    model.to(device)
-    model.eval()
-    criterion = criterion_builder(args, device) if criterion_builder is not None else _default_criterion(args, device)
-    head_steps_completed = _calibrate_probe_head(args, model, train_batches, device, criterion)
-    model.eval()
-
-    replaced = apply_lora_to_eegfm(
-        model=model,
-        model_name=str(getattr(args, "model_name", "")),
-        lora_target="module_c",
-        module_c_selected=candidate_modules,
-        r=int(getattr(args, "lora_rank", 4)),
-        alpha=float(getattr(args, "lora_alpha", 8.0)),
-        dropout=float(getattr(args, "module_c_preflight_dropout", 0.0)),
-        verbose=False,
-    )
-    if not replaced:
-        raise RuntimeError(
-            f"Module C preflight injected no probe adapters for model={getattr(args, 'model_name', '')}, "
-            f"candidates={','.join(candidate_modules)}."
-        )
-    model.to(device)
-
-    param_to_module, adapter_param_counts, probe_param_counts = _build_param_to_module(
-        model=model,
-        model_name=str(getattr(args, "model_name", "")),
-        candidate_modules=candidate_modules,
-        replaced_modules=replaced,
-    )
-    if not param_to_module:
-        raise RuntimeError("Module C preflight could not map probe parameters back to candidate modules.")
-    _configure_probe_trainability(model, param_to_module)
-
-    rank = int(getattr(args, "lora_rank", 4))
-    svd_max_numel = int(getattr(args, "module_c_preflight_svd_max_numel", 1000000))
-
+    original_requires_grad = {name: bool(parameter.requires_grad) for name, parameter in model.named_parameters()}
     try:
-        train_snap, train_seen = _backward_batches(
-            args, model, train_batches, device, criterion, param_to_module, candidate_modules, rank, svd_max_numel
+        model.to(device)
+        replaced = apply_lora_to_eegfm(
+            model=model,
+            model_name=str(getattr(args, "model_name", "")),
+            lora_target="module_c",
+            module_c_selected=candidate_modules,
+            module_b_sites=getattr(args, "module_b_sites", "both"),
+            r=int(getattr(args, "lora_rank", 4)),
+            alpha=float(getattr(args, "lora_alpha", 8.0)),
+            dropout=0.0,
+            verbose=False,
         )
-        val_snap, val_seen = _backward_batches(
-            args, model, val_batches, device, criterion, param_to_module, candidate_modules, rank, svd_max_numel
+        if not replaced:
+            raise RuntimeError(
+                f"Module C preflight injected no B/D/E probe adapters for model={getattr(args, 'model_name', '')}."
+            )
+        model.eval()
+        adapter_param_to_module, parameter_counts = _build_adapter_param_to_module(
+            model=model,
+            model_name=str(getattr(args, "model_name", "")),
+            candidate_modules=candidate_modules,
+            replaced_modules=replaced,
         )
-        hard_classes, class_counts, class_loss_mean = _validation_class_stats(args, model, val_batches, device)
-        profile_classes = tuple(sorted(class_counts.keys()))
-        class_snaps, class_seen = _class_gradient_snapshots(
-            args, model, val_batches, device, criterion, param_to_module, candidate_modules, rank, svd_max_numel,
-            classes=profile_classes,
+        if not adapter_param_to_module:
+            raise RuntimeError("Module C preflight could not map injected LoRA adapter parameters to B/D/E.")
+        _configure_adapter_trainability(model, adapter_param_to_module)
+        named_parameters = _named_adapter_parameters(model, adapter_param_to_module)
+        criterion = criterion_builder(args, device) if criterion_builder is not None else _default_criterion(args, device)
+
+        support_gradients = _full_support_gradients(
+            args, model, train_batches, device, criterion, named_parameters
+        )
+        virtual_updates: Dict[str, Dict[str, torch.Tensor]] = {}
+        for module_id in candidate_modules:
+            virtual_updates[module_id] = _optimizer_step_from_gradients(
+                args=args,
+                model=model,
+                named_parameters=named_parameters,
+                adapter_param_to_module=adapter_param_to_module,
+                gradients=support_gradients,
+                selected_modules=(module_id,),
+                restore_parameters=True,
+            ).get(module_id, {})
+
+        validation_gradients, validation_class_counts = _class_grouped_validation_gradients(
+            args=args,
+            model=model,
+            batches=val_batches,
+            device=device,
+            named_parameters=named_parameters,
+            adapter_param_to_module=adapter_param_to_module,
+            candidate_modules=candidate_modules,
+        )
+        module_effects = first_order_effects_from_snapshots(validation_gradients, virtual_updates)
+        decision = select_validation_risk_subset(module_effects, parameter_counts)
+        selected_before = tuple(decision.selected_modules)
+
+        _optimizer_step_from_gradients(
+            args=args,
+            model=model,
+            named_parameters=named_parameters,
+            adapter_param_to_module=adapter_param_to_module,
+            gradients=support_gradients,
+            selected_modules=selected_before,
+            restore_parameters=False,
+        )
+        full_validation_loss = _classwise_validation_loss(args, model, val_batches, device)
+        masked_validation_loss: Dict[str, Dict[int, float]] = {}
+        for module_id in selected_before[1:]:
+            with _masked_module_adapter(model, adapter_param_to_module, module_id):
+                masked_validation_loss[module_id] = _classwise_validation_loss(args, model, val_batches, device)
+        selected_after, pruning = prune_harmful_confirmation_additions(
+            selected_modules=selected_before,
+            primary_module=selected_before[0],
+            full_per_class_loss=full_validation_loss,
+            masked_per_class_loss=masked_validation_loss,
+        )
+        for module_id, record in decision.candidate_decisions.items():
+            record["selected_before_confirmation"] = int(module_id in selected_before)
+            record["selected_after_confirmation"] = int(module_id in selected_after)
+            record["selected"] = int(module_id in selected_after)
+        if selected_after != selected_before:
+            confirmed_effect = _combined_effects(module_effects, selected_after)
+            confirmed_mean = sum(confirmed_effect.values()) / float(len(confirmed_effect))
+            confirmed_worst = min(confirmed_effect.values())
+            decision = replace(
+                decision,
+                selected_modules=selected_after,
+                per_class_effect=confirmed_effect,
+                overall_effect=float(confirmed_mean),
+                worst_class_effect=float(confirmed_worst),
+                reason=f"{decision.reason}_confirmation_pruned",
+            )
+        confirmation = {
+            "selected_before": list(selected_before),
+            "selected_after": list(selected_after),
+            "full_per_class_loss": {str(class_id): float(value) for class_id, value in full_validation_loss.items()},
+            "masked_per_class_loss": {
+                module_id: {str(class_id): float(value) for class_id, value in per_class.items()}
+                for module_id, per_class in masked_validation_loss.items()
+            },
+            "pruning": pruning,
+        }
+        diagnostics = _build_diagnostics(
+            args=args,
+            model=model,
+            candidate_modules=candidate_modules,
+            decision=decision,
+            module_effects=module_effects,
+            adapter_param_to_module=adapter_param_to_module,
+            parameter_counts=parameter_counts,
+            support_gradients=support_gradients,
+            virtual_updates=virtual_updates,
+            confirmation=confirmation,
+        )
+
+        setattr(args, "module_c_enable", True)
+        setattr(args, "module_c_resolved_candidates", ",".join(candidate_modules))
+        setattr(args, "module_c_resolved_selected", ",".join(decision.selected_modules))
+        setattr(args, "module_c_selection_rule", MODULE_C_PREFLIGHT_SELECTION_RULE)
+
+        output_dir = str(getattr(args, "output_dir", "") or "")
+        score_path = ""
+        decision_path = ""
+        if is_main_process and output_dir:
+            score_rows = [diagnostics[module_id] for module_id in candidate_modules]
+            score_path = _write_csv(os.path.join(output_dir, MODULE_C_PREFLIGHT_SCORE_FILE), score_rows)
+            decision_path = _write_decision_json(
+                path=os.path.join(output_dir, MODULE_C_PREFLIGHT_DECISION_FILE),
+                args=args,
+                decision=decision,
+                candidate_modules=candidate_modules,
+                diagnostics=diagnostics,
+                confirmation=confirmation,
+                validation_class_counts=validation_class_counts,
+                parameter_counts=parameter_counts,
+                replaced_modules=replaced,
+            )
+        print(
+            "[ModuleC] validation-risk selected "
+            f"{','.join(decision.selected_modules)} ({decision.reason}); "
+            f"predicted mean={decision.overall_effect:.6g}, worst={decision.worst_class_effect:.6g}."
+        )
+        return ModuleCPreflightResult(
+            decision=decision,
+            diagnostics_by_module=diagnostics,
+            replaced_modules=tuple(replaced),
+            score_csv_path=score_path,
+            decision_json_path=decision_path,
         )
     finally:
         model.zero_grad(set_to_none=True)
         model.train(original_training)
-
-    diagnostics, overlap_scores, relief_rows, burden, relief_lcb, harm_lcb, complexity, functional_burden, functional_relief_lcb, action_overlap = _build_rgfs_evidence(
-        args=args,
-        candidate_modules=candidate_modules,
-        train_snap=train_snap,
-        train_seen=train_seen,
-        val_snap=val_snap,
-        val_seen=val_seen,
-        class_snaps=class_snaps,
-        class_seen=class_seen,
-        hard_classes=hard_classes,
-        class_counts=class_counts,
-        class_loss_mean=class_loss_mean,
-        adapter_param_counts=adapter_param_counts,
-        probe_param_counts=probe_param_counts,
-    )
-
-    config = RGFSConfig(
-        min_marginal_gain=float(getattr(args, "module_c_preflight_min_score", 0.0)),
-        tie_tolerance=float(getattr(args, "module_c_preflight_margin", 0.0)),
-        harm_veto_threshold=float(getattr(args, "module_c_rgfs_harm_threshold", 0.0)),
-        focus_burden_ratio=float(getattr(args, "module_c_rgfs_focus_ratio", 1.0)),
-        allow_empty=False,
-    )
-    decision = select_rgfs_subset(
-        module_ids=candidate_modules,
-        class_ids=sorted(burden.keys()),
-        burden=burden,
-        relief_lcb=relief_lcb,
-        harm_lcb=harm_lcb,
-        complexity=complexity,
-        config=config,
-        functional_burden=functional_burden,
-        functional_relief_lcb=functional_relief_lcb,
-    )
-
-    for module_id, record in decision.candidate_decisions.items():
-        if module_id in diagnostics:
-            diagnostics[module_id].update(
-                {
-                    "rgfs_gate": record.get("gate", ""),
-                    "rgfs_focus_marginal_gain": record.get("focus_marginal_gain", 0.0),
-                    "rgfs_marginal_gain": record.get("marginal_gain", 0.0),
-                    "rgfs_class_marginal_gain": record.get("class_marginal_gain", 0.0),
-                    "rgfs_focus_class_marginal_gain": record.get("focus_class_marginal_gain", 0.0),
-                    "rgfs_functional_marginal_gain": record.get("functional_marginal_gain", 0.0),
-                    "rgfs_blocked_harm_classes": ",".join(str(x) for x in record.get("blocked_harm_classes", ())),
-                    "rgfs_selected": int(module_id in decision.selected_modules),
-                    "probe_head_steps_completed": int(head_steps_completed),
-                }
-            )
-
-    selected = tuple(decision.selected_modules)
-    setattr(args, "module_c_enable", True)
-    setattr(args, "module_c_resolved_candidates", ",".join(candidate_modules))
-    setattr(args, "module_c_resolved_selected", ",".join(selected))
-    setattr(args, "module_c_selection_rule", MODULE_C_PREFLIGHT_SELECTION_RULE)
-    setattr(args, "module_c_preflight_selected_modules", ",".join(selected))
-
-    output_dir = str(getattr(args, "output_dir", "") or "").strip()
-    diag_dir = os.path.join(output_dir, "diagnostics") if output_dir else ""
-    score_path = os.path.join(diag_dir, MODULE_C_PREFLIGHT_SCORE_FILE) if diag_dir else ""
-    interaction_path = os.path.join(diag_dir, MODULE_C_PREFLIGHT_INTERACTION_FILE) if diag_dir else ""
-    decision_path = os.path.join(diag_dir, MODULE_C_PREFLIGHT_DECISION_FILE) if diag_dir else ""
-    relief_path = os.path.join(diag_dir, MODULE_C_RGFS_RELIEF_FILE) if diag_dir else ""
-    overlap_path = os.path.join(diag_dir, MODULE_C_ACTION_OVERLAP_FILE) if diag_dir else ""
-
-    if is_main_process:
-        score_rows = [diagnostics[m] for m in candidate_modules if m in diagnostics]
-        interaction_rows = [
-            {
-                "left_module": left,
-                "right_module": right,
-                "relief_profile_cosine": float(value),
-                "selection_rule": MODULE_C_PREFLIGHT_SELECTION_RULE,
-                "test_used_for_selection": 0,
-            }
-            for (left, right), value in sorted(overlap_scores.items())
-        ]
-        _write_csv(score_path, score_rows)
-        _write_csv(interaction_path, interaction_rows)
-        _write_csv(relief_path, relief_rows)
-        _write_json(overlap_path, action_overlap)
-        _write_decision_json(decision_path, args, decision, diagnostics, overlap_scores, action_overlap, replaced, relief_path, overlap_path)
-        print(f"[ModuleC] RGFS relief saved to: {relief_path}")
-        print(f"[ModuleC] RGFS decision saved to: {decision_path}")
-
-    if selected:
-        print(f"[ModuleC] RGFS selected modules: {','.join(selected)} ({decision.reason})")
-    else:
-        print("[ModuleC][WARN] RGFS selected no B/D/E modules even though empty selection is disabled.")
-
-    return ModuleCPreflightResult(
-        decision=decision,
-        diagnostics_by_module=diagnostics,
-        interaction_scores=overlap_scores,
-        replaced_modules=tuple(replaced),
-        score_csv_path=score_path,
-        interaction_csv_path=interaction_path,
-        decision_json_path=decision_path,
-        relief_csv_path=relief_path,
-        action_overlap_json_path=overlap_path,
-    )
+        current_parameters = dict(model.named_parameters())
+        for name, requires_grad in original_requires_grad.items():
+            if name in current_parameters:
+                current_parameters[name].requires_grad_(requires_grad)

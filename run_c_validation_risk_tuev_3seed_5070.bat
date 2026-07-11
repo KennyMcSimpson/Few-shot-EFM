@@ -3,9 +3,9 @@ setlocal enabledelayedexpansion
 
 cd /d D:\code\codepy\EEG_code\AdaBrain-Bench-main
 
-rem Formal Module C/RGFS-v2 TUEV 3-seed runner.
-rem This file does not encode an empty-C option. Current code enforces
-rem non-empty B/D/E selection through RGFS forced fallback when needed.
+rem Formal Module C validation-risk TUEV 3-seed runner.
+rem Module C always selects a nonempty B/D/E subset from support and
+rem validation data before the final LoRA model is created.
 
 set "PY=C:\Users\Kenny\.conda\envs\EEG\python.exe"
 set "DATASET=TUEV"
@@ -20,8 +20,6 @@ set "SEEDS=0 1 2"
 
 set "C_PREFLIGHT_TRAIN_BATCHES=0"
 set "C_PREFLIGHT_VAL_BATCHES=0"
-set "C_PROBE_HEAD_STEPS=3"
-set "C_PROBE_HEAD_LR=1e-3"
 
 rem Seed-specific fewshot Full-FT references are used only if present.
 rem Keep this at 0 for the cleanest 3-seed protocol. Set to 1 only if you
@@ -36,7 +34,7 @@ set "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 set "OMP_NUM_THREADS=4"
 
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "STAMP=%%i"
-set "COL_C=col_c_rgfs_tuev_3seed_5070_formal_v2_%STAMP%"
+set "COL_C=col_c_validation_risk_tuev_3seed_5070_%STAMP%"
 
 set "DRYRUN=0"
 if /I "%~1"=="--dry-run" set "DRYRUN=1"
@@ -45,18 +43,18 @@ set "SELECT_ARGS=--best_metric balanced_accuracy --selection_worst_alpha 0.35 --
 set "DIAG_ARGS=--monitor_dynamics --eval_train_set --diag_freq 5 --save_epoch_ckpt_freq 999"
 set "ASWA_ARGS=--adaptive_swa_eval --adaptive_swa_epoch_min 1 --adaptive_swa_epoch_max 30 --adaptive_swa_min_len 3 --adaptive_swa_max_len 8 --adaptive_swa_stride 1 --adaptive_swa_select_metric selection_bacc_min02_std --adaptive_swa_profile generic --adaptive_swa_balance_lambda 0.10 --adaptive_swa_hard_classes 0,2 --adaptive_swa_hard_floor 0.05 --adaptive_swa_hard_floor_lambda 0.20 --adaptive_swa_std_lambda 0.04 --adaptive_swa_tie_mode hard_stable --adaptive_swa_tie_eps 0.002"
 set "LORA_ARGS=--finetune_mod lora --lora_base_update full --lora_rank 4 --lora_alpha 8 --lora_dropout 0.1"
-set "C_ARGS=--lora_target module_c --module_c_candidates B,D,E --module_c_preflight_train_batches %C_PREFLIGHT_TRAIN_BATCHES% --module_c_preflight_val_batches %C_PREFLIGHT_VAL_BATCHES% --module_c_probe_head_steps %C_PROBE_HEAD_STEPS% --module_c_probe_head_lr %C_PROBE_HEAD_LR%"
+set "C_ARGS=--lora_target module_c --module_c_candidates B,D,E --module_c_preflight_train_batches %C_PREFLIGHT_TRAIN_BATCHES% --module_c_preflight_val_batches %C_PREFLIGHT_VAL_BATCHES%"
 set "FB_ARGS=--fb_enable --fb_probe --fb_recipe manual --fb_split_check --fb_collect --fb_collect_name %COL_C%"
 set "MODULE_BE_ARGS=--module_b_sites both --module_e_mode dynamic_pressure_gate --module_e_warmup_steps 0"
 
-echo [RUN] Formal Module C/RGFS-v2 TUEV 3-seed runner
+echo [RUN] Formal Module C validation-risk TUEV 3-seed runner
 echo [RUN] Root: %CD%
 echo [RUN] Dataset: %DATASET%
 echo [RUN] GPU: RTX 5070 profile, CUDA_VISIBLE_DEVICES=%CUDA_VISIBLE_DEVICES%
 echo [RUN] seeds=%SEEDS%
 echo [RUN] num_workers=%NUM_WORKERS% loader_prefetch_factor=%LOADER_PREFETCH% batch_size=%BATCH_SIZE%
 echo [RUN] Module C preflight train/val batch caps=%C_PREFLIGHT_TRAIN_BATCHES%/%C_PREFLIGHT_VAL_BATCHES% ^(0/0 means full train/val split^)
-echo [RUN] C candidates=B,D,E; empty selection is disabled in current Module C code.
+echo [RUN] Module C candidates=B,D,E; the selector never emits an empty set.
 echo [RUN] Collection: %COL_C%
 if "%DRYRUN%"=="1" echo [RUN] DRY RUN: commands will be printed only.
 echo.
@@ -73,7 +71,7 @@ if "%DRYRUN%"=="0" (
   mkdir "%COL_C%"
   echo model,seed,dataset,phase,subject_mod,finetune_mod,lora_target,module_c_candidates,preflight_train_batches,preflight_val_batches,reference_csv,run_tag,status,return_code>"%COL_C%\run_status.csv"
   if not exist "runner_logs" mkdir "runner_logs"
-  echo %COL_C%>runner_logs\c_rgfs_tuev_3seed_5070_formal_v2_latest.txt
+  echo %COL_C%>runner_logs\c_validation_risk_tuev_3seed_5070_latest.txt
 ) else (
   echo [DRYRUN] would create %COL_C%
 )
@@ -94,7 +92,7 @@ if "%DRYRUN%"=="0" (
 )
 
 echo.
-echo [RUN] Formal C/RGFS-v2 TUEV 3-seed runner finished. Collection: %COL_C%
+echo [RUN] Formal Module C validation-risk TUEV 3-seed runner finished. Collection: %COL_C%
 echo [RUN] Failed runs: %FAIL_COUNT%
 if not "%FAIL_COUNT%"=="0" exit /b 1
 exit /b 0
@@ -135,17 +133,17 @@ exit /b 0
 set "MODEL=%~1"
 set "PREFIX=%~2"
 set "SEED=%~3"
-set "TAG=%PREFIX%_c_rgfs_tuev_formal_v2_s%SEED%_%STAMP%"
+set "TAG=%PREFIX%_c_validation_risk_tuev_s%SEED%_%STAMP%"
 call :set_extra "%MODEL%"
 call :set_reference_args "%PREFIX%" "%SEED%"
 set "COMMON_ARGS=--dataset %DATASET% --task_mod Classification --k_shot %KSHOT% --epochs %EPOCHS% --batch_size %BATCH_SIZE% --lr %LR% --weight_decay %WEIGHT_DECAY% --num_workers %NUM_WORKERS% --loader_prefetch_factor %LOADER_PREFETCH% --seed %SEED%"
 
 echo.
-echo [C-RGFSv2+A] model=%MODEL% seed=%SEED% tag=%TAG%
+echo [C-Risk+A] model=%MODEL% seed=%SEED% tag=%TAG%
 if "%REF%"=="" (
-  echo [C-RGFSv2+A] no seed-specific reference CSV found; skipping Module D SBR eval for this run.
+  echo [C-Risk+A] no seed-specific reference CSV found; skipping Module D SBR eval for this run.
 ) else (
-  echo [C-RGFSv2+A] reference=%REF%
+  echo [C-Risk+A] reference=%REF%
 )
 
 if "%DRYRUN%"=="1" (
