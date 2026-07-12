@@ -656,6 +656,87 @@ class ModuleEDynamicPressureTests(unittest.TestCase):
         self.assertEqual(controller.events[2][0], "finish")
         self.assertTrue(controller.events[2][2])
 
+    def test_module_c_probe_applies_epoch_zero_schedule_before_controller_prepare(self):
+        class _ScheduleRecordingController(_RecordingController):
+            def __init__(self):
+                super().__init__()
+                self.prepare_groups = []
+
+            def bind_optimizer(self, optimizer):
+                super().bind_optimizer(optimizer)
+                for group in optimizer.param_groups:
+                    group["lr_scale"] = 0.5
+
+            def prepare_optimizer_step(self, optimizer, global_step=None, epoch=None):
+                self.prepare_groups.append(
+                    tuple(
+                        {
+                            "lr": float(group["lr"]),
+                            "weight_decay": float(group["weight_decay"]),
+                            "lr_scale": float(group["lr_scale"]),
+                        }
+                        for group in optimizer.param_groups
+                    )
+                )
+                super().prepare_optimizer_step(
+                    optimizer, global_step=global_step, epoch=epoch
+                )
+
+        args = SimpleNamespace(
+            model_name="Tiny",
+            layer_decay=1.0,
+            opt="sgd",
+            lr=0.1,
+            weight_decay=0.2,
+            opt_eps=None,
+            opt_betas=None,
+            momentum=0.9,
+            update_freq=2,
+            clip_grad=None,
+            norm_method="",
+            nb_classes=2,
+        )
+        model = _ProbeModel()
+        forward_calls = []
+        forward_handle = model.register_forward_hook(
+            lambda _module, _inputs, _output: forward_calls.append(1)
+        )
+        controller = _ScheduleRecordingController()
+        batches = [
+            (torch.randn(3, 4), torch.tensor([0, 1, 0]))
+            for _ in range(4)
+        ]
+
+        try:
+            _loss, examples, optimizer_steps = _run_support_pass(
+                args,
+                model,
+                batches,
+                torch.device("cpu"),
+                nn.CrossEntropyLoss(),
+                controller=controller,
+                lr_schedule_values=[0.04, 0.02],
+                wd_schedule_values=[0.03, 0.01],
+            )
+        finally:
+            forward_handle.remove()
+
+        self.assertEqual(len(forward_calls), 4)
+        self.assertEqual(examples, 12)
+        self.assertEqual(optimizer_steps, 2)
+        self.assertEqual(len(controller.prepare_groups), 2)
+        for groups, expected_lr, expected_wd in zip(
+            controller.prepare_groups, (0.02, 0.01), (0.03, 0.01)
+        ):
+            self.assertTrue(all(group["lr_scale"] == 0.5 for group in groups))
+            self.assertTrue(all(group["lr"] == expected_lr for group in groups))
+            positive_decay = [
+                group["weight_decay"]
+                for group in groups
+                if group["weight_decay"] > 0.0
+            ]
+            self.assertEqual(positive_decay, [expected_wd])
+
     def test_module_c_probe_preserves_prepare_failure_without_finishing(self):
         args = SimpleNamespace(
             model_name="Tiny",

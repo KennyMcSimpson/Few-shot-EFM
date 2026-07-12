@@ -645,14 +645,20 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, mo
 def resolve_resume_checkpoint(args):
     """Return the requested or newest auto-resume checkpoint without side effects."""
 
-    explicit = str(getattr(args, 'resume', '') or '')
-    if explicit:
-        return explicit
-    if not bool(getattr(args, 'auto_resume', False)):
+    enable_deepspeed = bool(getattr(args, 'enable_deepspeed', False))
+    auto_resume = bool(getattr(args, 'auto_resume', False))
+    if enable_deepspeed:
+        if not auto_resume:
+            return None
+    else:
+        explicit = str(getattr(args, 'resume', '') or '')
+        if explicit:
+            return explicit
+    if not auto_resume:
         return None
 
     output_dir = Path(str(getattr(args, 'output_dir', '') or ''))
-    if not bool(getattr(args, 'enable_deepspeed', False)):
+    if not enable_deepspeed:
         fixed_checkpoint = output_dir / 'checkpoint.pth'
         if fixed_checkpoint.is_file():
             return str(fixed_checkpoint)

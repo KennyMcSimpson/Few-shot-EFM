@@ -1924,6 +1924,15 @@ def _make_train_eval_loader(args, dataset_train):
     return data_loader_train_eval
 
 
+def _make_formal_train_loader(args, dataset_train, sampler_train):
+    return torch.utils.data.DataLoader(
+        dataset_train,
+        sampler=sampler_train,
+        batch_size=args.batch_size,
+        **_data_loader_kwargs(args, drop_last=True),
+    )
+
+
 def _make_module_c_preflight_loaders(args, dataset_train, dataset_val):
     if dataset_val is None:
         raise RuntimeError("Automatic Module C requires a validation dataset.")
@@ -3463,10 +3472,8 @@ def main(args, ds_init):
 
 
 
-    data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, sampler=sampler_train,
-        batch_size=args.batch_size,
-        **_data_loader_kwargs(args, drop_last=True),
+    data_loader_train = _make_formal_train_loader(
+        args, dataset_train, sampler_train
     )
 
     if args.monitor_dynamics and args.eval_train_set and args.task_mod != 'Retrieval':
