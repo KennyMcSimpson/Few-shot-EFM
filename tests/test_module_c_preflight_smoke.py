@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 import random
@@ -15,17 +16,18 @@ except ModuleNotFoundError:  # pragma: no cover - depends on the training env.
     nn = None
 
 if torch is not None:
+    import util.module_c_preflight_policy as module_c_preflight_policy
     from run_finetuning import (
         _make_module_c_preflight_loaders,
         _resolve_module_c_support_batch_limit,
     )
     from util.module_c_preflight_policy import (
         _run_support_pass,
+        _validation_losses,
         capture_module_c_rng_state,
         restore_module_c_rng_state,
         run_module_c_preflight_selection,
     )
-    from util.module_c_risk_policy import SearchDecision
 
 
 if torch is not None:
@@ -84,6 +86,25 @@ if torch is not None:
             hidden = torch.tanh(block.mlp.fc1(hidden))
             hidden = block.mlp.fc2(hidden)
             return self.task_head(hidden)
+
+
+    class _IdentityLogits(nn.Module):
+        def forward(self, samples):
+            return samples
+
+
+    class _ScalarProbe(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, samples):
+            return self.scale.expand(samples.shape[0], 2)
+
+
+    class _MeanOutputLoss(nn.Module):
+        def forward(self, output, _targets):
+            return output.mean()
 
 
 def _args(output_dir, classes=3):
@@ -180,7 +201,19 @@ class ModuleCPreflightSmokeTests(unittest.TestCase):
                 )
                 self.assertEqual(trace["trainable_parameter_count"], expected_count)
             self.assertTrue(all((action,) in result.branch_traces for action in ("B", "D", "E")))
-            self.assertTrue(any(len(subset) == 2 for subset in result.branch_traces))
+            self.assertEqual(
+                set(result.branch_traces),
+                {
+                    (),
+                    ("B",),
+                    ("D",),
+                    ("E",),
+                    ("B", "D"),
+                    ("B", "E"),
+                    ("D", "E"),
+                    ("B", "D", "E"),
+                },
+            )
             fingerprints = {trace["support_fingerprint"] for trace in result.branch_traces.values()}
             self.assertEqual(len(fingerprints), 1)
             self.assertTrue(
@@ -193,9 +226,27 @@ class ModuleCPreflightSmokeTests(unittest.TestCase):
             with open(result.decision_json_path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
             serialized = json.dumps(payload).lower()
-            self.assertIn("paired_validation_log_loss", serialized)
+            self.assertIn("exhaustive", serialized)
+            self.assertIn("validation_macro_log_loss", serialized)
+            self.assertIn("conditional_contributions", serialized)
+            self.assertIn("pair_interactions", serialized)
             self.assertNotIn("first_order", serialized)
             self.assertNotIn("forced_nonempty_least_harm", serialized)
+            self.assertNotIn("subject", serialized)
+            self.assertNotIn("holm", serialized)
+            self.assertNotIn("retired_actions", serialized)
+            self.assertNotIn("search_steps", serialized)
+            self.assertEqual(payload["runtime"]["branch_count"], 8)
+            self.assertEqual(payload["runtime"]["support_pass_count"], 9)
+            self.assertEqual(payload["runtime"]["validation_pass_count"], 10)
+            self.assertEqual(set(payload["branches"]), {"EMPTY", "B", "D", "E", "B+D", "B+E", "D+E", "B+D+E"})
+            with open(result.score_csv_path, "r", encoding="utf-8", newline="") as handle:
+                score_rows = list(csv.DictReader(handle))
+            self.assertEqual(len(score_rows), 7)
+            self.assertEqual(
+                {row["branch"] for row in score_rows},
+                {"B", "D", "E", "B+D", "B+E", "D+E", "B+D+E"},
+            )
             self.assertEqual(payload["probe_training"]["lora_dropout"], 0.2)
             self.assertEqual(
                 payload["probe_training"]["full_update_base_control"],
@@ -227,10 +278,15 @@ class ModuleCPreflightSmokeTests(unittest.TestCase):
             )
 
             self.assertIsInstance(support_loader.sampler, SequentialSampler)
-            self.assertTrue(support_loader.drop_last)
+            self.assertFalse(support_loader.drop_last)
             self.assertEqual(
                 [batch[0][:, 0, 0].tolist() for batch in support_loader],
-                [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0], [6.0, 7.0, 8.0]],
+                [
+                    [0.0, 1.0, 2.0],
+                    [3.0, 4.0, 5.0],
+                    [6.0, 7.0, 8.0],
+                    [9.0, 10.0],
+                ],
             )
             self.assertIsInstance(validation_loader.sampler, SequentialSampler)
             self.assertFalse(validation_loader.drop_last)
@@ -238,9 +294,9 @@ class ModuleCPreflightSmokeTests(unittest.TestCase):
                 [value for batch in validation_loader for value in batch[0][:, 0, 0].tolist()],
                 validation_ids.tolist(),
             )
-            self.assertEqual(_resolve_module_c_support_batch_limit(2, 0), 2)
-            self.assertEqual(_resolve_module_c_support_batch_limit(2, 1), 1)
-            self.assertEqual(_resolve_module_c_support_batch_limit(2, 99), 2)
+            self.assertEqual(_resolve_module_c_support_batch_limit(4, 0), 4)
+            self.assertEqual(_resolve_module_c_support_batch_limit(4, 1), 1)
+            self.assertEqual(_resolve_module_c_support_batch_limit(4, 99), 4)
 
             seen_support_ids = []
 
@@ -271,13 +327,19 @@ class ModuleCPreflightSmokeTests(unittest.TestCase):
                 )
 
             self.assertTrue(seen_support_ids)
-            self.assertEqual(set(seen_support_ids), {(0, 1, 2, 3, 4, 5)})
+            self.assertEqual(len(seen_support_ids), 9)
+            self.assertEqual(set(seen_support_ids), {tuple(range(11))})
             expected_trace = [
                 {
                     "optimizer_step": 0,
                     "lr_schedule_value": 0.0125,
                     "weight_decay_schedule_value": 0.025,
-                }
+                },
+                {
+                    "optimizer_step": 1,
+                    "lr_schedule_value": 0.0125,
+                    "weight_decay_schedule_value": 0.025,
+                },
             ]
             self.assertEqual(result.head_anchor["optimizer_schedule_trace"], expected_trace)
             self.assertEqual(
@@ -286,26 +348,148 @@ class ModuleCPreflightSmokeTests(unittest.TestCase):
                 {json.dumps(expected_trace, sort_keys=True)},
             )
             self.assertTrue(
-                all(trace["support_examples"] == 6 for trace in result.branch_traces.values())
+                all(trace["support_examples"] == 11 for trace in result.branch_traces.values())
             )
             self.assertTrue(
-                all(trace["optimizer_steps"] == 1 for trace in result.branch_traces.values())
+                all(trace["optimizer_steps"] == 2 for trace in result.branch_traces.values())
             )
 
             with open(result.decision_json_path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
             support_scope = payload["probe_training"]["support_loader"]
             self.assertEqual(support_scope["sampler_type"], "SequentialSampler")
-            self.assertTrue(support_scope["drop_last"])
+            self.assertFalse(support_scope["drop_last"])
             self.assertEqual(support_scope["raw_dataset_size"], 11)
-            self.assertEqual(support_scope["visible_example_count"], 6)
-            self.assertAlmostEqual(support_scope["coverage_fraction"], 6.0 / 11.0)
+            self.assertEqual(support_scope["visible_example_count"], 11)
+            self.assertAlmostEqual(support_scope["coverage_fraction"], 1.0)
             validation_scope = payload["probe_training"]["validation_loader"]
             self.assertEqual(validation_scope["sampler_type"], "SequentialSampler")
             self.assertFalse(validation_scope["drop_last"])
             self.assertEqual(validation_scope["raw_dataset_size"], 8)
             self.assertEqual(validation_scope["visible_example_count"], 8)
             self.assertEqual(validation_scope["coverage_fraction"], 1.0)
+
+    def test_preflight_support_keeps_a_dataset_smaller_than_one_batch(self):
+        args = SimpleNamespace(batch_size=3, num_workers=0, pin_mem=False)
+        support = TensorDataset(torch.arange(2), torch.tensor([0, 1]))
+        validation = TensorDataset(torch.arange(2), torch.tensor([0, 1]))
+
+        support_loader, validation_loader = _make_module_c_preflight_loaders(
+            args, support, validation
+        )
+
+        self.assertFalse(support_loader.drop_last)
+        self.assertEqual([value for batch in support_loader for value in batch[0].tolist()], [0, 1])
+        self.assertEqual([value for batch in validation_loader for value in batch[0].tolist()], [0, 1])
+
+    def test_automatic_preflight_requires_the_complete_bde_registry(self):
+        support_loader, validation_loader = self._loaders(classes=3)
+        with tempfile.TemporaryDirectory() as output_dir:
+            args = _args(output_dir, classes=3)
+            args.module_c_candidates = "B,D"
+
+            with self.assertRaisesRegex(ValueError, "exactly.*B.*D.*E"):
+                run_module_c_preflight_selection(
+                    args=args,
+                    model=_TinyGram(classes=3),
+                    data_loader_train=support_loader,
+                    data_loader_val=validation_loader,
+                    device=torch.device("cpu"),
+                )
+
+    def test_validation_metrics_report_macro_and_micro_multiclass_log_loss(self):
+        logits = torch.tensor([[2.0, 0.0], [1.0, 0.0], [0.0, 0.0], [0.0, 2.0]])
+        labels = torch.tensor([0, 0, 0, 1])
+        batches = list(DataLoader(TensorDataset(logits, labels), batch_size=2, shuffle=False))
+        args = _args("", classes=2)
+
+        losses, observed, per_class, macro_loss, micro_loss = _validation_losses(
+            args, _IdentityLogits(), batches, torch.device("cpu")
+        )
+        expected = torch.nn.functional.cross_entropy(logits, labels, reduction="none")
+
+        self.assertEqual(observed, tuple(labels.tolist()))
+        self.assertTrue(torch.allclose(torch.tensor(losses), expected))
+        self.assertAlmostEqual(per_class[0], float(expected[:3].mean()))
+        self.assertAlmostEqual(per_class[1], float(expected[3]))
+        self.assertAlmostEqual(macro_loss, float((expected[:3].mean() + expected[3]) / 2.0))
+        self.assertAlmostEqual(micro_loss, float(expected.mean()))
+        self.assertNotAlmostEqual(macro_loss, micro_loss)
+
+    def test_validation_metrics_report_macro_and_micro_binary_log_loss(self):
+        logits = torch.tensor([[-2.0], [-1.0], [0.0], [2.0]])
+        labels = torch.tensor([0, 0, 0, 1])
+        batches = list(DataLoader(TensorDataset(logits, labels), batch_size=2, shuffle=False))
+        args = _args("", classes=1)
+
+        losses, observed, per_class, macro_loss, micro_loss = _validation_losses(
+            args, _IdentityLogits(), batches, torch.device("cpu")
+        )
+        expected = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits[:, 0], labels.float(), reduction="none"
+        )
+
+        self.assertEqual(observed, tuple(labels.tolist()))
+        self.assertTrue(torch.allclose(torch.tensor(losses), expected))
+        self.assertAlmostEqual(per_class[0], float(expected[:3].mean()))
+        self.assertAlmostEqual(per_class[1], float(expected[3]))
+        self.assertAlmostEqual(macro_loss, float((expected[:3].mean() + expected[3]) / 2.0))
+        self.assertAlmostEqual(micro_loss, float(expected.mean()))
+        self.assertNotAlmostEqual(macro_loss, micro_loss)
+
+    def test_partial_accumulation_tail_uses_its_actual_microbatch_count(self):
+        args = _args("", classes=2)
+        args.lr = 0.1
+        args.update_freq = 2
+        model = _ScalarProbe()
+        batches = [
+            (torch.zeros(1, 1), torch.tensor([0])),
+            (torch.zeros(1, 1), torch.tensor([1])),
+            (torch.zeros(1, 1), torch.tensor([0])),
+        ]
+
+        with patch(
+            "util.module_c_preflight_policy._create_probe_optimizer",
+            return_value=torch.optim.SGD(model.parameters(), lr=0.1),
+        ):
+            _run_support_pass(
+                args,
+                model,
+                batches,
+                torch.device("cpu"),
+                _MeanOutputLoss(),
+                lr_schedule_values=[0.1],
+                wd_schedule_values=[0.0],
+                formal_epoch_zero_steps=1,
+            )
+
+        self.assertAlmostEqual(float(model.scale.detach()), -0.2, places=6)
+
+    def test_e_controller_attaches_only_to_the_four_e_containing_branches(self):
+        support_loader, validation_loader = self._loaders(classes=3)
+        original_attach = module_c_preflight_policy.attach_module_e_dynamic_pressure_controller
+        attached_models = []
+
+        def recording_attach(args, model):
+            attached_models.append(model)
+            return original_attach(args, model)
+
+        with tempfile.TemporaryDirectory() as output_dir, patch(
+            "util.module_c_preflight_policy.attach_module_e_dynamic_pressure_controller",
+            side_effect=recording_attach,
+        ):
+            model = _TinyGram(classes=3)
+            result = run_module_c_preflight_selection(
+                args=_args(output_dir, classes=3),
+                model=model,
+                data_loader_train=support_loader,
+                data_loader_val=validation_loader,
+                device=torch.device("cpu"),
+            )
+
+        self.assertEqual(len(attached_models), 4)
+        self.assertEqual(len(result.branch_traces), 8)
+        self.assertFalse(hasattr(model, "_module_e_dynamic_pressure_controller"))
 
     def test_binary_bce_search_uses_both_labels(self):
         support_loader, validation_loader = self._loaders(classes=2)
@@ -322,125 +506,24 @@ class ModuleCPreflightSmokeTests(unittest.TestCase):
             )
 
             self.assertTrue(result.decision.selected_modules)
-            primary_step = result.decision.search_steps[0]
-            observed_classes = set(primary_step["trial_diagnostics"]["B"]["class_gain"])
+            observed_classes = set(result.branch_traces[("B",)]["validation_per_class_loss"])
             self.assertEqual(observed_classes, {0, 1})
 
-    def test_dead_primary_path_compares_the_alternative_pair_without_building_the_triple(self):
-        support_loader, validation_loader = self._loaders(classes=3)
-        choose_calls = []
-
-        def scripted_choice(trials, require_nonempty, alpha):
-            del alpha
-            trials = tuple(trials)
-            subsets = {tuple(trial.candidate_subset) for trial in trials}
-            choose_calls.append(subsets)
-            if len(choose_calls) == 1:
-                self.assertTrue(require_nonempty)
-                selected = next(trial for trial in trials if trial.candidate_subset == ("B",))
-                return SearchDecision(selected, "nonempty_weak_best_observed_gain", "weak", {})
-            if len(choose_calls) == 2:
-                self.assertFalse(require_nonempty)
-                self.assertEqual(subsets, {("B", "D"), ("B", "E")})
-                return SearchDecision(None, "no_supported_safe_gain", "none", {})
-            if len(choose_calls) == 3:
-                self.assertFalse(require_nonempty)
-                self.assertEqual(subsets, {("D", "E")})
-                selected = next(iter(trials))
-                return SearchDecision(selected, "supported_alternative_pair_gain", "supported", {})
-            self.fail(f"Unexpected additional search stage: {subsets}")
-
-        with tempfile.TemporaryDirectory() as output_dir:
-            with patch("util.module_c_preflight_policy.choose_action", side_effect=scripted_choice):
-                result = run_module_c_preflight_selection(
-                    args=_args(output_dir, classes=3),
-                    model=_TinyGram(classes=3),
-                    data_loader_train=support_loader,
-                    data_loader_val=validation_loader,
-                    device=torch.device("cpu"),
-                )
-
-            self.assertEqual(result.decision.selected_modules, ("D", "E"))
-            self.assertEqual(result.decision.evidence_strength, "supported")
-            self.assertNotIn(("B", "D", "E"), result.branch_traces)
-            self.assertEqual(
-                [step["stage"] for step in result.decision.search_steps],
-                ["primary", "conditional_addition", "alternative_pair_rescue"],
-            )
-            self.assertEqual(
-                result.decision.search_steps[-1]["reason"],
-                "supported_alternative_pair_gain",
-            )
-            with open(result.decision_json_path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            self.assertEqual(
-                payload["search"]["strategy"],
-                "hierarchical_forward_addition_and_alternative_pair_rescue",
-            )
-            self.assertEqual(payload["primary_evidence_strength"], "weak")
-            self.assertEqual(payload["final_evidence_strength"], "supported")
-            self.assertEqual(payload["search"]["retired_actions"], ["B"])
-            self.assertNotIn("floating_deletion", json.dumps(payload).lower())
-
-    def test_supported_forward_chain_can_reach_all_three_actions(self):
-        support_loader, validation_loader = self._loaders(classes=3)
-        choose_calls = []
-
-        def scripted_choice(trials, require_nonempty, alpha):
-            del alpha
-            trials = tuple(trials)
-            subsets = {tuple(trial.candidate_subset) for trial in trials}
-            choose_calls.append(subsets)
-            if len(choose_calls) == 1:
-                self.assertTrue(require_nonempty)
-                selected = next(trial for trial in trials if trial.candidate_subset == ("B",))
-                return SearchDecision(selected, "supported_primary_gain", "supported", {})
-            if len(choose_calls) == 2:
-                self.assertFalse(require_nonempty)
-                self.assertEqual(subsets, {("B", "D"), ("B", "E")})
-                selected = next(trial for trial in trials if trial.candidate_subset == ("B", "D"))
-                return SearchDecision(selected, "supported_conditional_gain", "supported", {})
-            if len(choose_calls) == 3:
-                self.assertFalse(require_nonempty)
-                self.assertEqual(subsets, {("B", "D", "E")})
-                selected = next(iter(trials))
-                return SearchDecision(selected, "supported_conditional_gain", "supported", {})
-            self.fail(f"Unexpected additional search stage: {subsets}")
-
-        with tempfile.TemporaryDirectory() as output_dir:
-            with patch("util.module_c_preflight_policy.choose_action", side_effect=scripted_choice):
-                result = run_module_c_preflight_selection(
-                    args=_args(output_dir, classes=3),
-                    model=_TinyGram(classes=3),
-                    data_loader_train=support_loader,
-                    data_loader_val=validation_loader,
-                    device=torch.device("cpu"),
-                )
-
-            self.assertEqual(result.decision.selected_modules, ("B", "D", "E"))
-            self.assertEqual(
-                [step["stage"] for step in result.decision.search_steps],
-                ["primary", "conditional_addition", "conditional_addition"],
-            )
-            with open(result.decision_json_path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            self.assertEqual(payload["search"]["retired_actions"], [])
-
-    def test_subject_metadata_is_required_for_clustered_evidence(self):
+    def test_validation_does_not_require_subject_metadata(self):
         support_loader, _ = self._loaders(classes=3)
         samples = torch.randn(9, 4, 5)
         labels = torch.tensor([0, 1, 2] * 3)
         validation_loader = DataLoader(TensorDataset(samples, labels), batch_size=3, shuffle=False)
 
         with tempfile.TemporaryDirectory() as output_dir:
-            with self.assertRaisesRegex(ValueError, "subject_id"):
-                run_module_c_preflight_selection(
-                    args=_args(output_dir, classes=3),
-                    model=_TinyGram(classes=3),
-                    data_loader_train=support_loader,
-                    data_loader_val=validation_loader,
-                    device=torch.device("cpu"),
-                )
+            result = run_module_c_preflight_selection(
+                args=_args(output_dir, classes=3),
+                model=_TinyGram(classes=3),
+                data_loader_train=support_loader,
+                data_loader_val=validation_loader,
+                device=torch.device("cpu"),
+            )
+            self.assertEqual(len(result.branch_traces), 8)
 
     def test_rng_snapshot_restores_python_numpy_and_torch(self):
         random.seed(19)

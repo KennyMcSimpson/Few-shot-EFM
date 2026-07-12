@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "name": "module_c_exhaustive_seed0_4datasets",
+  "entrypoint": "run_finetuning.py",
+  "purpose": "Seed-0 verification of exhaustive one-pass Module C selection before formal LoRA training.",
+  "matrix": {
+    "datasets": ["TUEV", "Sleep-EDF", "BCI-IV-2A", "SEED-IV"],
+    "models": ["EEGPT", "BIOT", "LaBraM", "CBraMod", "Gram", "CSBrain"],
+    "seeds": [0]
+  },
+  "fixed_cli_arguments": [
+    "--task_mod", "Classification",
+    "--subject_mod", "fewshot",
+    "--k_shot", "0.05",
+    "--finetune_mod", "lora",
+    "--lora_base_update", "full",
+    "--lora_rank", "4",
+    "--lora_alpha", "8",
+    "--lora_dropout", "0.1",
+    "--lora_target", "module_c",
+    "--module_c_candidates", "B,D,E",
+    "--module_c_preflight_train_batches", "0",
+    "--module_c_preflight_val_batches", "0",
+    "--module_b_sites", "both",
+    "--module_e_mode", "dynamic_pressure_gate",
+    "--module_e_warmup_steps", "0",
+    "--epochs", "50",
+    "--batch_size", "16",
+    "--lr", "1e-4",
+    "--weight_decay", "0.05",
+    "--loss_type", "sqrt_balanced_ce",
+    "--best_metric", "balanced_accuracy",
+    "--no_auto_resume"
+  ],
+  "model_cli_overrides": {
+    "EEGPT": ["--sampling_rate", "256"],
+    "Gram": [
+      "--gram_ckpt", "checkpoints/base.pth",
+      "--gram_vqgan_ckpt", "checkpoints/base_class_quantization.pth",
+      "--gram_root", "external/Gram"
+    ]
+  },
+  "decision_artifact": {
+    "filename": "module_c_preflight_decision.json",
+    "status_fields": [
+      "selected_modules",
+      "selection_status",
+      "runner_up_modules",
+      "selection_gap",
+      "selected_observed_gain",
+      "runtime.branch_count",
+      "runtime.total_seconds"
+    ]
+  },
+  "notes": [
+    "EMPTY is reference-only and cannot be selected.",
+    "The public repository stores this declarative protocol instead of machine-specific shell runners.",
+    "Operational launch scripts may be generated outside the repository from this manifest."
+  ]
+}

@@ -1940,7 +1940,7 @@ def _make_module_c_preflight_loaders(args, dataset_train, dataset_val):
         dataset_train,
         sampler=torch.utils.data.SequentialSampler(dataset_train),
         batch_size=int(args.batch_size),
-        **_data_loader_kwargs(args, drop_last=True),
+        **_data_loader_kwargs(args, drop_last=False),
     )
     validation_loader = torch.utils.data.DataLoader(
         dataset_val,
@@ -1957,6 +1957,15 @@ def _ensure_module_c_preflight_has_no_resume(args):
         raise RuntimeError(
             "Automatic Module C topology recovery from a resume checkpoint is unsupported "
             f"({resume_checkpoint}). Use a new output directory and no resume checkpoint."
+        )
+
+
+def _ensure_module_c_preflight_is_single_process():
+    world_size = int(utils.get_world_size())
+    if world_size != 1:
+        raise RuntimeError(
+            "Automatic Module C topology selection is single-process only (world_size=1); "
+            "distributed rank synchronization is not implemented."
         )
 
 
@@ -3509,8 +3518,9 @@ def main(args, ds_init):
 
     module_c_preflight_ran = False
     if module_c_preflight_requested(args):
+        _ensure_module_c_preflight_is_single_process()
         _ensure_module_c_preflight_has_no_resume(args)
-        print("[ModuleC] running matched low-budget search before formal LoRA training.")
+        print("[ModuleC] running exhaustive matched one-pass search before formal LoRA training.")
         module_c_support_loader, module_c_validation_loader = _make_module_c_preflight_loaders(
             args, dataset_train, dataset_val
         )

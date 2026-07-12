@@ -1,4 +1,5 @@
 import hashlib
+import itertools
 import unittest
 from types import SimpleNamespace
 
@@ -229,7 +230,7 @@ class ModuleCLoraInterfaceTests(unittest.TestCase):
     def test_csbrain_actions_are_nonempty_and_disjoint(self):
         self._audit(_TinyDualAttention(csbrain=True), "CSBrain")
 
-    def test_union_and_selected_only_module_c_adapters_have_identical_hashes(self):
+    def test_union_and_every_nonempty_selected_subset_have_identical_hashes(self):
         fixtures = (
             ("BIOT", _TinyBIOT),
             ("EEGPT", _TinyMergedTransformer),
@@ -249,34 +250,40 @@ class ModuleCLoraInterfaceTests(unittest.TestCase):
                     dropout=0.0,
                     seed=37,
                 )
-                selected_model = factory()
-                apply_lora_to_eegfm(
-                    model=selected_model,
-                    model_name=model_name,
-                    lora_target="module_c",
-                    module_c_selected=("E",),
-                    module_b_sites="both",
-                    r=2,
-                    alpha=4.0,
-                    dropout=0.0,
-                    module_c_seed=37,
-                    verbose=False,
-                )
-
                 union_hashes = self._adapter_hashes(union_model)
-                selected_hashes = self._adapter_hashes(selected_model)
-                self.assertTrue(selected_hashes)
-                self.assertEqual(
-                    {name: union_hashes[name] for name in selected_hashes},
-                    selected_hashes,
-                )
-                self.assertTrue(
-                    all(
-                        torch.count_nonzero(dict(selected_model.named_parameters())[name]) == 0
-                        for name in selected_hashes
-                        if "lora_B" in name
-                    )
-                )
+                for subset_size in range(1, 4):
+                    for selected_subset in itertools.combinations(("B", "D", "E"), subset_size):
+                        with self.subTest(model_name=model_name, selected_subset=selected_subset):
+                            selected_model = factory()
+                            apply_lora_to_eegfm(
+                                model=selected_model,
+                                model_name=model_name,
+                                lora_target="module_c",
+                                module_c_selected=selected_subset,
+                                module_b_sites="both",
+                                r=2,
+                                alpha=4.0,
+                                dropout=0.0,
+                                module_c_seed=37,
+                                verbose=False,
+                            )
+
+                            selected_hashes = self._adapter_hashes(selected_model)
+                            self.assertTrue(selected_hashes)
+                            self.assertEqual(
+                                {name: union_hashes[name] for name in selected_hashes},
+                                selected_hashes,
+                            )
+                            self.assertTrue(
+                                all(
+                                    torch.count_nonzero(
+                                        dict(selected_model.named_parameters())[name]
+                                    )
+                                    == 0
+                                    for name in selected_hashes
+                                    if "lora_B" in name
+                                )
+                            )
 
     def test_module_c_injection_preserves_cpu_and_initialized_cuda_rng(self):
         model = _TinyBIOT()

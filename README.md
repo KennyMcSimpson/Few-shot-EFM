@@ -34,7 +34,7 @@ models/                        EEG model wrappers and backbone integrations
 util/lora.py                   LoRA injection and trainable-parameter control
 util/fb_*.py                   Functional-block registry, policy, probes, and collection
 util/module_b_*.py             Signal/input-side adaptation helpers
-util/module_c_*.py             Matched low-budget Module C functional-action search
+util/module_c_*.py             Exhaustive matched one-pass Module C subset search
 util/module_d_*.py             Semantic refinement utilities
 util/module_e_*.py             Structural routing and pressure-guided helpers
 
@@ -156,7 +156,7 @@ python run_finetuning.py \
   --fb_collect
 ```
 
-Module-C task-aligned B/D/E search:
+Module-C exhaustive B/D/E search:
 
 ```bash
 python run_finetuning.py \
@@ -172,14 +172,21 @@ python run_finetuning.py \
   --module_c_preflight_val_batches 0
 ```
 
-The default `0/0` scope uses the complete formal-visible support epoch and the
-complete validation split. Support uses `SequentialSampler` with
-`drop_last=True`, so Ada excludes the raw tail exactly as formal training does;
-validation uses `SequentialSampler` with `drop_last=False` and covers every
-example once. Each visited subset receives the same matched support pass, and
-ranking uses paired, subject-clustered validation log-loss. Add
+The default `0/0` scope uses one complete support pass and the complete
+validation split. Both use `SequentialSampler` with `drop_last=False`, so every
+available example is covered once. `EMPTY` is retained only as a reference;
+`B`, `D`, `E`, `B+D`, `B+E`, `D+E`, and `B+D+E` each receive the same anchored
+support pass. The nonempty subset with the lowest sample-level class-macro
+validation log-loss is selected, with exact ties resolved by fewer actions,
+then fewer adapter parameters, then canonical B/D/E order. Add
 `--module_c_preflight_only` to write the decision and timing diagnostics without
 starting formal training.
+
+The checked experiment matrix and fixed arguments live in
+`experiment_manifests/module_c_exhaustive_seed0_4datasets.json`. Machine-specific
+launch scripts are intentionally kept outside the public repository; each
+matrix entry invokes `run_finetuning.py` directly with the manifest arguments,
+plus `--dataset`, `--model_name`, `--seed`, `--output_dir`, and `--run_tag`.
 
 ## Reproducibility Notes
 

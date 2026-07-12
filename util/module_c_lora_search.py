@@ -5,10 +5,10 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 
-MODULE_C_CURRENT = "task_aligned_matched_validation_search"
+MODULE_C_CURRENT = "exhaustive_low_fidelity_selection"
 MODULE_C_ROLE = "nonempty_bde_adapter_action_selector"
 MODULE_C_SELECTION_SCOPE = "bde_only_nonempty_subset"
-MODULE_C_SELECTION_RULE = "task_aligned_matched_validation_search"
+MODULE_C_SELECTION_RULE = "exhaustive_validation_macro_log_loss"
 
 
 DEFAULT_CANDIDATE_MODULES: Dict[str, Dict[str, Any]] = {

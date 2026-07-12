@@ -20,13 +20,13 @@ def add_fb_args(parser):
     parser.add_argument("--fb_collect", action="store_true", default=False, help="Copy small logs/csvs into a short collected folder.")
     parser.add_argument("--fb_collect_name", default="", type=str, help="Collected folder name, e.g. col_fb2s.")
     parser.add_argument("--module_c_enable", action="store_true", default=False, help="Enable Module C B/D/E selection metadata. This does not inject LoRA automatically.")
-    parser.add_argument("--module_c_candidates", default="B,D,E", type=str, help="Comma-separated B/D/E candidates for automatic Module C subset selection.")
+    parser.add_argument("--module_c_candidates", default="B,D,E", type=str, help="Automatic Module C exhaustively evaluates the fixed B/D/E action registry; this argument must remain B,D,E.")
     parser.add_argument("--module_c_selected", default="", type=str, help="Explicit nonempty B/D/E selection for an ablation; otherwise Module C selects automatically.")
     parser.set_defaults(module_c_preflight=True)
     parser.add_argument("--module_c_no_preflight", action="store_false", dest="module_c_preflight", help="Disable automatic Module C selection; requires an explicit nonempty --module_c_selected B/D/E set.")
-    parser.add_argument("--module_c_preflight_train_batches", default=0, type=int, help="Module C support preflight batch cap. <=0 uses the complete formal-visible support epoch; SequentialSampler with drop_last=True excludes the raw tail. Positive values are debug upper bounds.")
+    parser.add_argument("--module_c_preflight_train_batches", default=0, type=int, help="Module C support preflight batch cap. <=0 uses the complete support split once with SequentialSampler and drop_last=False; positive values are debug upper bounds.")
     parser.add_argument("--module_c_preflight_val_batches", default=0, type=int, help="Module C validation preflight batch cap. <=0 scans complete validation with SequentialSampler and drop_last=False; positive values are debug upper bounds.")
-    parser.add_argument("--module_c_preflight_only", action="store_true", default=False, help="Run automatic Module C search, write diagnostics, and exit before formal training.")
+    parser.add_argument("--module_c_preflight_only", action="store_true", default=False, help="Run exhaustive Module C preflight, write diagnostics, and exit before formal training.")
     return parser
 MODEL_DEFAULT_RECIPE={"BIOT":"sem_lif","LaBraM":"sem_lif","EEGPT":"sig_align","CBraMod":"str_mix","Gram":"gram_diag","CSBrain":"csb_diag","NeurIPT":"probe_only"}
 MODULE_B_METADATA_KEYS=(
@@ -49,8 +49,12 @@ def resolve_functional_args(args):
     if module_c_target:
         args.module_c_enable=True
     if bool(getattr(args,"module_c_enable",False)):
-        args.module_c_resolved_candidates=",".join(parse_module_ids(getattr(args,"module_c_candidates","B,D,E")))
-        args.module_c_resolved_selected=",".join(parse_module_ids(getattr(args,"module_c_selected","")))
+        resolved_candidates=parse_module_ids(getattr(args,"module_c_candidates","B,D,E"))
+        resolved_selected=parse_module_ids(getattr(args,"module_c_selected",""))
+        args.module_c_resolved_candidates=",".join(resolved_candidates)
+        args.module_c_resolved_selected=",".join(resolved_selected)
+        if module_c_target and not resolved_selected and bool(getattr(args,"module_c_preflight",True)) and tuple(resolved_candidates)!=("B","D","E"):
+            raise ValueError("Automatic Module C preflight requires exactly B,D,E in canonical order.")
         if module_c_target and not args.module_c_resolved_selected and not bool(getattr(args,"module_c_preflight",True)):
             raise ValueError("Module C requires a nonempty --module_c_selected B/D/E set when automatic preflight is disabled.")
     if not bool(getattr(args,"fb_enable",False)): return args

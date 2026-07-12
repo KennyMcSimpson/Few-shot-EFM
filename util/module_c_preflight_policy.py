@@ -1,8 +1,8 @@
-"""Task-aligned, matched low-budget search for Module C.
+"""Matched exhaustive low-fidelity selection for Module C.
 
 The probe is disposable.  It anchors the downstream head for one support pass,
-then gives every measured B/D/E subset the same one-pass training budget from
-the same anchored state.  Selection uses paired validation log-loss only; no
+then gives every B/D/E subset the same one-pass training budget from the same
+anchored state.  Selection uses validation macro log-loss only; no
 probe parameters, optimizer state, or head weights enter formal training.
 """
 
@@ -11,7 +11,6 @@ from __future__ import annotations
 import copy
 import csv
 import hashlib
-import itertools
 import json
 import math
 import os
@@ -23,17 +22,19 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import ConcatDataset, SequentialSampler, Subset
 
 from .lora import apply_lora_to_eegfm, freeze_all_parameters
-from .module_c_lora_search import DEFAULT_CANDIDATE_MODULES, build_module_c_recipe, parse_module_ids
-from .module_c_risk_policy import (
-    ActionTrial,
-    MODULE_C_ALPHA,
-    PairedRiskEvidence,
-    SearchDecision,
-    choose_action,
-    cluster_jackknife_evidence,
+from .module_c_exhaustive_policy import (
+    ExhaustiveDecision,
+    SubsetRisk,
+    enumerate_action_subsets,
+    select_exhaustive_subset,
+)
+from .module_c_lora_search import (
+    DEFAULT_CANDIDATE_MODULES,
+    MODULE_C_SELECTION_RULE,
+    build_module_c_recipe,
+    parse_module_ids,
 )
 from .module_e_structural_routing import (
     attach_module_e_dynamic_pressure_controller,
@@ -42,7 +43,7 @@ from .module_e_structural_routing import (
 from .optim_factory import LayerDecayValueAssigner, create_optimizer
 
 
-MODULE_C_PREFLIGHT_SELECTION_RULE = "task_aligned_matched_validation_search"
+MODULE_C_PREFLIGHT_SELECTION_RULE = MODULE_C_SELECTION_RULE
 MODULE_C_PREFLIGHT_SCORE_FILE = "module_c_preflight_scores.csv"
 MODULE_C_PREFLIGHT_DECISION_FILE = "module_c_preflight_decision.json"
 
@@ -51,8 +52,14 @@ MODULE_C_PREFLIGHT_DECISION_FILE = "module_c_preflight_decision.json"
 class ModuleCDecision:
     selected_modules: Tuple[str, ...]
     reason: str
-    evidence_strength: str
-    search_steps: Tuple[Dict[str, Any], ...]
+    selection_status: str
+    runner_up_modules: Tuple[str, ...]
+    selection_gap: float
+    observed_gain: float
+    ranked_subsets: Tuple[Tuple[str, ...], ...]
+    conditional_contributions: Mapping[str, float]
+    pair_interactions: Mapping[str, float]
+    triple_interaction: Optional[float]
 
 
 @dataclass(frozen=True)
@@ -83,9 +90,9 @@ class _BranchEvaluation:
     subset: Tuple[str, ...]
     per_sample_loss: Tuple[float, ...]
     labels: Tuple[int, ...]
-    subjects: Tuple[str, ...]
     per_class_loss: Dict[int, float]
-    class_balanced_loss: float
+    macro_loss: float
+    micro_loss: float
     support_loss: Optional[float]
     support_examples: int
     optimizer_steps: int
@@ -102,7 +109,8 @@ class _BranchEvaluation:
             "support_examples": int(self.support_examples),
             "optimizer_steps": int(self.optimizer_steps),
             "validation_per_class_loss": {int(k): float(v) for k, v in self.per_class_loss.items()},
-            "validation_class_balanced_loss": float(self.class_balanced_loss),
+            "validation_macro_log_loss": float(self.macro_loss),
+            "validation_micro_log_loss": float(self.micro_loss),
             "validation_examples": len(self.per_sample_loss),
             "validation_loss_source": "direct_per_example_log_loss",
             "adapter_parameter_count": int(self.adapter_parameter_count),
@@ -221,13 +229,13 @@ def _collect_probe_batches(data_loader: Any, max_batches: int) -> List[Sequence[
 
 
 def _resolve_module_c_support_batch_limit(
-    formal_batch_limit: int, debug_batch_cap: int
+    loader_batch_count: int, debug_batch_cap: int
 ) -> int:
-    formal_limit = int(formal_batch_limit)
-    if formal_limit <= 0:
-        raise ValueError("Module C requires a positive formal support batch limit.")
+    loader_limit = int(loader_batch_count)
+    if loader_limit <= 0:
+        raise ValueError("Module C requires a nonempty support loader.")
     debug_cap = int(debug_batch_cap)
-    return min(formal_limit, debug_cap) if debug_cap > 0 else formal_limit
+    return min(loader_limit, debug_cap) if debug_cap > 0 else loader_limit
 
 
 def _support_fingerprint(batches: Sequence[Sequence[Any]]) -> str:
@@ -241,46 +249,6 @@ def _support_fingerprint(batches: Sequence[Sequence[Any]]) -> str:
         digest.update(samples.detach().cpu().contiguous().numpy().tobytes())
         digest.update(labels.detach().cpu().contiguous().numpy().tobytes())
     return digest.hexdigest()
-
-
-def _metadata_entry(dataset: Any, index: int) -> Optional[Mapping[str, Any]]:
-    if isinstance(dataset, Subset):
-        return _metadata_entry(dataset.dataset, int(dataset.indices[index]))
-    if isinstance(dataset, ConcatDataset):
-        if index < 0:
-            index += len(dataset)
-        dataset_index = 0
-        while dataset_index < len(dataset.cumulative_sizes) and index >= dataset.cumulative_sizes[dataset_index]:
-            dataset_index += 1
-        if dataset_index >= len(dataset.datasets):
-            return None
-        previous = 0 if dataset_index == 0 else dataset.cumulative_sizes[dataset_index - 1]
-        return _metadata_entry(dataset.datasets[dataset_index], index - previous)
-    data = getattr(dataset, "data", None)
-    if isinstance(data, Sequence) and 0 <= int(index) < len(data):
-        entry = data[int(index)]
-        return entry if isinstance(entry, Mapping) else None
-    return None
-
-
-def _validation_subject_ids(data_loader: Any, batch_count: int, example_count: int) -> Tuple[str, ...]:
-    if not isinstance(getattr(data_loader, "sampler", None), SequentialSampler):
-        raise ValueError(
-            "Module C clustered evidence requires a sequential validation sampler so subject_id metadata stays aligned."
-        )
-    planned_batches = list(data_loader.batch_sampler)[: int(batch_count)]
-    indices = [int(index) for batch_indices in planned_batches for index in batch_indices]
-    if len(indices) != int(example_count):
-        raise RuntimeError("Module C validation metadata count does not match the evaluated examples.")
-    subjects = []
-    for index in indices:
-        entry = _metadata_entry(data_loader.dataset, index)
-        if entry is None or "subject_id" not in entry:
-            raise ValueError(
-                "Module C subject-clustered evidence requires subject_id metadata in every validation dataset entry."
-            )
-        subjects.append(str(entry["subject_id"]))
-    return tuple(subjects)
 
 
 def _is_adapter_parameter(name: str) -> bool:
@@ -514,6 +482,7 @@ def _run_support_pass(
     controller: Any = None,
     lr_schedule_values: Optional[Sequence[float]] = None,
     wd_schedule_values: Optional[Sequence[float]] = None,
+    formal_epoch_zero_steps: Optional[int] = None,
     optimizer_schedule_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Optional[float], int, int]:
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
@@ -537,21 +506,35 @@ def _run_support_pass(
         batch_size = int(samples.shape[0])
         total_loss += float(loss.detach().cpu().item()) * batch_size
         total_examples += batch_size
-        (loss / float(update_freq)).backward()
+        accumulation_group_start = (batch_index // update_freq) * update_freq
+        accumulation_group_size = min(
+            update_freq, len(batches) - accumulation_group_start
+        )
+        (loss / float(accumulation_group_size)).backward()
         should_step = (batch_index + 1) % update_freq == 0 or batch_index + 1 == len(batches)
         if should_step:
+            schedule_index = optimizer_steps
+            if formal_epoch_zero_steps is not None:
+                epoch_zero_steps = int(formal_epoch_zero_steps)
+                if epoch_zero_steps <= 0:
+                    raise ValueError("Module C requires positive formal epoch-zero schedule geometry.")
+                if optimizer_steps > epoch_zero_steps:
+                    raise RuntimeError(
+                        "Module C support coverage produced more than one optimizer step beyond formal epoch zero."
+                    )
+                schedule_index = min(optimizer_steps, epoch_zero_steps - 1)
             if lr_schedule_values is not None:
-                if optimizer_steps >= len(lr_schedule_values):
+                if schedule_index >= len(lr_schedule_values):
                     raise RuntimeError("Module C LR schedule is shorter than the support optimizer-step budget.")
-                lr_value = float(lr_schedule_values[optimizer_steps])
+                lr_value = float(lr_schedule_values[schedule_index])
                 for group in optimizer.param_groups:
                     group["lr"] = lr_value * float(group.get("lr_scale", 1.0))
             else:
                 lr_value = None
             if wd_schedule_values is not None:
-                if optimizer_steps >= len(wd_schedule_values):
+                if schedule_index >= len(wd_schedule_values):
                     raise RuntimeError("Module C WD schedule is shorter than the support optimizer-step budget.")
-                wd_value = float(wd_schedule_values[optimizer_steps])
+                wd_value = float(wd_schedule_values[schedule_index])
                 for group in optimizer.param_groups:
                     if float(group.get("weight_decay", 0.0)) > 0.0:
                         group["weight_decay"] = wd_value
@@ -586,12 +569,33 @@ def _run_support_pass(
     return float(total_loss / total_examples), total_examples, optimizer_steps
 
 
+def _summarize_validation_log_losses(
+    per_sample_losses: Sequence[float],
+    labels: Sequence[int],
+) -> Tuple[Dict[int, float], float, float]:
+    """Aggregate aligned CE/BCE losses into per-class, macro, and micro risks."""
+
+    losses = tuple(float(value) for value in per_sample_losses)
+    class_labels = tuple(int(value) for value in labels)
+    if not losses or len(losses) != len(class_labels):
+        raise ValueError("Module C validation losses and labels must be nonempty and aligned.")
+    if any(not math.isfinite(value) for value in losses):
+        raise ValueError("Module C validation produced a non-finite per-example log-loss.")
+    per_class = {
+        class_id: float(np.mean([loss for loss, label in zip(losses, class_labels) if label == class_id]))
+        for class_id in sorted(set(class_labels))
+    }
+    if len(per_class) < 2:
+        raise ValueError("Module C requires at least two observed validation labels.")
+    return per_class, float(np.mean(list(per_class.values()))), float(np.mean(losses))
+
+
 def _validation_losses(
     args: Any,
     model: nn.Module,
     batches: Sequence[Sequence[Any]],
     device: torch.device,
-) -> Tuple[Tuple[float, ...], Tuple[int, ...], Dict[int, float], float]:
+) -> Tuple[Tuple[float, ...], Tuple[int, ...], Dict[int, float], float, float]:
     losses_out: List[float] = []
     labels_out: List[int] = []
     model.eval()
@@ -602,13 +606,10 @@ def _validation_losses(
             losses = _per_sample_log_loss(_forward_output(model, samples), targets, args)
             losses_out.extend(float(value) for value in losses.detach().cpu().tolist())
             labels_out.extend(int(value) for value in labels.detach().cpu().tolist())
-    per_class = {
-        class_id: float(np.mean([loss for loss, label in zip(losses_out, labels_out) if label == class_id]))
-        for class_id in sorted(set(labels_out))
-    }
-    if len(per_class) < 2:
-        raise ValueError("Module C requires at least two observed validation labels.")
-    return tuple(losses_out), tuple(labels_out), per_class, float(np.mean(list(per_class.values())))
+    per_class, macro_loss, micro_loss = _summarize_validation_log_losses(
+        losses_out, labels_out
+    )
+    return tuple(losses_out), tuple(labels_out), per_class, macro_loss, micro_loss
 
 
 def _remove_dynamic_controller(model: nn.Module) -> None:
@@ -630,8 +631,9 @@ def _anchor_task_head(
     effective_classes: int,
     lr_schedule_values: Optional[Sequence[float]] = None,
     wd_schedule_values: Optional[Sequence[float]] = None,
+    formal_epoch_zero_steps: Optional[int] = None,
 ) -> Dict[str, Any]:
-    initial_losses, _labels, initial_per_class, initial_macro = _validation_losses(
+    initial_losses, _labels, initial_per_class, initial_macro, initial_micro = _validation_losses(
         args, model, validation_batches, device
     )
     del initial_losses
@@ -652,9 +654,10 @@ def _anchor_task_head(
         criterion,
         lr_schedule_values=lr_schedule_values,
         wd_schedule_values=wd_schedule_values,
+        formal_epoch_zero_steps=formal_epoch_zero_steps,
         optimizer_schedule_trace=optimizer_schedule_trace,
     ) if head_names else (None, 0, 0)
-    _final_losses, _labels, final_per_class, final_macro = _validation_losses(
+    _final_losses, _labels, final_per_class, final_macro, final_micro = _validation_losses(
         args, model, validation_batches, device
     )
     parameter_delta_sq = 0.0
@@ -675,28 +678,14 @@ def _anchor_task_head(
         "validation_loss_before": float(initial_macro),
         "validation_loss_after": float(final_macro),
         "validation_loss_improvement": float(initial_macro - final_macro),
+        "validation_micro_log_loss_before": float(initial_micro),
+        "validation_micro_log_loss_after": float(final_micro),
         "validation_per_class_before": initial_per_class,
         "validation_per_class_after": final_per_class,
         "uniform_log_loss_reference": uniform_reference,
         "below_uniform_reference": bool(final_macro < uniform_reference),
         "validity_role": "diagnostic_only_not_a_selection_gate",
     }
-
-
-def _paired_evidence(reference: _BranchEvaluation, candidate: _BranchEvaluation) -> PairedRiskEvidence:
-    if reference.labels != candidate.labels or reference.subjects != candidate.subjects:
-        raise RuntimeError("Module C matched branches lost validation sample alignment.")
-    grouped: Dict[str, Dict[int, List[float]]] = {}
-    for reference_loss, candidate_loss, class_id, subject_id in zip(
-        reference.per_sample_loss,
-        candidate.per_sample_loss,
-        reference.labels,
-        reference.subjects,
-    ):
-        grouped.setdefault(subject_id, {}).setdefault(class_id, []).append(
-            float(reference_loss - candidate_loss)
-        )
-    return cluster_jackknife_evidence(grouped)
 
 
 def _canonical_subset(actions: Sequence[str], candidate_order: Sequence[str]) -> Tuple[str, ...]:
@@ -730,21 +719,6 @@ def _validate_probe_training_controls(args: Any) -> None:
         )
 
 
-def _trial_from_branches(
-    label: str,
-    base: _BranchEvaluation,
-    candidate: _BranchEvaluation,
-) -> ActionTrial:
-    return ActionTrial(
-        label=label,
-        base_subset=base.subset,
-        candidate_subset=candidate.subset,
-        added_actions=tuple(action for action in candidate.subset if action not in base.subset),
-        parameter_count=int(candidate.adapter_parameter_count),
-        evidence=_paired_evidence(base, candidate),
-    )
-
-
 def _write_csv(path: str, rows: Sequence[Mapping[str, Any]]) -> str:
     if not path or not rows:
         return ""
@@ -776,19 +750,39 @@ def _write_json(path: str, payload: Mapping[str, Any]) -> str:
     return path
 
 
-def _decision_rows(search_steps: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+def _subset_label(subset: Sequence[str]) -> str:
+    return "+".join(subset) if subset else "EMPTY"
+
+
+def _decision_rows(
+    branches: Mapping[Tuple[str, ...], _BranchEvaluation],
+    decision: ExhaustiveDecision,
+    branch_gains: Mapping[str, float],
+) -> List[Dict[str, Any]]:
+    rank_by_subset = {
+        subset: rank for rank, subset in enumerate(decision.ranked_subsets, start=1)
+    }
     rows: List[Dict[str, Any]] = []
-    for step_index, step in enumerate(search_steps, start=1):
-        for label, record in step.get("trial_diagnostics", {}).items():
-            rows.append(
-                {
-                    "step": step_index,
-                    "stage": step.get("stage", ""),
-                    "trial": label,
-                    "selected_after_stage": step.get("selected_after", []),
-                    **record,
-                }
-            )
+    for subset in (subset for subset in branches if subset):
+        evaluation = branches[subset]
+        label = _subset_label(subset)
+        rows.append(
+            {
+                "branch": label,
+                "subset": list(subset),
+                "rank": rank_by_subset[subset],
+                "selected": int(subset == decision.selected_subset),
+                "selection_status": decision.selection_status,
+                "runner_up_subset": list(decision.runner_up_subset),
+                "selection_gap": float(decision.selection_gap),
+                "branch_gain": float(branch_gains[label]),
+                "per_class_gain": dict(decision.per_class_gain[label]),
+                "conditional_contributions": dict(decision.conditional_contributions),
+                "pair_interactions": dict(decision.pair_interactions),
+                "triple_interaction": decision.triple_interaction,
+                **evaluation.summary(),
+            }
+        )
     return rows
 
 
@@ -804,30 +798,36 @@ def run_module_c_preflight_selection(
     lr_schedule_values: Optional[Sequence[float]] = None,
     wd_schedule_values: Optional[Sequence[float]] = None,
 ) -> ModuleCPreflightResult:
-    """Resolve a nonempty B/D/E subset with matched one-pass branch trials."""
+    """Resolve a nonempty B/D/E subset with matched exhaustive branch trials."""
 
     started = time.perf_counter()
     raw_classes = int(getattr(args, "nb_classes", 0))
     effective_classes = 2 if raw_classes == 1 else raw_classes
     if str(getattr(args, "task_mod", "")) != "Classification" or effective_classes < 2:
-        raise ValueError("Module C task-aligned search supports classification with at least two labels.")
+        raise ValueError("Module C exhaustive selection supports classification with at least two labels.")
     _validate_probe_training_controls(args)
     candidate_modules = tuple(parse_module_ids(getattr(args, "module_c_candidates", "B,D,E")))
-    if not candidate_modules:
-        raise ValueError("Module C requires at least one B/D/E candidate.")
+    canonical_candidates = tuple(DEFAULT_CANDIDATE_MODULES)
+    if candidate_modules != canonical_candidates:
+        raise ValueError(
+            "Automatic Module C exhaustive selection requires exactly canonical B,D,E candidates; "
+            f"got {','.join(candidate_modules) or 'EMPTY'}."
+        )
     if data_loader_train is None or data_loader_val is None:
         raise RuntimeError("Module C requires distinct support/train and validation dataloaders.")
+    if bool(getattr(data_loader_train, "drop_last", False)):
+        raise ValueError("Module C exhaustive support requires drop_last=False for complete coverage.")
 
-    if num_training_steps_per_epoch is None:
-        formal_support_batch_limit = len(data_loader_train)
-    else:
-        formal_support_batch_limit = int(num_training_steps_per_epoch) * max(
-            1, int(getattr(args, "update_freq", 1))
-        )
+    support_loader_batch_count = len(data_loader_train)
     support_batch_limit = _resolve_module_c_support_batch_limit(
-        formal_support_batch_limit,
+        support_loader_batch_count,
         int(getattr(args, "module_c_preflight_train_batches", 0)),
     )
+    formal_epoch_zero_steps = (
+        None if num_training_steps_per_epoch is None else int(num_training_steps_per_epoch)
+    )
+    if formal_epoch_zero_steps is not None and formal_epoch_zero_steps <= 0:
+        raise ValueError("Module C requires positive formal epoch-zero schedule geometry.")
     support_batches = _collect_probe_batches(data_loader_train, support_batch_limit)
     validation_batches = _collect_probe_batches(
         data_loader_val, int(getattr(args, "module_c_preflight_val_batches", 0))
@@ -851,6 +851,7 @@ def run_module_c_preflight_selection(
         effective_classes,
         lr_schedule_values=lr_schedule_values,
         wd_schedule_values=wd_schedule_values,
+        formal_epoch_zero_steps=formal_epoch_zero_steps,
     )
     anchored_named = dict(model.named_parameters())
     if set(anchored_named) != set(original_trainability):
@@ -875,10 +876,6 @@ def run_module_c_preflight_selection(
     model.to(device)
     injection_complete_rng = capture_module_c_rng_state()
 
-    validation_example_count = sum(int(batch[1].numel()) for batch in validation_batches)
-    validation_subjects = _validation_subject_ids(
-        data_loader_val, len(validation_batches), validation_example_count
-    )
     expected_classes = set(range(effective_classes))
 
     branch_cache: Dict[Tuple[str, ...], _BranchEvaluation] = {}
@@ -913,9 +910,10 @@ def run_module_c_preflight_selection(
             controller=controller,
             lr_schedule_values=lr_schedule_values,
             wd_schedule_values=wd_schedule_values,
+            formal_epoch_zero_steps=formal_epoch_zero_steps,
             optimizer_schedule_trace=optimizer_schedule_trace,
         )
-        losses, labels, per_class_loss, macro_loss = _validation_losses(
+        losses, labels, per_class_loss, macro_loss, micro_loss = _validation_losses(
             branch_args, model, validation_batches, device
         )
         observed_classes = set(labels)
@@ -924,8 +922,9 @@ def run_module_c_preflight_selection(
                 f"Module C validation split must contain every expected label; expected={sorted(expected_classes)}, "
                 f"observed={sorted(observed_classes)}."
             )
-        if len(losses) != len(validation_subjects):
-            raise RuntimeError("Module C validation loss and subject metadata lengths differ.")
+        empty_evaluation = branch_cache.get(())
+        if empty_evaluation is not None and labels != empty_evaluation.labels:
+            raise RuntimeError("Module C matched branches lost validation sample alignment.")
         named = dict(model.named_parameters())
         adapter_count = sum(
             int(named[name].numel())
@@ -936,9 +935,9 @@ def run_module_c_preflight_selection(
             subset=subset,
             per_sample_loss=losses,
             labels=labels,
-            subjects=validation_subjects,
             per_class_loss=per_class_loss,
-            class_balanced_loss=macro_loss,
+            macro_loss=macro_loss,
+            micro_loss=micro_loss,
             support_loss=support_loss,
             support_examples=support_examples,
             optimizer_steps=optimizer_steps,
@@ -952,116 +951,41 @@ def run_module_c_preflight_selection(
         branch_cache[subset] = evaluation
         return evaluation
 
-    search_steps: List[Dict[str, Any]] = []
-    retired_actions: List[str] = []
-    empty_branch = evaluate_subset(())
-    primary_trials = [
-        _trial_from_branches(action, empty_branch, evaluate_subset((action,)))
-        for action in candidate_modules
-    ]
-    primary = choose_action(primary_trials, require_nonempty=True, alpha=MODULE_C_ALPHA)
-    if primary.selected_trial is None:
-        raise RuntimeError("Module C nonempty primary selection returned no action.")
-    selected = tuple(primary.selected_subset)
-    final_evidence_strength = primary.evidence_strength
-    search_steps.append(
-        {
-            "stage": "primary",
-            "reference_subset": [],
-            "selected_after": list(selected),
-            "reason": primary.reason,
-            "evidence_strength": primary.evidence_strength,
-            "trial_diagnostics": primary.trial_diagnostics,
-        }
-    )
+    exhaustive_subsets = enumerate_action_subsets(candidate_modules)
+    for subset in ((), *exhaustive_subsets):
+        evaluate_subset(subset)
 
-    stop_reason = "all_registry_actions_selected"
-    while True:
-        remaining = [
-            action
-            for action in candidate_modules
-            if action not in selected and action not in retired_actions
-        ]
-        if not remaining:
-            stop_reason = (
-                "all_available_actions_selected"
-                if retired_actions
-                else "all_registry_actions_selected"
-            )
-            break
-        reference = evaluate_subset(selected)
-        addition_trials = []
-        for action in remaining:
-            candidate_subset = _canonical_subset((*selected, action), candidate_modules)
-            addition_trials.append(
-                _trial_from_branches(
-                    "+".join(candidate_subset), reference, evaluate_subset(candidate_subset)
-                )
-            )
-        addition: Optional[SearchDecision] = None
-        if addition_trials:
-            addition = choose_action(addition_trials, require_nonempty=False, alpha=MODULE_C_ALPHA)
-            search_steps.append(
-                {
-                    "stage": "conditional_addition",
-                    "reference_subset": list(selected),
-                    "selected_after": list(addition.selected_subset or selected),
-                    "reason": addition.reason,
-                    "evidence_strength": addition.evidence_strength,
-                    "trial_diagnostics": addition.trial_diagnostics,
-                }
-            )
-        if addition is not None and addition.selected_trial is not None:
-            selected = tuple(addition.selected_subset)
-            final_evidence_strength = addition.evidence_strength
-            continue
-
-        pair_trials = []
-        if len(selected) == 1 and len(remaining) >= 2:
-            for pair in itertools.combinations(remaining, 2):
-                candidate_subset = _canonical_subset(pair, candidate_modules)
-                pair_trials.append(
-                    _trial_from_branches(
-                        "+".join(candidate_subset), reference, evaluate_subset(candidate_subset)
-                    )
-                )
-        if pair_trials:
-            rescue = choose_action(pair_trials, require_nonempty=False, alpha=MODULE_C_ALPHA)
-            rescue_reason = (
-                "supported_alternative_pair_gain"
-                if rescue.selected_trial is not None
-                else "no_supported_alternative_pair_gain"
-            )
-            search_steps.append(
-                {
-                    "stage": "alternative_pair_rescue",
-                    "reference_subset": list(selected),
-                    "selected_after": list(rescue.selected_subset or selected),
-                    "reason": rescue_reason,
-                    "evidence_strength": rescue.evidence_strength,
-                    "trial_diagnostics": rescue.trial_diagnostics,
-                }
-            )
-            if rescue.selected_trial is not None:
-                retired_actions.extend(selected)
-                selected = tuple(rescue.selected_subset)
-                final_evidence_strength = rescue.evidence_strength
-                continue
-            stop_reason = "no_supported_conditional_or_alternative_pair_gain"
-            break
-
-        stop_reason = "no_supported_conditional_gain"
-        break
-
-    final_reason = f"{primary.reason};{stop_reason}"
+    branch_risks = {
+        subset: SubsetRisk(
+            subset=subset,
+            macro_loss=evaluation.macro_loss,
+            micro_loss=evaluation.micro_loss,
+            per_class_loss=evaluation.per_class_loss,
+            adapter_parameter_count=evaluation.adapter_parameter_count,
+        )
+        for subset, evaluation in branch_cache.items()
+    }
+    exhaustive_decision = select_exhaustive_subset(branch_risks, candidate_modules)
+    selected = tuple(exhaustive_decision.selected_subset)
+    final_reason = "global_minimum_validation_macro_log_loss"
     final_decision = ModuleCDecision(
-        selected_modules=tuple(selected),
+        selected_modules=selected,
         reason=final_reason,
-        evidence_strength=final_evidence_strength,
-        search_steps=tuple(search_steps),
+        selection_status=exhaustive_decision.selection_status,
+        runner_up_modules=tuple(exhaustive_decision.runner_up_subset),
+        selection_gap=float(exhaustive_decision.selection_gap),
+        observed_gain=float(exhaustive_decision.observed_gain),
+        ranked_subsets=tuple(exhaustive_decision.ranked_subsets),
+        conditional_contributions=dict(exhaustive_decision.conditional_contributions),
+        pair_interactions=dict(exhaustive_decision.pair_interactions),
+        triple_interaction=exhaustive_decision.triple_interaction,
     )
-
-    primary_diagnostics = search_steps[0]["trial_diagnostics"]
+    empty_macro_loss = branch_cache[()].macro_loss
+    branch_gains = {
+        _subset_label(subset): float(empty_macro_loss - evaluation.macro_loss)
+        for subset, evaluation in branch_cache.items()
+        if subset
+    }
     diagnostics_by_module: Dict[str, Dict[str, Any]] = {}
     for action in candidate_modules:
         replacements = ownership.action_replacement_names[action]
@@ -1079,13 +1003,16 @@ def run_module_c_preflight_selection(
             "functional_role": DEFAULT_CANDIDATE_MODULES[action]["role"],
             "functional_blocks": list(DEFAULT_CANDIDATE_MODULES[action]["blocks"]),
             "functional_diagnostics_used_for_ranking": 0,
-            "common_ranking_measure": "paired_class_balanced_validation_log_loss",
+            "common_ranking_measure": "validation_macro_log_loss",
             "adapter_parameter_count": int(ownership.parameter_counts[action]),
             "adapter_parameter_names": list(ownership.action_parameter_names[action]),
             "replacement_names": list(replacements),
             "structural_branches_reference_only": structural_branches,
             "selected": int(action in selected),
-            "primary_trial": primary_diagnostics.get(action, {}),
+            "singleton_branch": branch_cache[(action,)].summary(),
+            "singleton_gain": branch_gains[action],
+            "per_class_gain": dict(exhaustive_decision.per_class_gain[action]),
+            "conditional_contribution": exhaustive_decision.conditional_contributions.get(action),
         }
 
     setattr(args, "module_c_enable", True)
@@ -1107,48 +1034,43 @@ def run_module_c_preflight_selection(
         "candidate_modules": list(candidate_modules),
         "selected_modules": list(selected),
         "selection_reason": final_reason,
-        "primary_evidence_strength": primary.evidence_strength,
-        "final_evidence_strength": final_evidence_strength,
-        "final_evidence_definition": "evidence strength of the final accepted search transition; primary evidence is preserved separately",
-        "score_definition": "paired_validation_log_loss: loss(reference_subset) - loss(candidate_subset)",
-        "positive_sign": "candidate branch lowers validation log-loss",
-        "aggregation_order": "windows_within_subject_class_then_subjects_within_class_then_equal_class_mean",
-        "uncertainty": {
-            "method": "delete_one_subject_cluster_jackknife",
-            "minimum_subject_clusters": 3,
-            "minimum_cluster_reason": "estimate between-subject dispersion with at least two t-test degrees of freedom",
-            "alpha": MODULE_C_ALPHA,
-            "alpha_source": "conventional_fixed_type_I_error_rate",
-            "gain_multiplicity": "Holm correction across candidate gains within each measured search stage",
-            "harm_multiplicity": "Holm correction across every candidate-by-class harm test within each measured search stage",
-            "window_independence_claimed": 0,
-            "inference_role": "within_stage_stability_screen_not_post_selection_inference",
-            "adaptive_reuse_note": "the same validation split guides sequential stages, so p-values are evidence controls rather than confirmatory guarantees",
+        "selection_status": exhaustive_decision.selection_status,
+        "runner_up_modules": list(exhaustive_decision.runner_up_subset),
+        "selection_gap": float(exhaustive_decision.selection_gap),
+        "selected_observed_gain": float(exhaustive_decision.observed_gain),
+        "ranked_subsets": [list(subset) for subset in exhaustive_decision.ranked_subsets],
+        "score_definition": "validation_macro_log_loss",
+        "gain_definition": "EMPTY_validation_macro_log_loss_minus_branch_validation_macro_log_loss",
+        "aggregation_order": "per_example_log_loss_then_per_class_mean_then_equal_class_macro_mean",
+        "exhaustive_selection": {
+            "strategy": "evaluate_EMPTY_and_every_BDE_subset_once_then_rank_globally",
+            "selectable_branch_count": len(exhaustive_subsets),
+            "empty_is_selectable": 0,
+            "tie_break_order": [
+                "validation_macro_log_loss",
+                "fewer_actions",
+                "fewer_adapter_parameters",
+                "canonical_BDE_order",
+            ],
         },
-        "nonempty_rule": {
-            "supported": "choose the largest supported paired gain with no supported class harm",
-            "weak": "if required, choose the largest observed gain without supported class harm",
-            "mandatory": "if every action has supported harm, maximize the worst observed class effect",
+        "branch_gains": branch_gains,
+        "per_class_gains": {
+            label: dict(gains)
+            for label, gains in exhaustive_decision.per_class_gain.items()
         },
-        "search": {
-            "strategy": "hierarchical_forward_addition_and_alternative_pair_rescue",
-            "supported_candidate_ranking": "largest paired class-balanced gain, then largest worst-class gain, then fewer adapter parameters only on an exact evidence tie",
-            "complexity_policy": "parameter count is reported and used only as an exact tie-break; no unexplained weighted penalty is added",
-            "pair_order": 2,
-            "pair_order_reason": "lowest interaction order that can represent synergy or conflict",
-            "alternative_pair_scope": "only after every one-action extension of a singleton fails",
-            "alternative_pair_reference": "compare pairs formed only from remaining actions directly against the current singleton",
-            "forward_only_after_replacement": 1,
-            "retired_actions": retired_actions,
-            "search_steps": search_steps,
-        },
+        "conditional_contributions": dict(exhaustive_decision.conditional_contributions),
+        "pair_interactions": dict(exhaustive_decision.pair_interactions),
+        "triple_interaction": exhaustive_decision.triple_interaction,
         "head_anchor": head_anchor,
         "probe_training": {
             "support_passes_per_branch": 1,
-            "budget_unit_reason": "one complete formal-visible support epoch; Ada drop_last=True excludes the raw tail",
+            "budget_unit_reason": "one complete sequential no-drop support pass",
             "optimizer": str(getattr(args, "opt", "")),
             "base_learning_rate": float(getattr(args, "lr", 0.0)),
-            "learning_rate_rule": "formal epoch-0 schedule; constant and plateau modes retain configured optimizer LR",
+            "learning_rate_rule": "formal epoch-zero schedule geometry",
+            "partial_accumulation_tail_schedule_rule": "reuse_final_epoch_zero_lr_and_weight_decay_without_consuming_next_epoch",
+            "partial_accumulation_gradient_rule": "average_over_the_actual_number_of_microbatches_in_each_step",
+            "formal_epoch_zero_optimizer_steps": formal_epoch_zero_steps,
             "weight_decay": float(getattr(args, "weight_decay", 0.0)),
             "lora_base_update": str(getattr(args, "lora_base_update", "")),
             "full_update_base_control": "same_pre_injection_base_trainability_for_every_branch",
@@ -1156,10 +1078,10 @@ def run_module_c_preflight_selection(
             "lora_alpha": float(getattr(args, "lora_alpha", 0.0)),
             "lora_dropout": float(getattr(args, "lora_dropout", 0.0)),
             "support_batch_cap": train_cap,
-            "support_formal_batch_limit": formal_support_batch_limit,
+            "support_loader_batch_count": support_loader_batch_count,
             "support_effective_batch_limit": support_batch_limit,
             "validation_batch_cap": val_cap,
-            "support_scope": "formal_visible" if support_batch_limit >= formal_support_batch_limit else "debug_capped",
+            "support_scope": "complete" if train_cap <= 0 else "debug_capped",
             "validation_scope": "complete" if val_cap <= 0 else "debug_capped",
             "support_loader": {
                 "sampler_type": type(getattr(data_loader_train, "sampler", None)).__name__,
@@ -1194,7 +1116,7 @@ def run_module_c_preflight_selection(
             "support_pass_count": len(branch_cache) + int(head_anchor["support_passes"]),
             "validation_pass_count": len(branch_cache) + 2,
         },
-        "claim_boundary": "low_fidelity_validation_guided_subset_search_not_a_guarantee_of_the_final_test_winner",
+        "claim_boundary": "exhaustive_low_fidelity_BDE_selection_not_a_guarantee_of_the_final_test_winner",
         "recipe": build_module_c_recipe(
             selected,
             registry=DEFAULT_CANDIDATE_MODULES,
@@ -1208,7 +1130,7 @@ def run_module_c_preflight_selection(
     if is_main_process and output_dir:
         score_path = _write_csv(
             os.path.join(output_dir, MODULE_C_PREFLIGHT_SCORE_FILE),
-            _decision_rows(search_steps),
+            _decision_rows(branch_cache, exhaustive_decision, branch_gains),
         )
         decision_path = _write_json(
             os.path.join(output_dir, MODULE_C_PREFLIGHT_DECISION_FILE),
@@ -1216,9 +1138,10 @@ def run_module_c_preflight_selection(
         )
 
     print(
-        "[ModuleC] task-aligned search selected "
-        f"{','.join(selected)}; primary_evidence={primary.evidence_strength}; "
-        f"final_evidence={final_evidence_strength}; "
+        "[ModuleC] exhaustive low-fidelity selection chose "
+        f"{','.join(selected)}; status={exhaustive_decision.selection_status}; "
+        f"runner_up={','.join(exhaustive_decision.runner_up_subset)}; "
+        f"gap={exhaustive_decision.selection_gap:.6g}; "
         f"branches={len(branch_cache)}, elapsed={total_seconds:.1f}s."
     )
     return ModuleCPreflightResult(

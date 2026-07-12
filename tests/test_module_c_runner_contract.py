@@ -1,14 +1,22 @@
+import argparse
+import json
 import os
 import pathlib
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from torch.utils.data import RandomSampler, TensorDataset
 
 import run_finetuning
-from run_finetuning import _ensure_module_c_preflight_has_no_resume
+from run_finetuning import (
+    _ensure_module_c_preflight_has_no_resume,
+    _ensure_module_c_preflight_is_single_process,
+)
+from util.fb_policy import add_fb_args, resolve_functional_args
+from util.module_c_lora_search import build_module_c_recipe, parse_module_ids
 from util.utils import auto_load_model, resolve_resume_checkpoint
 
 
@@ -24,20 +32,31 @@ class ModuleCRunnerContractTests(unittest.TestCase):
             enable_deepspeed=enable_deepspeed,
         )
 
-    def test_decision_lookup_follows_remote_results_symlink(self):
-        runner = pathlib.Path(__file__).resolve().parents[1] / "run_c_task_aligned_seed0_4datasets_5090.sh"
-        text = runner.read_text(encoding="utf-8")
+    def test_public_experiment_manifest_tracks_the_exhaustive_status_contract(self):
+        root = pathlib.Path(__file__).resolve().parents[1]
+        manifest_path = root / "experiment_manifests" / "module_c_exhaustive_seed0_4datasets.json"
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
 
-        self.assertIn("find -L finetuning_results", text)
-
-    def test_status_prefers_final_path_evidence_strength(self):
-        runner = pathlib.Path(__file__).resolve().parents[1] / "run_c_task_aligned_seed0_4datasets_5090.sh"
-        text = runner.read_text(encoding="utf-8")
-
-        self.assertIn(
-            'payload.get("final_evidence_strength", payload.get("primary_evidence_strength", "NA"))',
-            text,
+        self.assertEqual(manifest["entrypoint"], "run_finetuning.py")
+        self.assertEqual(manifest["matrix"]["seeds"], [0])
+        self.assertEqual(
+            manifest["matrix"]["datasets"],
+            ["TUEV", "Sleep-EDF", "BCI-IV-2A", "SEED-IV"],
         )
+        self.assertEqual(
+            manifest["matrix"]["models"],
+            ["EEGPT", "BIOT", "LaBraM", "CBraMod", "Gram", "CSBrain"],
+        )
+        self.assertIn("selection_status", manifest["decision_artifact"]["status_fields"])
+        serialized = json.dumps(manifest).lower()
+        self.assertNotIn("evidence_strength", serialized)
+        self.assertNotIn("task_aligned", serialized)
+
+    def test_module_c_public_contract_contains_no_tracked_shell_runner(self):
+        root = pathlib.Path(__file__).resolve().parents[1]
+        self.assertFalse((root / "run_c_exhaustive_seed0_4datasets_5090.sh").exists())
+        self.assertFalse((root / "run_c_exhaustive_tuev_3seed_5070.bat").exists())
 
     def test_pure_resume_resolver_handles_explicit_newest_auto_and_none(self):
         with tempfile.TemporaryDirectory() as output_dir:
@@ -122,6 +141,13 @@ class ModuleCRunnerContractTests(unittest.TestCase):
                 self._resume_args(output_dir, auto_resume=False)
             )
 
+    def test_automatic_module_c_rejects_distributed_topology_selection(self):
+        with patch("run_finetuning.utils.get_world_size", return_value=1):
+            _ensure_module_c_preflight_is_single_process()
+        with patch("run_finetuning.utils.get_world_size", return_value=2):
+            with self.assertRaisesRegex(RuntimeError, "single-process|world_size=1"):
+                _ensure_module_c_preflight_is_single_process()
+
     def test_formal_training_loader_remains_random_and_drop_last(self):
         make_loader = getattr(run_finetuning, "_make_formal_train_loader", None)
         self.assertIsNotNone(
@@ -145,32 +171,61 @@ class ModuleCRunnerContractTests(unittest.TestCase):
         self.assertEqual(len(set(visible_ids)), 9)
         self.assertTrue(set(visible_ids).issubset(set(range(11))))
 
-    def test_documentation_describes_formal_visible_support_and_complete_validation(self):
+    def test_documentation_describes_complete_support_and_validation(self):
         root = pathlib.Path(__file__).resolve().parents[1]
         readme = (root / "README.md").read_text(encoding="utf-8")
         help_text = (root / "util" / "fb_policy.py").read_text(encoding="utf-8")
-        design = (
-            root
-            / "docs"
-            / "superpowers"
-            / "specs"
-            / "2026-07-12-module-c-task-aligned-search-design.md"
-        ).read_text(encoding="utf-8")
-        plan = (
-            root
-            / "docs"
-            / "superpowers"
-            / "plans"
-            / "2026-07-12-module-c-task-aligned-search-plan.md"
-        ).read_text(encoding="utf-8")
-        combined = "\n".join((readme, help_text, design, plan)).lower()
-        self.assertIn("complete formal-visible support epoch", combined)
-        self.assertIn("drop_last=true", combined)
-        self.assertIn("raw tail", combined)
-        self.assertIn("validation", combined)
+        combined = "\n".join((readme, help_text)).lower()
+        self.assertIn("complete support", combined)
         self.assertIn("drop_last=false", combined)
-        self.assertNotIn("complete support and validation splits", readme.lower())
-        self.assertNotIn("full train split", help_text.lower())
+        self.assertIn("validation", combined)
+        self.assertNotIn("subject-cluster", combined)
+        self.assertNotIn("holm", combined)
+        self.assertNotIn("hierarchical_forward", combined)
+
+    def test_c_accepts_only_bde_and_never_emits_qv_metadata(self):
+        with self.assertRaises(ValueError):
+            parse_module_ids("B,qv,E")
+
+        recipe = build_module_c_recipe(("B", "E"))
+        self.assertNotIn("qv", str(recipe).lower())
+
+    def test_parser_keeps_batch_caps_as_debug_controls(self):
+        parser = argparse.ArgumentParser()
+        add_fb_args(parser)
+        args = parser.parse_args([])
+
+        self.assertEqual(args.module_c_preflight_train_batches, 0)
+        self.assertEqual(args.module_c_preflight_val_batches, 0)
+        self.assertFalse(args.module_c_preflight_only)
+        self.assertFalse(hasattr(args, "module_c_rgfs_harm_threshold"))
+        self.assertFalse(hasattr(args, "module_c_probe_head_steps"))
+
+    def test_parser_exposes_preflight_only_for_no_training_verification(self):
+        parser = argparse.ArgumentParser()
+        add_fb_args(parser)
+        args = parser.parse_args(["--module_c_preflight_only"])
+
+        self.assertTrue(args.module_c_preflight_only)
+
+    def test_disabled_preflight_requires_an_explicit_nonempty_bde_selection(self):
+        parser = argparse.ArgumentParser()
+        add_fb_args(parser)
+        args = parser.parse_args(["--module_c_no_preflight"])
+        args.lora_target = "module_c"
+
+        with self.assertRaisesRegex(ValueError, "nonempty --module_c_selected"):
+            resolve_functional_args(args)
+
+    def test_automatic_preflight_rejects_a_partial_or_reordered_registry(self):
+        parser = argparse.ArgumentParser()
+        add_fb_args(parser)
+        for candidates in ("B,D", "E,D,B"):
+            with self.subTest(candidates=candidates):
+                args = parser.parse_args(["--module_c_candidates", candidates])
+                args.lora_target = "module_c"
+                with self.assertRaisesRegex(ValueError, "exactly B,D,E"):
+                    resolve_functional_args(args)
 
 
 if __name__ == "__main__":
