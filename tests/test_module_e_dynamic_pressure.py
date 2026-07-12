@@ -91,13 +91,12 @@ class _FakeScaledLoss:
 
 
 class _FakeGradScaler:
-    def __init__(self, events, parameter, fail_step=False, skip_step=False, grow_scale=False):
+    def __init__(self, events, parameter, fail_step=False, skip_step=False, fail_update=False):
         self.events = events
         self.parameter = parameter
         self.fail_step = fail_step
         self.skip_step = skip_step
-        self.grow_scale = grow_scale
-        self._scale = 8.0
+        self.fail_update = fail_update
 
     def scale(self, _loss):
         return _FakeScaledLoss(self.events, self.parameter)
@@ -105,20 +104,26 @@ class _FakeGradScaler:
     def unscale_(self, _optimizer):
         self.events.append("unscale")
 
-    def step(self, _optimizer):
+    def step(self, optimizer):
         self.events.append("step")
         if self.fail_step:
             raise RuntimeError("step failed")
-
-    def get_scale(self):
-        return self._scale
+        if self.skip_step:
+            return None
+        return optimizer.step()
 
     def update(self):
         self.events.append("update")
-        if self.skip_step:
-            self._scale *= 0.5
-        elif self.grow_scale:
-            self._scale *= 2.0
+        if self.fail_update:
+            raise RuntimeError("update failed")
+
+
+class _NoPostHookOptimizer:
+    def __init__(self, parameter):
+        self.param_groups = [{"params": [parameter], "lr": 0.1}]
+
+    def step(self):
+        raise AssertionError("optimizer.step must not run without post-hook support")
 
 
 class _FailOnceLrGroup(dict):
@@ -383,7 +388,7 @@ class ModuleEDynamicPressureTests(unittest.TestCase):
             )
         self.assertEqual(
             events,
-            ["backward", "unscale", "before", "clip", "step", "update", "after:1"],
+            ["backward", "unscale", "before", "clip", "step", "after:1", "update"],
         )
 
         events.clear()
@@ -451,15 +456,15 @@ class ModuleEDynamicPressureTests(unittest.TestCase):
 
         self.assertEqual(optimizer.param_groups[0]["lr"], 0.1)
         self.assertEqual(
-            events, ["backward", "unscale", "before", "step", "update", "after:0"]
+            events, ["backward", "unscale", "before", "step", "after:0", "update"]
         )
 
-    def test_native_scaler_treats_grown_scale_as_success(self):
+    def test_native_scaler_observes_real_optimizer_step_with_none_return(self):
         parameter = nn.Parameter(torch.ones(1))
         optimizer = torch.optim.SGD([parameter], lr=0.1)
         events = []
         scaler = object.__new__(NativeScalerWithGradNormCount)
-        scaler._scaler = _FakeGradScaler(events, parameter, grow_scale=True)
+        scaler._scaler = _FakeGradScaler(events, parameter)
 
         scaler(
             object(),
@@ -472,7 +477,65 @@ class ModuleEDynamicPressureTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(events[-2:], ["update", "after:1"])
+        self.assertEqual(events[-2:], ["after:1", "update"])
+
+    def test_native_scaler_restores_before_update_failure_after_real_step(self):
+        parameter = nn.Parameter(torch.ones(1))
+        optimizer = torch.optim.SGD([parameter], lr=0.1)
+        events = []
+        scaler = object.__new__(NativeScalerWithGradNormCount)
+        scaler._scaler = _FakeGradScaler(events, parameter, fail_update=True)
+
+        def before():
+            events.append("before")
+            optimizer.param_groups[0]["lr"] = 0.5
+
+        def after(step_applied=True):
+            events.append(f"after:{int(step_applied)}")
+            optimizer.param_groups[0]["lr"] = 0.1
+
+        with self.assertRaisesRegex(RuntimeError, "update failed"):
+            scaler(
+                object(),
+                optimizer,
+                parameters=[parameter],
+                update_grad=True,
+                before_optimizer_step=before,
+                after_optimizer_step=after,
+            )
+
+        self.assertEqual(optimizer.param_groups[0]["lr"], 0.1)
+        self.assertEqual(
+            events, ["backward", "unscale", "before", "step", "after:1", "update"]
+        )
+
+    def test_native_scaler_requires_public_post_step_hook_for_after_callback(self):
+        parameter = nn.Parameter(torch.ones(1))
+        optimizer = _NoPostHookOptimizer(parameter)
+        events = []
+        scaler = object.__new__(NativeScalerWithGradNormCount)
+        scaler._scaler = _FakeGradScaler(events, parameter)
+
+        def before():
+            events.append("before")
+            optimizer.param_groups[0]["lr"] = 0.5
+
+        def after(step_applied=True):
+            events.append(f"after:{int(step_applied)}")
+            optimizer.param_groups[0]["lr"] = 0.1
+
+        with self.assertRaisesRegex(RuntimeError, "register_step_post_hook"):
+            scaler(
+                object(),
+                optimizer,
+                parameters=[parameter],
+                update_grad=True,
+                before_optimizer_step=before,
+                after_optimizer_step=after,
+            )
+
+        self.assertEqual(optimizer.param_groups[0]["lr"], 0.1)
+        self.assertEqual(events, ["backward", "unscale", "before", "after:0"])
 
     def test_native_scaler_does_not_finish_when_prepare_callback_raises(self):
         parameter = nn.Parameter(torch.ones(1))

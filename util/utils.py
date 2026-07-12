@@ -512,6 +512,7 @@ class NativeScalerWithGradNormCount:
             self._scaler.unscale_(optimizer)
             before_completed = False
             step_applied = False
+            step_hook_handle = None
             try:
                 if before_optimizer_step is not None:
                     before_optimizer_step()
@@ -521,16 +522,32 @@ class NativeScalerWithGradNormCount:
                     norm = torch.nn.utils.clip_grad_norm_(parameters, clip_grad)
                 else:
                     norm = get_grad_norm_(parameters, layer_names=layer_names)
-                scale_before = float(self._scaler.get_scale())
-                self._scaler.step(optimizer)
-                self._scaler.update()
-                step_applied = float(self._scaler.get_scale()) >= scale_before
+                if after_optimizer_step is not None:
+                    register_post_hook = getattr(optimizer, "register_step_post_hook", None)
+                    if not callable(register_post_hook):
+                        raise RuntimeError(
+                            "Optimizer must support public register_step_post_hook() "
+                            "when an after_optimizer_step callback is used."
+                        )
+
+                    def _mark_step_applied(*_args, **_kwargs):
+                        nonlocal step_applied
+                        step_applied = True
+
+                    step_hook_handle = register_post_hook(_mark_step_applied)
+                try:
+                    self._scaler.step(optimizer)
+                finally:
+                    if step_hook_handle is not None:
+                        step_hook_handle.remove()
+                        step_hook_handle = None
             except BaseException:
                 if before_completed and after_optimizer_step is not None:
                     after_optimizer_step(step_applied=step_applied)
                 raise
             if after_optimizer_step is not None:
                 after_optimizer_step(step_applied=step_applied)
+            self._scaler.update()
         else:
             norm = None
         return norm
