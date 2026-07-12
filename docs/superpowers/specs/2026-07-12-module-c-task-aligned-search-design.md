@@ -18,7 +18,7 @@ The current selector freezes a newly initialized task head, derives one AdamW vi
 6. Estimate uncertainty with delete-one-subject cluster jackknife pseudo-values. Use one-sided `alpha=0.05` tests and Holm correction within each search stage. Window-level independence must never be claimed. Because sequential stages reuse the same validation split, these p-values are stability screens rather than confirmatory post-selection inference.
 7. A supported addition has Holm-adjusted positive evidence for class-balanced gain and no Holm-adjusted evidence of harm for any observed class. Choose the largest point gain among supported actions, then the largest worst-class gain; adapter parameter count breaks only an exact evidence tie.
 8. If no primary action is safe, still return one action because Module C is defined as nonempty. Prefer an action without supported class harm, then the largest class-balanced gain. If all actions show supported harm, maximize the worst class effect. Mark these outcomes as weak or mandatory evidence, never as predicted improvement.
-9. After selecting a primary action, repeat matched conditional additions. When all single additions fail, probe the lowest nontrivial interaction order, a pair of remaining actions. After an addition, compare independently trained, equal-budget smaller subsets and remove an action only when the smaller subset has nonworse observed class-balanced risk and no supported class harm. This is a parsimony rule, not an equivalence claim. Track visited subsets to prevent cycles.
+9. After selecting a primary action, repeat matched one-action additions. If every one-action extension fails while the selected set is still a singleton, evaluate pairs formed only from the remaining actions directly against that singleton. A supported alternative pair replaces the singleton, retires the old action, and may then grow only through supported one-action additions. Once a multi-action path stalls, the search stops; it never deletes an accepted action or jumps directly to a higher-order set. Thus B/D/E can all be selected through a supported chain such as `B -> B+D -> B+D+E`, but not by jumping from failed `B+D` and `B+E` trials directly to `B+D+E`.
 10. Discard every probe model, optimizer, gradient, and task-head state. Restore Python, NumPy, Torch CPU, Torch CUDA, sampler, and DataLoader random state. Rebuild formal training from the original pretrained checkpoint with only the selected actions.
 
 ## Metrics
@@ -56,7 +56,7 @@ The selector uses only a common downstream risk measure for ranking. Module B si
 
 ## Runtime Bound
 
-With B/D/E, the implementation uses one head-anchor pass plus at most seven distinct equal-budget subset branches on the normal forward/rescue path; cached branches are reused by floating deletion. This is at most eight support passes, about 16 percent of a 50-epoch formal run and about 2.3 percent of seven 50-epoch subset runs. Full validation scans can dominate on Sleep-EDF and TUEV, so every decision records measured wall time and `--module_c_preflight_only` is used before formal queues.
+With B/D/E, the implementation uses one head-anchor pass plus at most seven distinct equal-budget subset branches on either the supported forward path or the singleton alternative-pair path. This is at most eight support passes, about 16 percent of a 50-epoch formal run and about 2.3 percent of seven 50-epoch subset runs. Full validation scans can dominate on Sleep-EDF and TUEV, so every decision records measured wall time and `--module_c_preflight_only` is used before formal queues.
 
 ## Validity Failures
 
@@ -64,7 +64,7 @@ Selection must fail explicitly when an expected class is absent from validation,
 
 ## Validation Before Formal Experiments
 
-- Unit-test primary selection, weak nonempty fallback, additions, pair rescue, floating deletion, Holm correction, and binary classification.
+- Unit-test primary selection, weak nonempty fallback, supported forward additions, singleton alternative-pair rescue, absence of backward deletion, Holm correction, and binary classification.
 - Smoke-test real B/D/E LoRA injection and disjoint ownership for every supported model, including independent BIOT E ownership.
 - Verify preflight-only mode writes complete decision and branch diagnostics without entering formal training.
 - Verify formal model initialization hashes are identical with and without preflight for the same seed.

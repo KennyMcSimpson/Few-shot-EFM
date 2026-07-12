@@ -29,7 +29,7 @@
 - Produces `PairedRiskEvidence`, `ActionTrial`, `SearchDecision`, `cluster_jackknife_evidence(...)`, `holm_adjust(...)`, and `choose_action(...)`.
 - Consumes subject-class paired loss differences and adapter parameter counts; contains no Torch model code.
 
-- [x] Write failing tests for subject/class macro gain, cluster jackknife uncertainty, Holm adjustment, safe primary selection, weak nonempty fallback, tie-to-smaller action, conditional addition, pair rescue, and floating deletion.
+- [x] Write failing tests for subject/class macro gain, cluster jackknife uncertainty, Holm adjustment, safe primary selection, weak nonempty fallback, tie-to-smaller action, conditional addition, alternative-pair rescue, and the absence of backward deletion.
 - [x] Run `python -m unittest tests.test_module_c_risk_policy -v` and confirm failures are missing new interfaces or old policy behavior.
 - [x] Implement the minimum pure policy and rerun until all policy tests pass.
 - [x] Remove old first-order effect, exact-zero gate, additive independent-effect combination, and `forced_nonempty_least_harm` semantics.
@@ -63,7 +63,7 @@
 - [x] Write failing smoke tests proving the head is trainable before action trials, matched reference/candidate branches see identical support data, direct validation loss replaces `-<g,delta>`, and conditional combinations are evaluated rather than summed. The self-review removed the brittle uniform-loss hard gate and retained it as a diagnostic.
 - [x] Run the smoke tests and confirm old zero-update implementation fails them.
 - [x] Implement one-pass head anchoring, branch snapshot/restore, formal trainability controls, complete support scans, per-example validation losses, and subject metadata grouping.
-- [x] Implement dynamic forward additions, pair rescue, and equal-budget floating deletion using the pure policy.
+- [x] Implement dynamic forward additions and singleton-only alternative-pair rescue using the pure policy; remove backward deletion.
 - [x] Write CSV/JSON diagnostics containing head behavior, branch budgets, per-class effects, confidence evidence, search trace, ownership, and evidence strength.
 - [x] Rerun all Module C tests.
 

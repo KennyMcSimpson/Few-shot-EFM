@@ -2,13 +2,13 @@ import argparse
 import math
 import unittest
 
+import util.module_c_risk_policy as module_c_risk_policy
 from util.fb_policy import add_fb_args, resolve_functional_args
 from util.module_c_lora_search import build_module_c_recipe, parse_module_ids
 from util.module_c_risk_policy import (
     ActionTrial,
     PairedRiskEvidence,
     choose_action,
-    choose_floating_deletion,
     cluster_jackknife_evidence,
     holm_adjust,
 )
@@ -165,7 +165,7 @@ class ModuleCRiskPolicyTests(unittest.TestCase):
         self.assertEqual(decision.selected_subset, ("B", "D"))
         self.assertEqual(decision.reason, "supported_conditional_gain")
 
-    def test_pair_rescue_is_the_same_supported_rule_on_a_joint_branch(self):
+    def test_alternative_pair_uses_the_same_supported_rule_on_a_joint_branch(self):
         decision = choose_action(
             [
                 _trial(
@@ -182,16 +182,8 @@ class ModuleCRiskPolicyTests(unittest.TestCase):
         self.assertEqual(decision.selected_subset, ("B", "D", "E"))
         self.assertEqual(decision.evidence_strength, "supported")
 
-    def test_floating_deletion_prefers_a_nonworse_smaller_subset(self):
-        decision = choose_floating_deletion(
-            [
-                _trial("drop-D", ("B", "E"), _evidence(0.00, {0: 0.01, 1: -0.01}, 0.5), 15, base=("B", "D", "E")),
-                _trial("drop-E", ("B", "D"), _evidence(-0.03, {0: -0.02, 1: -0.04}, 0.8), 20, base=("B", "D", "E")),
-            ]
-        )
-
-        self.assertEqual(decision.selected_subset, ("B", "E"))
-        self.assertEqual(decision.reason, "floating_delete_observed_nonworse")
+    def test_policy_does_not_expose_backward_deletion(self):
+        self.assertFalse(hasattr(module_c_risk_policy, "choose_floating_deletion"))
 
     def test_selector_supports_binary_classes(self):
         evidence = cluster_jackknife_evidence(

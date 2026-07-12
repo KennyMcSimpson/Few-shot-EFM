@@ -79,7 +79,7 @@ import sys
 with open(sys.argv[1], "r", encoding="utf-8") as handle:
     payload = json.load(handle)
 selected = ";".join(payload.get("selected_modules", ())) or "NA"
-strength = str(payload.get("primary_evidence_strength", "NA"))
+strength = str(payload.get("final_evidence_strength", payload.get("primary_evidence_strength", "NA")))
 runtime = payload.get("runtime", {})
 print(selected, strength, runtime.get("branch_count", "NA"), runtime.get("total_seconds", "NA"))
 PY

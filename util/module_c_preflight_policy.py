@@ -33,7 +33,6 @@ from .module_c_risk_policy import (
     PairedRiskEvidence,
     SearchDecision,
     choose_action,
-    choose_floating_deletion,
     cluster_jackknife_evidence,
 )
 from .module_e_structural_routing import (
@@ -865,7 +864,7 @@ def run_module_c_preflight_selection(
         return evaluation
 
     search_steps: List[Dict[str, Any]] = []
-    visited = set()
+    retired_actions: List[str] = []
     empty_branch = evaluate_subset(())
     primary_trials = [
         _trial_from_branches(action, empty_branch, evaluate_subset((action,)))
@@ -875,7 +874,7 @@ def run_module_c_preflight_selection(
     if primary.selected_trial is None:
         raise RuntimeError("Module C nonempty primary selection returned no action.")
     selected = tuple(primary.selected_subset)
-    visited.add(selected)
+    final_evidence_strength = primary.evidence_strength
     search_steps.append(
         {
             "stage": "primary",
@@ -888,14 +887,23 @@ def run_module_c_preflight_selection(
     )
 
     stop_reason = "all_registry_actions_selected"
-    while len(selected) < len(candidate_modules):
+    while True:
+        remaining = [
+            action
+            for action in candidate_modules
+            if action not in selected and action not in retired_actions
+        ]
+        if not remaining:
+            stop_reason = (
+                "all_available_actions_selected"
+                if retired_actions
+                else "all_registry_actions_selected"
+            )
+            break
         reference = evaluate_subset(selected)
-        remaining = [action for action in candidate_modules if action not in selected]
         addition_trials = []
         for action in remaining:
             candidate_subset = _canonical_subset((*selected, action), candidate_modules)
-            if candidate_subset in visited:
-                continue
             addition_trials.append(
                 _trial_from_branches(
                     "+".join(candidate_subset), reference, evaluate_subset(candidate_subset)
@@ -916,78 +924,51 @@ def run_module_c_preflight_selection(
             )
         if addition is not None and addition.selected_trial is not None:
             selected = tuple(addition.selected_subset)
-            visited.add(selected)
-        else:
-            pair_trials = []
-            if len(remaining) >= 2:
-                for pair in itertools.combinations(remaining, 2):
-                    candidate_subset = _canonical_subset((*selected, *pair), candidate_modules)
-                    if candidate_subset in visited:
-                        continue
-                    pair_trials.append(
-                        _trial_from_branches(
-                            "+".join(candidate_subset), reference, evaluate_subset(candidate_subset)
-                        )
-                    )
-            if pair_trials:
-                rescue = choose_action(pair_trials, require_nonempty=False, alpha=MODULE_C_ALPHA)
-                search_steps.append(
-                    {
-                        "stage": "pair_rescue",
-                        "reference_subset": list(selected),
-                        "selected_after": list(rescue.selected_subset or selected),
-                        "reason": rescue.reason,
-                        "evidence_strength": rescue.evidence_strength,
-                        "trial_diagnostics": rescue.trial_diagnostics,
-                    }
-                )
-                if rescue.selected_trial is not None:
-                    selected = tuple(rescue.selected_subset)
-                    visited.add(selected)
-                else:
-                    stop_reason = "no_supported_conditional_or_pair_gain"
-                    break
-            else:
-                stop_reason = "no_supported_conditional_gain"
-                break
+            final_evidence_strength = addition.evidence_strength
+            continue
 
-        if len(selected) > 1:
-            full_branch = evaluate_subset(selected)
-            deletion_trials = []
-            for action in selected:
-                smaller = tuple(item for item in selected if item != action)
-                if not smaller:
-                    continue
-                deletion_trials.append(
+        pair_trials = []
+        if len(selected) == 1 and len(remaining) >= 2:
+            for pair in itertools.combinations(remaining, 2):
+                candidate_subset = _canonical_subset(pair, candidate_modules)
+                pair_trials.append(
                     _trial_from_branches(
-                        f"drop-{action}", full_branch, evaluate_subset(smaller)
+                        "+".join(candidate_subset), reference, evaluate_subset(candidate_subset)
                     )
                 )
-            deletion = choose_floating_deletion(deletion_trials, alpha=MODULE_C_ALPHA)
+        if pair_trials:
+            rescue = choose_action(pair_trials, require_nonempty=False, alpha=MODULE_C_ALPHA)
+            rescue_reason = (
+                "supported_alternative_pair_gain"
+                if rescue.selected_trial is not None
+                else "no_supported_alternative_pair_gain"
+            )
             search_steps.append(
                 {
-                    "stage": "floating_deletion",
+                    "stage": "alternative_pair_rescue",
                     "reference_subset": list(selected),
-                    "selected_after": list(deletion.selected_subset or selected),
-                    "reason": deletion.reason,
-                    "evidence_strength": deletion.evidence_strength,
-                    "trial_diagnostics": deletion.trial_diagnostics,
+                    "selected_after": list(rescue.selected_subset or selected),
+                    "reason": rescue_reason,
+                    "evidence_strength": rescue.evidence_strength,
+                    "trial_diagnostics": rescue.trial_diagnostics,
                 }
             )
-            if deletion.selected_trial is not None:
-                deleted_to = tuple(deletion.selected_subset)
-                if deleted_to in visited:
-                    selected = deleted_to
-                    stop_reason = "floating_deletion_returned_visited_subset"
-                    break
-                selected = deleted_to
-                visited.add(selected)
+            if rescue.selected_trial is not None:
+                retired_actions.extend(selected)
+                selected = tuple(rescue.selected_subset)
+                final_evidence_strength = rescue.evidence_strength
+                continue
+            stop_reason = "no_supported_conditional_or_alternative_pair_gain"
+            break
+
+        stop_reason = "no_supported_conditional_gain"
+        break
 
     final_reason = f"{primary.reason};{stop_reason}"
     final_decision = ModuleCDecision(
         selected_modules=tuple(selected),
         reason=final_reason,
-        evidence_strength=primary.evidence_strength,
+        evidence_strength=final_evidence_strength,
         search_steps=tuple(search_steps),
     )
 
@@ -1034,6 +1015,8 @@ def run_module_c_preflight_selection(
         "selected_modules": list(selected),
         "selection_reason": final_reason,
         "primary_evidence_strength": primary.evidence_strength,
+        "final_evidence_strength": final_evidence_strength,
+        "final_evidence_definition": "evidence strength of the final accepted search transition; primary evidence is preserved separately",
         "score_definition": "paired_validation_log_loss: loss(reference_subset) - loss(candidate_subset)",
         "positive_sign": "candidate branch lowers validation log-loss",
         "aggregation_order": "windows_within_subject_class_then_subjects_within_class_then_equal_class_mean",
@@ -1055,11 +1038,15 @@ def run_module_c_preflight_selection(
             "mandatory": "if every action has supported harm, maximize the worst observed class effect",
         },
         "search": {
-            "strategy": "forward_conditional_addition_pair_rescue_and_floating_deletion",
+            "strategy": "hierarchical_forward_addition_and_alternative_pair_rescue",
             "supported_candidate_ranking": "largest paired class-balanced gain, then largest worst-class gain, then fewer adapter parameters only on an exact evidence tie",
             "complexity_policy": "parameter count is reported and used only as an exact tie-break; no unexplained weighted penalty is added",
             "pair_order": 2,
             "pair_order_reason": "lowest interaction order that can represent synergy or conflict",
+            "alternative_pair_scope": "only after every one-action extension of a singleton fails",
+            "alternative_pair_reference": "compare pairs formed only from remaining actions directly against the current singleton",
+            "forward_only_after_replacement": 1,
+            "retired_actions": retired_actions,
             "search_steps": search_steps,
         },
         "head_anchor": head_anchor,
@@ -1122,6 +1109,7 @@ def run_module_c_preflight_selection(
     print(
         "[ModuleC] task-aligned search selected "
         f"{','.join(selected)}; primary_evidence={primary.evidence_strength}; "
+        f"final_evidence={final_evidence_strength}; "
         f"branches={len(branch_cache)}, elapsed={total_seconds:.1f}s."
     )
     return ModuleCPreflightResult(

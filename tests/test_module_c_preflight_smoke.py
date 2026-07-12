@@ -4,6 +4,7 @@ import random
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 try:
     import torch
@@ -19,6 +20,7 @@ if torch is not None:
         restore_module_c_rng_state,
         run_module_c_preflight_selection,
     )
+    from util.module_c_risk_policy import SearchDecision
 
 
 if torch is not None:
@@ -213,6 +215,106 @@ class ModuleCPreflightSmokeTests(unittest.TestCase):
             primary_step = result.decision.search_steps[0]
             observed_classes = set(primary_step["trial_diagnostics"]["B"]["class_gain"])
             self.assertEqual(observed_classes, {0, 1})
+
+    def test_dead_primary_path_compares_the_alternative_pair_without_building_the_triple(self):
+        support_loader, validation_loader = self._loaders(classes=3)
+        choose_calls = []
+
+        def scripted_choice(trials, require_nonempty, alpha):
+            del alpha
+            trials = tuple(trials)
+            subsets = {tuple(trial.candidate_subset) for trial in trials}
+            choose_calls.append(subsets)
+            if len(choose_calls) == 1:
+                self.assertTrue(require_nonempty)
+                selected = next(trial for trial in trials if trial.candidate_subset == ("B",))
+                return SearchDecision(selected, "nonempty_weak_best_observed_gain", "weak", {})
+            if len(choose_calls) == 2:
+                self.assertFalse(require_nonempty)
+                self.assertEqual(subsets, {("B", "D"), ("B", "E")})
+                return SearchDecision(None, "no_supported_safe_gain", "none", {})
+            if len(choose_calls) == 3:
+                self.assertFalse(require_nonempty)
+                self.assertEqual(subsets, {("D", "E")})
+                selected = next(iter(trials))
+                return SearchDecision(selected, "supported_alternative_pair_gain", "supported", {})
+            self.fail(f"Unexpected additional search stage: {subsets}")
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            with patch("util.module_c_preflight_policy.choose_action", side_effect=scripted_choice):
+                result = run_module_c_preflight_selection(
+                    args=_args(output_dir, classes=3),
+                    model=_TinyGram(classes=3),
+                    data_loader_train=support_loader,
+                    data_loader_val=validation_loader,
+                    device=torch.device("cpu"),
+                )
+
+            self.assertEqual(result.decision.selected_modules, ("D", "E"))
+            self.assertEqual(result.decision.evidence_strength, "supported")
+            self.assertNotIn(("B", "D", "E"), result.branch_traces)
+            self.assertEqual(
+                [step["stage"] for step in result.decision.search_steps],
+                ["primary", "conditional_addition", "alternative_pair_rescue"],
+            )
+            self.assertEqual(
+                result.decision.search_steps[-1]["reason"],
+                "supported_alternative_pair_gain",
+            )
+            with open(result.decision_json_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            self.assertEqual(
+                payload["search"]["strategy"],
+                "hierarchical_forward_addition_and_alternative_pair_rescue",
+            )
+            self.assertEqual(payload["primary_evidence_strength"], "weak")
+            self.assertEqual(payload["final_evidence_strength"], "supported")
+            self.assertEqual(payload["search"]["retired_actions"], ["B"])
+            self.assertNotIn("floating_deletion", json.dumps(payload).lower())
+
+    def test_supported_forward_chain_can_reach_all_three_actions(self):
+        support_loader, validation_loader = self._loaders(classes=3)
+        choose_calls = []
+
+        def scripted_choice(trials, require_nonempty, alpha):
+            del alpha
+            trials = tuple(trials)
+            subsets = {tuple(trial.candidate_subset) for trial in trials}
+            choose_calls.append(subsets)
+            if len(choose_calls) == 1:
+                self.assertTrue(require_nonempty)
+                selected = next(trial for trial in trials if trial.candidate_subset == ("B",))
+                return SearchDecision(selected, "supported_primary_gain", "supported", {})
+            if len(choose_calls) == 2:
+                self.assertFalse(require_nonempty)
+                self.assertEqual(subsets, {("B", "D"), ("B", "E")})
+                selected = next(trial for trial in trials if trial.candidate_subset == ("B", "D"))
+                return SearchDecision(selected, "supported_conditional_gain", "supported", {})
+            if len(choose_calls) == 3:
+                self.assertFalse(require_nonempty)
+                self.assertEqual(subsets, {("B", "D", "E")})
+                selected = next(iter(trials))
+                return SearchDecision(selected, "supported_conditional_gain", "supported", {})
+            self.fail(f"Unexpected additional search stage: {subsets}")
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            with patch("util.module_c_preflight_policy.choose_action", side_effect=scripted_choice):
+                result = run_module_c_preflight_selection(
+                    args=_args(output_dir, classes=3),
+                    model=_TinyGram(classes=3),
+                    data_loader_train=support_loader,
+                    data_loader_val=validation_loader,
+                    device=torch.device("cpu"),
+                )
+
+            self.assertEqual(result.decision.selected_modules, ("B", "D", "E"))
+            self.assertEqual(
+                [step["stage"] for step in result.decision.search_steps],
+                ["primary", "conditional_addition", "conditional_addition"],
+            )
+            with open(result.decision_json_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            self.assertEqual(payload["search"]["retired_actions"], [])
 
     def test_subject_metadata_is_required_for_clustered_evidence(self):
         support_loader, _ = self._loaders(classes=3)

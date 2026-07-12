@@ -54,7 +54,7 @@ class ActionTrial:
 
 @dataclass(frozen=True)
 class SearchDecision:
-    """Result of one forward, rescue, or floating-deletion search stage."""
+    """Result of one forward or alternative-path search stage."""
 
     selected_trial: Optional[ActionTrial]
     reason: str
@@ -338,37 +338,5 @@ def choose_action(
         chosen,
         "nonempty_mandatory_minimax_harm",
         "mandatory",
-        diagnostics,
-    )
-
-
-def choose_floating_deletion(
-    trials: Sequence[ActionTrial],
-    alpha: float = MODULE_C_ALPHA,
-) -> SearchDecision:
-    """Prefer a smaller measured subset only when observed risk is nonworse.
-
-    This is a parsimony rule, not an equivalence claim: the smaller subset must
-    have a nonnegative paired class-balanced point gain and no supported class
-    harm.  No arbitrary noninferiority margin is introduced.
-    """
-
-    trials = tuple(trials)
-    if not trials:
-        return SearchDecision(None, "no_floating_deletion_trial", "none", {})
-    diagnostics = _stage_diagnostics(trials, alpha=float(alpha))
-    eligible = [
-        trial
-        for trial in trials
-        if trial.evidence.overall_gain >= 0.0
-        and not diagnostics[trial.label]["supported_harm_classes"]
-    ]
-    if not eligible:
-        return SearchDecision(None, "floating_delete_rejected", "none", diagnostics)
-    chosen = min(eligible, key=_trial_rank)
-    return SearchDecision(
-        chosen,
-        "floating_delete_observed_nonworse",
-        "parsimony",
         diagnostics,
     )
