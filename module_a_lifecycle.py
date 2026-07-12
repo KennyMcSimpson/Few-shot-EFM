@@ -35,12 +35,12 @@ def add_lifecycle_window_args(parser):
                         help='Maximum continuous window length for adaptive SWA search.')
     parser.add_argument('--adaptive_swa_stride', default=1, type=int,
                         help='Stride for adaptive SWA candidate start/end epochs.')
-    parser.add_argument('--adaptive_swa_select_metric', default='selection_bacc_min02_std', type=str,
-                        help='Validation metric used to choose SWA window. Use names without val_ prefix; test is never used.')
+    parser.add_argument('--adaptive_swa_select_metric', default='selection_bacc_worst_std', type=str,
+                        help='Validation metric used to choose the SWA window. The generic default combines balanced accuracy, worst-class recall, and recall stability; use names without val_ prefix. Test is never used.')
     parser.add_argument('--adaptive_swa_balance_lambda', default=0.0, type=float,
-                        help='Extra validation-only penalty lambda * abs(val_class0-val_class2) for window selection.')
-    parser.add_argument('--adaptive_swa_hard_classes', default='0,2', type=str,
-                        help='Comma-separated hard-class ids used by adaptive_swa_balance_lambda. Default: 0,2.')
+                        help='Extra validation-only penalty on the recall spread among configured hard classes.')
+    parser.add_argument('--adaptive_swa_hard_classes', default='', type=str,
+                        help='Optional comma-separated hard-class ids used by hard-class penalties and diagnostics. Empty disables hard-class behavior.')
     parser.add_argument('--adaptive_swa_tie_eps', default=0.002, type=float,
                         help='If window scores are within this value, prefer shorter and earlier windows.')
     parser.add_argument('--adaptive_swa_trainable_only', action='store_true', default=True,
@@ -66,7 +66,7 @@ def add_lifecycle_window_args(parser):
     parser.add_argument('--adaptive_swa_std_lambda', default=-1.0, type=float,
                         help='Validation recall-std penalty for adaptive SWA. -1 uses profile default.')
     parser.add_argument('--adaptive_swa_hard_floor', default=-1.0, type=float,
-                        help='Optional validation hard-class floor. If hard_min is below floor, apply penalty. -1 disables unless profile default enables it.')
+                        help='Optional validation hard-class floor. It is ignored when no hard classes are configured; -1 disables it.')
     parser.add_argument('--adaptive_swa_hard_floor_lambda', default=-1.0, type=float,
                         help='Penalty strength for hard-class floor. -1 uses profile default.')
     parser.add_argument('--adaptive_swa_late_end', default=-1.0, type=float,
@@ -151,10 +151,9 @@ def _add_per_class_to_row(prefix, details, row):
 def _add_selection_metrics(stats, details, args):
     """Add composite validation-selection scores into stats in-place.
 
-    These scores are designed for TUEV few-shot where balanced_accuracy alone can
-    select checkpoints that ignore class0/class2. They are used only for model
-    selection when --best_metric is set to one of these keys; ordinary metrics
-    are still saved unchanged.
+    The generic scores combine balanced accuracy with dynamically computed
+    worst-class recall and recall stability. Fixed class-0/2 scores remain
+    available as explicit legacy selectors; ordinary metrics are unchanged.
     """
     if stats is None:
         return stats
@@ -359,7 +358,7 @@ def _adaptive_swa_profile_defaults(args):
     max_len = max(1, int(getattr(args, 'adaptive_swa_max_len', 8)))
 
     d = {
-        'base_metric': str(getattr(args, 'adaptive_swa_select_metric', 'selection_bacc_min02_std') or 'selection_bacc_min02_std'),
+        'base_metric': str(getattr(args, 'adaptive_swa_select_metric', 'selection_bacc_worst_std') or 'selection_bacc_worst_std'),
         'life_center': (ep_min + ep_max) / 2.0,
         'life_center_weight': 0.000,
         'early_weight': 0.000,
@@ -410,7 +409,7 @@ def _adaptive_swa_metric(stats, details, args, start_epoch=None, end_epoch=None,
     if stats is None:
         return None, {}
     cfg = _adaptive_swa_profile_defaults(args)
-    metric_name = cfg.get('base_metric') or str(getattr(args, 'adaptive_swa_select_metric', 'selection_bacc_min02_std') or 'selection_bacc_min02_std')
+    metric_name = cfg.get('base_metric') or str(getattr(args, 'adaptive_swa_select_metric', 'selection_bacc_worst_std') or 'selection_bacc_worst_std')
     score = _select_metric(stats, metric_name)
     if score is None:
         # For BIOT/LaBraM profile, fall back to balanced accuracy by design.
@@ -426,7 +425,8 @@ def _adaptive_swa_metric(stats, details, args, start_epoch=None, end_epoch=None,
     max_len = max(1.0, float(cfg.get('max_len', length_f)))
 
     per_class = details.get('per_class_recall', None) if details is not None else None
-    hard = _parse_int_list(getattr(args, 'adaptive_swa_hard_classes', '0,2'), [0, 2])
+    hard = _parse_int_list(getattr(args, 'adaptive_swa_hard_classes', ''), [])
+    has_hard_classes = bool(hard)
     vals = []
     if per_class is not None:
         for c in hard:
@@ -461,7 +461,7 @@ def _adaptive_swa_metric(stats, details, args, start_epoch=None, end_epoch=None,
     hard_floor = float(cfg['hard_floor'])
     hard_floor_lambda = float(cfg['hard_floor_lambda'])
     hard_floor_penalty = 0.0
-    if hard_floor >= 0.0:
+    if has_hard_classes and hard_floor >= 0.0:
         hard_floor_penalty = hard_floor_lambda * max(0.0, hard_floor - hard_min)
 
     late_end = float(cfg['late_end'])
@@ -492,12 +492,12 @@ def _adaptive_swa_metric(stats, details, args, start_epoch=None, end_epoch=None,
         'early_bonus': float(early_bonus),
         'len_bonus': float(len_bonus),
         'recall_std_penalty': float(std_penalty),
-        'hard_imbalance': float(imbalance),
-        'hard_imbalance_penalty': float(hard_imbalance_penalty),
+        'hard_imbalance': float(imbalance) if has_hard_classes else '',
+        'hard_imbalance_penalty': float(hard_imbalance_penalty) if has_hard_classes else '',
         'hard_min': hard_min if vals else '',
         'hard_max': hard_max if vals else '',
-        'hard_floor': hard_floor,
-        'hard_floor_penalty': float(hard_floor_penalty),
+        'hard_floor': hard_floor if has_hard_classes else '',
+        'hard_floor_penalty': float(hard_floor_penalty) if has_hard_classes else '',
         'late_end': float(late_end),
         'late_penalty': float(late_penalty),
         'tie_mode': cfg['tie_mode'],
@@ -535,15 +535,17 @@ def _prefer_adaptive_swa_candidate(new_item, best_item, tie_eps, args=None):
                 if abs(nc - lc) == abs(bc - lc) and int(new_item['start_epoch']) < int(best_item['start_epoch']):
                     return True
         elif mode == 'hard_stable':
-            # CBraMod: keep hard-class stable first, then shorter/earlier.
-            nh = new_item.get('hard_min', '')
-            bh = best_item.get('hard_min', '')
-            try:
-                nhf, bhf = float(nh), float(bh)
-                if nhf > bhf + 1e-6:
-                    return True
-            except Exception:
-                pass
+            # Compare hard-class stability only when the user configured a hard set.
+            hard = _parse_int_list(getattr(args, 'adaptive_swa_hard_classes', ''), [])
+            if hard:
+                nh = new_item.get('hard_min', '')
+                bh = best_item.get('hard_min', '')
+                try:
+                    nhf, bhf = float(nh), float(bh)
+                    if nhf > bhf + 1e-6:
+                        return True
+                except Exception:
+                    pass
             if int(new_item['length']) < int(best_item['length']):
                 return True
             if int(new_item['length']) == int(best_item['length']) and int(new_item['start_epoch']) < int(best_item['start_epoch']):
@@ -572,7 +574,8 @@ def _adaptive_swa_forgetting_rows(window_details, final_details, args, start_epo
     learned = (~win_ok) & final_ok
     forgotten = win_ok & (~final_ok)
     always_wrong = (~win_ok) & (~final_ok)
-    hard = set(_parse_int_list(getattr(args, 'adaptive_swa_hard_classes', '0,2'), [0, 2]))
+    hard = set(_parse_int_list(getattr(args, 'adaptive_swa_hard_classes', ''), []))
+    has_hard_classes = bool(hard)
 
     def count(mask):
         return int(np.asarray(mask, dtype=bool).sum())
@@ -628,18 +631,18 @@ def _adaptive_swa_forgetting_rows(window_details, final_details, args, start_epo
         'lifecycle_retention_gap': rate(lifecycle_retention_gap_count, total),
         'trajectory_forgetting_asymmetry': transition_asymmetry(forgotten_count, learned_count),
         'hard_classes': ','.join(str(x) for x in sorted(hard)),
-        'hard_total_count': hard_total,
-        'hard_retained_count': hard_retained_count,
-        'hard_newly_learned_count': hard_learned_count,
-        'hard_forgotten_count': hard_forgotten_count,
-        'hard_always_wrong_count': hard_always_wrong_count,
-        'hard_transition_count': hard_transition_count,
-        'hard_lifecycle_retention_gap_count': hard_lifecycle_retention_gap_count,
-        'hard_forgotten_rate': rate(hard_forgotten_count, hard_total),
-        'hard_newly_learned_rate': rate(hard_learned_count, hard_total),
-        'hard_transition_rate': rate(hard_transition_count, hard_total),
-        'hard_lifecycle_retention_gap': rate(hard_lifecycle_retention_gap_count, hard_total),
-        'hard_trajectory_forgetting_asymmetry': transition_asymmetry(hard_forgotten_count, hard_learned_count),
+        'hard_total_count': hard_total if has_hard_classes else '',
+        'hard_retained_count': hard_retained_count if has_hard_classes else '',
+        'hard_newly_learned_count': hard_learned_count if has_hard_classes else '',
+        'hard_forgotten_count': hard_forgotten_count if has_hard_classes else '',
+        'hard_always_wrong_count': hard_always_wrong_count if has_hard_classes else '',
+        'hard_transition_count': hard_transition_count if has_hard_classes else '',
+        'hard_lifecycle_retention_gap_count': hard_lifecycle_retention_gap_count if has_hard_classes else '',
+        'hard_forgotten_rate': rate(hard_forgotten_count, hard_total) if has_hard_classes else '',
+        'hard_newly_learned_rate': rate(hard_learned_count, hard_total) if has_hard_classes else '',
+        'hard_transition_rate': rate(hard_transition_count, hard_total) if has_hard_classes else '',
+        'hard_lifecycle_retention_gap': rate(hard_lifecycle_retention_gap_count, hard_total) if has_hard_classes else '',
+        'hard_trajectory_forgetting_asymmetry': transition_asymmetry(hard_forgotten_count, hard_learned_count) if has_hard_classes else '',
     }
 
     class_rows = []
@@ -661,7 +664,7 @@ def _adaptive_swa_forgetting_rows(window_details, final_details, args, start_epo
             'end_epoch': int(end_epoch),
             'length': int(length),
             'class_id': int(cls),
-            'is_hard_class': int(cls in hard),
+            'is_hard_class': int(cls in hard) if has_hard_classes else '',
             'support': support,
             'window_correct_count': cls_win,
             'final_correct_count': cls_final,
@@ -724,7 +727,7 @@ def run_lifecycle_window_search(args, model, data_loader_val, data_loader_test, 
         print('[Adaptive-SWA] no candidate windows generated.')
         return None
 
-    print(f"[Adaptive-SWA] searching {len(windows)} validation-only windows. profile={profile_cfg.get('profile', 'generic')}, requested_profile={profile_cfg.get('requested_profile', 'generic')}, metric={getattr(args, 'adaptive_swa_select_metric', '')}, len=[{getattr(args, 'adaptive_swa_min_len', '')},{getattr(args, 'adaptive_swa_max_len', '')}]")
+    print(f"[Adaptive-SWA] searching {len(windows)} validation-only windows. profile={profile_cfg.get('profile', 'generic')}, requested_profile={profile_cfg.get('requested_profile', 'generic')}, metric={getattr(args, 'adaptive_swa_select_metric', 'selection_bacc_worst_std') or 'selection_bacc_worst_std'}, len=[{getattr(args, 'adaptive_swa_min_len', '')},{getattr(args, 'adaptive_swa_max_len', '')}]")
     best_item = None
     tie_eps = float(getattr(args, 'adaptive_swa_tie_eps', 0.002))
 
@@ -752,7 +755,7 @@ def run_lifecycle_window_search(args, model, data_loader_val, data_loader_test, 
             'end_epoch': int(end),
             'length': int(length),
             'count': int(count),
-            'select_metric': getattr(args, 'adaptive_swa_select_metric', ''),
+            'select_metric': getattr(args, 'adaptive_swa_select_metric', 'selection_bacc_worst_std') or 'selection_bacc_worst_std',
             'score': float(score),
             'score_is_validation_only': 1,
             'test_used_for_selection': 0,
@@ -833,14 +836,18 @@ def run_lifecycle_window_search(args, model, data_loader_val, data_loader_test, 
             _append_csv_row(forgetting_csv, forgetting_summary)
             for cls_row in forgetting_class_rows:
                 _append_csv_row(forgetting_class_csv, cls_row)
-            print(
+            message = (
                 f"[Adaptive-SWA] val forgetting diagnostic: "
                 f"forgotten={forgetting_summary['forgotten_count']}, "
                 f"newly_learned={forgetting_summary['newly_learned_count']}, "
-                f"LRG={forgetting_summary['lifecycle_retention_gap']:.6f}, "
-                f"hard_LRG={forgetting_summary['hard_lifecycle_retention_gap']:.6f}, "
-                f"hard_TFA={forgetting_summary['hard_trajectory_forgetting_asymmetry']:.6f}"
+                f"LRG={forgetting_summary['lifecycle_retention_gap']:.6f}"
             )
+            if forgetting_summary.get('hard_classes'):
+                message += (
+                    f", hard_LRG={forgetting_summary['hard_lifecycle_retention_gap']:.6f}, "
+                    f"hard_TFA={forgetting_summary['hard_trajectory_forgetting_asymmetry']:.6f}"
+                )
+            print(message)
     finally:
         model.load_state_dict(final_state, strict=False)
         _apply_partial_float_state(model, selected_state)
@@ -858,7 +865,7 @@ def run_lifecycle_window_search(args, model, data_loader_val, data_loader_test, 
         'end_epoch': int(best_item['end_epoch']),
         'length': int(best_item['length']),
         'count': int(best_item['count']),
-        'select_metric': getattr(args, 'adaptive_swa_select_metric', ''),
+        'select_metric': getattr(args, 'adaptive_swa_select_metric', 'selection_bacc_worst_std') or 'selection_bacc_worst_std',
         'adaptive_swa_profile': getattr(args, 'adaptive_swa_profile', 'generic'),
         'adaptive_swa_profile_effective': profile_cfg.get('profile', 'generic'),
         'selection_score': float(best_item['score']),

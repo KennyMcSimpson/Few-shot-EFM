@@ -418,9 +418,9 @@ def get_args():
 
     # Boundary-anchor LoRA snapshot controls
     parser.add_argument('--boundary_anchor_eval', action='store_true', default=False,
-                        help='Save and finally evaluate the best validation boundary-aware LoRA snapshot. This is mainly for BIOT.')
-    parser.add_argument('--boundary_anchor_metric', default='selection_bacc_min02_std', type=str,
-                        help='Validation metric used to select the boundary anchor snapshot.')
+                        help='Save and finally evaluate the best validation-selected boundary-aware LoRA snapshot.')
+    parser.add_argument('--boundary_anchor_metric', default='selection_bacc_worst_std', type=str,
+                        help='Validation metric used to select the boundary anchor snapshot. The generic default uses worst-class recall and recall stability.')
     parser.add_argument('--boundary_anchor_min_epoch', default=1, type=int,
                         help='Do not consider epochs before this value for boundary anchor selection.')
     parser.add_argument('--boundary_anchor_max_epoch', default=-1, type=int,
@@ -494,7 +494,7 @@ def get_args():
     parser.add_argument('--snapshot_topk', default=3, type=int,
                         help='Number of validation-selected epoch snapshots used for logit ensemble.')
     parser.add_argument('--snapshot_select_metric', default='', type=str,
-                        help='Metric used to rank snapshots. Empty means args.best_metric. Use names without val_ prefix, e.g. selection_bacc_min02_std.')
+                        help='Metric used to rank snapshots. Empty means args.best_metric. Use names without val_ prefix, e.g. selection_bacc_worst_std.')
     parser.add_argument('--snapshot_include_top1', action='store_true', default=True,
                         help='Also save a top1 snapshot row besides top-k ensemble.')
     parser.add_argument('--snapshot_no_top1', action='store_false', dest='snapshot_include_top1',
@@ -1995,10 +1995,9 @@ def _select_metric(stats, metric_name):
 def _add_selection_metrics(stats, details, args):
     """Add composite validation-selection scores into stats in-place.
 
-    These scores are designed for TUEV few-shot where balanced_accuracy alone can
-    select checkpoints that ignore class0/class2. They are used only for model
-    selection when --best_metric is set to one of these keys; ordinary metrics
-    are still saved unchanged.
+    The generic scores combine balanced accuracy with dynamically computed
+    worst-class recall and recall stability. Fixed class-0/2 scores remain
+    available as explicit legacy selectors; ordinary metrics are unchanged.
     """
     if stats is None:
         return stats
@@ -2279,7 +2278,8 @@ def _write_snapshot_candidates(diag_dir, ranked_rows, metric_col):
     out = os.path.join(diag_dir, 'snapshot_candidates.csv')
     os.makedirs(diag_dir, exist_ok=True)
     fieldnames = ['rank', 'epoch', 'select_metric_col', 'select_score',
-                  'val_balanced_accuracy', 'val_selection_bacc_min02_std',
+                  'val_balanced_accuracy', 'val_selection_bacc_worst_std',
+                  'val_selection_bacc_min02_std',
                   'val_worst_class_recall', 'val_selection_min02', 'val_recall_std',
                   'test_balanced_accuracy', 'test_accuracy']
     with open(out, 'w', newline='', encoding='utf-8') as f:
@@ -2293,6 +2293,7 @@ def _write_snapshot_candidates(diag_dir, ranked_rows, metric_col):
                 'select_metric_col': metric_col,
                 'select_score': item['score'],
                 'val_balanced_accuracy': r.get('val_balanced_accuracy', ''),
+                'val_selection_bacc_worst_std': r.get('val_selection_bacc_worst_std', ''),
                 'val_selection_bacc_min02_std': r.get('val_selection_bacc_min02_std', ''),
                 'val_worst_class_recall': r.get('val_worst_class_recall', ''),
                 'val_selection_min02': r.get('val_selection_min02', ''),
@@ -2306,9 +2307,8 @@ def _write_snapshot_candidates(diag_dir, ranked_rows, metric_col):
 def _run_snapshot_ensemble_report(args, model, data_loader_val, data_loader_test, device, metrics):
     """Post-training top-k validation-selected snapshot logit ensemble.
 
-    This is designed for TUEV few-shot instability: instead of relying on one
-    potentially noisy validation-selected checkpoint, rank saved epoch snapshots
-    by a validation/composite metric and average their test logits.
+    To reduce few-shot checkpoint instability, rank saved epoch snapshots by a
+    validation/composite metric and average their test logits.
     """
     if args.task_mod != 'Classification' or int(args.nb_classes) <= 1:
         print('[Snapshot] skip: only multiclass classification is supported for now.')
@@ -2571,7 +2571,7 @@ def _maybe_update_boundary_anchor(args, model, epoch_id, val_stats, val_details,
     if val_stats is None or int(epoch_id) < int(getattr(args, 'boundary_anchor_min_epoch', 1)):
         return current_best_score, current_best_epoch
 
-    metric_name = str(getattr(args, 'boundary_anchor_metric', 'selection_bacc_min02_std'))
+    metric_name = str(getattr(args, 'boundary_anchor_metric', 'selection_bacc_worst_std') or 'selection_bacc_worst_std')
     score = _select_metric(val_stats, metric_name)
     if score is None:
         print(f"[BoundaryAnchor] metric not found: {metric_name}")
@@ -2680,7 +2680,7 @@ def _run_boundary_anchor_final_eval(args, model, data_loader_val, data_loader_te
     row = {
         'mode': 'boundary_anchor_v2',
         'anchor_epoch': epoch,
-        'anchor_metric': getattr(args, 'boundary_anchor_metric', ''),
+        'anchor_metric': getattr(args, 'boundary_anchor_metric', 'selection_bacc_worst_std') or 'selection_bacc_worst_std',
         'anchor_strategy': getattr(args, 'boundary_anchor_strategy', 'best'),
         'anchor_reason': reason,
         'anchor_source_ckpt': ckpt_path,
