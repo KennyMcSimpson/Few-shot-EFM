@@ -611,32 +611,64 @@ class ModuleEDynamicPressureController:
         if self._prepared_optimizer is not None:
             raise RuntimeError("Module E optimizer step was prepared twice without finishing.")
 
-        self._read_unscaled_pressure()
-        for branch in self.branches:
-            count = int(self._pending_count.get(branch, 0))
-            raw = float(self._pending_energy.get(branch, 0.0) / count) if count > 0 else 0.0
-            prev = float(self._ema_pressure.get(branch, 0.0))
-            self._raw_pressure[branch] = raw
-            self._ema_pressure[branch] = self.beta * prev + (1.0 - self.beta) * raw
-        scales, entropy, degenerate = self._compute_next_scales()
-        self._branch_scale.update(scales)
-
-        self._parameter_snapshots = {
-            name: param.detach().clone() for name, param in self._param_objects.items()
+        stored_group_lrs = [
+            (group, float(group["lr"])) for group in optimizer.param_groups
+        ]
+        pressure_state = {
+            "ema": dict(self._ema_pressure),
+            "raw": dict(self._raw_pressure),
+            "scale": dict(self._branch_scale),
+            "pending_energy": dict(self._pending_energy),
+            "pending_count": dict(self._pending_count),
+            "pending_param_tensors": dict(self._pending_param_tensors),
+            "entropy": self._prepared_entropy,
+            "degenerate": self._allocation_degenerate,
         }
-        self._stored_group_lrs = []
-        for group in optimizer.param_groups:
-            base_lr = float(group["lr"])
-            self._stored_group_lrs.append((group, base_lr))
-            tag = str(group.get("param_group_tag", ""))
-            if tag.startswith("module_e:"):
-                branch = tag.split(":", 1)[1]
-                group["lr"] = base_lr * self.scale_for_branch(branch)
-        self._prepared_optimizer = optimizer
-        self._prepared_global_step = global_step
-        self._prepared_epoch = epoch
-        self._prepared_entropy = entropy
-        self._allocation_degenerate = degenerate
+        try:
+            self._read_unscaled_pressure()
+            for branch in self.branches:
+                count = int(self._pending_count.get(branch, 0))
+                raw = float(self._pending_energy.get(branch, 0.0) / count) if count > 0 else 0.0
+                prev = float(self._ema_pressure.get(branch, 0.0))
+                self._raw_pressure[branch] = raw
+                self._ema_pressure[branch] = self.beta * prev + (1.0 - self.beta) * raw
+            scales, entropy, degenerate = self._compute_next_scales()
+            self._branch_scale.update(scales)
+
+            self._parameter_snapshots = {
+                name: param.detach().clone() for name, param in self._param_objects.items()
+            }
+            self._stored_group_lrs = stored_group_lrs
+            self._prepared_optimizer = optimizer
+            self._prepared_global_step = global_step
+            self._prepared_epoch = epoch
+            self._prepared_entropy = entropy
+            self._allocation_degenerate = degenerate
+            for group, base_lr in stored_group_lrs:
+                tag = str(group.get("param_group_tag", ""))
+                if tag.startswith("module_e:"):
+                    branch = tag.split(":", 1)[1]
+                    group["lr"] = base_lr * self.scale_for_branch(branch)
+        except BaseException:
+            for group, base_lr in stored_group_lrs:
+                try:
+                    group["lr"] = base_lr
+                except BaseException:
+                    pass
+            self._ema_pressure = pressure_state["ema"]
+            self._raw_pressure = pressure_state["raw"]
+            self._branch_scale = pressure_state["scale"]
+            self._pending_energy = pressure_state["pending_energy"]
+            self._pending_count = pressure_state["pending_count"]
+            self._pending_param_tensors = pressure_state["pending_param_tensors"]
+            self._prepared_entropy = pressure_state["entropy"]
+            self._allocation_degenerate = pressure_state["degenerate"]
+            self._stored_group_lrs = []
+            self._parameter_snapshots = {}
+            self._prepared_optimizer = None
+            self._prepared_global_step = None
+            self._prepared_epoch = None
+            raise
 
     def _diagnostic_path(self) -> str:
         if not self.output_dir:

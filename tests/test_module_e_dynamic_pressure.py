@@ -73,6 +73,12 @@ class _RecordingController:
         self.events.append(("finish", optimizer, step_applied))
 
 
+class _FailingPrepareController(_RecordingController):
+    def prepare_optimizer_step(self, optimizer, global_step=None, epoch=None):
+        self.events.append(("prepare", optimizer, global_step, epoch))
+        raise RuntimeError("probe prepare failed")
+
+
 class _FakeScaledLoss:
     def __init__(self, events, parameter):
         self.events = events
@@ -85,10 +91,13 @@ class _FakeScaledLoss:
 
 
 class _FakeGradScaler:
-    def __init__(self, events, parameter, fail_step=False):
+    def __init__(self, events, parameter, fail_step=False, skip_step=False, grow_scale=False):
         self.events = events
         self.parameter = parameter
         self.fail_step = fail_step
+        self.skip_step = skip_step
+        self.grow_scale = grow_scale
+        self._scale = 8.0
 
     def scale(self, _loss):
         return _FakeScaledLoss(self.events, self.parameter)
@@ -101,8 +110,27 @@ class _FakeGradScaler:
         if self.fail_step:
             raise RuntimeError("step failed")
 
+    def get_scale(self):
+        return self._scale
+
     def update(self):
         self.events.append("update")
+        if self.skip_step:
+            self._scale *= 0.5
+        elif self.grow_scale:
+            self._scale *= 2.0
+
+
+class _FailOnceLrGroup(dict):
+    def __init__(self, source):
+        super().__init__(source)
+        self.fail_next_lr_write = True
+
+    def __setitem__(self, key, value):
+        if key == "lr" and self.fail_next_lr_write:
+            self.fail_next_lr_write = False
+            raise RuntimeError("prepare lr write failed")
+        return super().__setitem__(key, value)
 
 
 def _module_e_args(replaced):
@@ -355,7 +383,7 @@ class ModuleEDynamicPressureTests(unittest.TestCase):
             )
         self.assertEqual(
             events,
-            ["backward", "unscale", "before", "clip", "step", "after:1", "update"],
+            ["backward", "unscale", "before", "clip", "step", "update", "after:1"],
         )
 
         events.clear()
@@ -397,6 +425,135 @@ class ModuleEDynamicPressureTests(unittest.TestCase):
         self.assertEqual(optimizer.param_groups[0]["lr"], 0.1)
         self.assertEqual(events, ["backward", "unscale", "before", "step", "after:0"])
 
+    def test_native_scaler_reports_silent_amp_skip_and_restores_lr(self):
+        parameter = nn.Parameter(torch.ones(1))
+        optimizer = torch.optim.SGD([parameter], lr=0.1)
+        events = []
+        scaler = object.__new__(NativeScalerWithGradNormCount)
+        scaler._scaler = _FakeGradScaler(events, parameter, skip_step=True)
+
+        def before():
+            events.append("before")
+            optimizer.param_groups[0]["lr"] = 0.5
+
+        def after(step_applied=True):
+            events.append(f"after:{int(step_applied)}")
+            optimizer.param_groups[0]["lr"] = 0.1
+
+        scaler(
+            object(),
+            optimizer,
+            parameters=[parameter],
+            update_grad=True,
+            before_optimizer_step=before,
+            after_optimizer_step=after,
+        )
+
+        self.assertEqual(optimizer.param_groups[0]["lr"], 0.1)
+        self.assertEqual(
+            events, ["backward", "unscale", "before", "step", "update", "after:0"]
+        )
+
+    def test_native_scaler_treats_grown_scale_as_success(self):
+        parameter = nn.Parameter(torch.ones(1))
+        optimizer = torch.optim.SGD([parameter], lr=0.1)
+        events = []
+        scaler = object.__new__(NativeScalerWithGradNormCount)
+        scaler._scaler = _FakeGradScaler(events, parameter, grow_scale=True)
+
+        scaler(
+            object(),
+            optimizer,
+            parameters=[parameter],
+            update_grad=True,
+            before_optimizer_step=lambda: events.append("before"),
+            after_optimizer_step=lambda step_applied=True: events.append(
+                f"after:{int(step_applied)}"
+            ),
+        )
+
+        self.assertEqual(events[-2:], ["update", "after:1"])
+
+    def test_native_scaler_does_not_finish_when_prepare_callback_raises(self):
+        parameter = nn.Parameter(torch.ones(1))
+        optimizer = torch.optim.SGD([parameter], lr=0.1)
+        events = []
+        scaler = object.__new__(NativeScalerWithGradNormCount)
+        scaler._scaler = _FakeGradScaler(events, parameter)
+
+        def before():
+            events.append("before")
+            raise RuntimeError("prepare callback failed")
+
+        with self.assertRaisesRegex(RuntimeError, "prepare callback failed"):
+            scaler(
+                object(),
+                optimizer,
+                parameters=[parameter],
+                update_grad=True,
+                before_optimizer_step=before,
+                after_optimizer_step=lambda step_applied=True: events.append("after"),
+            )
+
+        self.assertEqual(events, ["backward", "unscale", "before"])
+
+    def test_prepare_optimizer_step_rolls_back_partial_lr_writes(self):
+        model = _TwoBranchAdapters()
+        controller = ModuleEDynamicPressureController(
+            "EEGPT",
+            beta=0.0,
+            temperature=0.01,
+            gate_floor=0.0,
+            scale_min=0.5,
+            scale_max=1.5,
+        )
+        named = dict(model.named_parameters())
+        for name, branch in (
+            ("attention.lora_A", "mixing"),
+            ("attention.lora_B", "mixing"),
+            ("spatial_attention.lora_A", "spatial"),
+            ("spatial_attention.lora_B", "spatial"),
+        ):
+            controller.register_param(
+                name, branch, named[name], is_pressure_param=name.endswith("lora_B")
+            )
+        optimizer = torch.optim.SGD(
+            [
+                {
+                    "params": [named["attention.lora_A"], named["attention.lora_B"]],
+                    "lr": 0.1,
+                    "param_group_tag": "module_e:mixing",
+                },
+                {
+                    "params": [
+                        named["spatial_attention.lora_A"],
+                        named["spatial_attention.lora_B"],
+                    ],
+                    "lr": 0.1,
+                    "param_group_tag": "module_e:spatial",
+                },
+                {
+                    "params": [model.head],
+                    "lr": 0.1,
+                    "param_group_tag": "non_module_e",
+                },
+            ]
+        )
+        controller.bind_optimizer(optimizer)
+        optimizer.param_groups[1] = _FailOnceLrGroup(optimizer.param_groups[1])
+        for parameter in model.parameters():
+            parameter.grad = torch.ones_like(parameter)
+        named["attention.lora_B"].grad.fill_(0.01)
+        named["spatial_attention.lora_B"].grad.fill_(10.0)
+
+        with self.assertRaisesRegex(RuntimeError, "prepare lr write failed"):
+            controller.prepare_optimizer_step(optimizer)
+
+        self.assertEqual([group["lr"] for group in optimizer.param_groups], [0.1, 0.1, 0.1])
+        self.assertIsNone(controller._prepared_optimizer)
+        self.assertEqual(controller._stored_group_lrs, [])
+        self.assertEqual(controller._parameter_snapshots, {})
+
     def test_module_c_probe_uses_controller_group_and_step_contract(self):
         args = SimpleNamespace(
             model_name="Tiny",
@@ -435,6 +592,39 @@ class ModuleEDynamicPressureTests(unittest.TestCase):
         self.assertEqual(controller.events[1][0], "prepare")
         self.assertEqual(controller.events[2][0], "finish")
         self.assertTrue(controller.events[2][2])
+
+    def test_module_c_probe_preserves_prepare_failure_without_finishing(self):
+        args = SimpleNamespace(
+            model_name="Tiny",
+            layer_decay=1.0,
+            opt="sgd",
+            lr=0.1,
+            weight_decay=0.01,
+            opt_eps=None,
+            opt_betas=None,
+            momentum=0.9,
+            update_freq=1,
+            clip_grad=None,
+            norm_method="",
+            nb_classes=2,
+        )
+        model = _ProbeModel()
+        controller = _FailingPrepareController()
+        batches = [(torch.randn(3, 4), torch.tensor([0, 1, 0]))]
+
+        with self.assertRaisesRegex(RuntimeError, "probe prepare failed"):
+            _run_support_pass(
+                args,
+                model,
+                batches,
+                torch.device("cpu"),
+                nn.CrossEntropyLoss(),
+                controller=controller,
+            )
+
+        self.assertEqual(controller.events[0], "bind")
+        self.assertEqual(controller.events[1][0], "prepare")
+        self.assertFalse(any(event[0] == "finish" for event in controller.events[1:]))
 
     def test_formal_optimizer_creation_uses_controller_group_and_bind_contract(self):
         args = argparse.Namespace(

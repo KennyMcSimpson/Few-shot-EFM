@@ -510,21 +510,27 @@ class NativeScalerWithGradNormCount:
         self._scaler.scale(loss).backward(create_graph=create_graph)
         if update_grad:
             self._scaler.unscale_(optimizer)
+            before_completed = False
             step_applied = False
             try:
                 if before_optimizer_step is not None:
                     before_optimizer_step()
+                before_completed = True
                 if clip_grad is not None:
                     assert parameters is not None
                     norm = torch.nn.utils.clip_grad_norm_(parameters, clip_grad)
                 else:
                     norm = get_grad_norm_(parameters, layer_names=layer_names)
+                scale_before = float(self._scaler.get_scale())
                 self._scaler.step(optimizer)
-                step_applied = True
-            finally:
-                if after_optimizer_step is not None:
+                self._scaler.update()
+                step_applied = float(self._scaler.get_scale()) >= scale_before
+            except BaseException:
+                if before_completed and after_optimizer_step is not None:
                     after_optimizer_step(step_applied=step_applied)
-            self._scaler.update()
+                raise
+            if after_optimizer_step is not None:
+                after_optimizer_step(step_applied=step_applied)
         else:
             norm = None
         return norm

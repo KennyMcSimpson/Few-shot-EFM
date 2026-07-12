@@ -522,12 +522,14 @@ def _run_support_pass(
         (loss / float(update_freq)).backward()
         should_step = (batch_index + 1) % update_freq == 0 or batch_index + 1 == len(batches)
         if should_step:
-            if controller is not None:
-                controller.prepare_optimizer_step(
-                    optimizer, global_step=optimizer_steps, epoch=1
-                )
+            prepared = False
             step_applied = False
             try:
+                if controller is not None:
+                    controller.prepare_optimizer_step(
+                        optimizer, global_step=optimizer_steps, epoch=1
+                    )
+                    prepared = True
                 clip_grad = getattr(args, "clip_grad", None)
                 if clip_grad is not None:
                     torch.nn.utils.clip_grad_norm_(trainable, float(clip_grad))
@@ -535,7 +537,7 @@ def _run_support_pass(
                 step_applied = True
                 optimizer_steps += 1
             finally:
-                if controller is not None:
+                if controller is not None and prepared:
                     controller.finish_optimizer_step(optimizer, step_applied=step_applied)
             optimizer.zero_grad(set_to_none=True)
     return float(total_loss / total_examples), total_examples, optimizer_steps
