@@ -139,7 +139,7 @@ finetune_list = {
 # ---------------------------------------------------------------------------------------------------------------------
 
 # ----------------------------------------------Parameters------------------------------------------------------
-def get_args():
+def get_args(argv=None):
     parser = argparse.ArgumentParser()
     # Fine-tuning parameters
     parser.add_argument('--dataset', default='SEED-IV', type=str,
@@ -203,6 +203,9 @@ def get_args():
     parser.add_argument('--k_shot', default=10, type=float, help='number of shots in the few_shot setting')
     parser.add_argument('--run_tag', default='', type=str,
                         help='Optional short suffix appended to output_dir to avoid auto-resume/output collisions.')
+    parser.add_argument('--output_dir', default='', type=str,
+                        help=('Optional base result directory. The generated run tag is created '
+                              'under this directory; empty uses finetuning_results/<task>/<model>/<mode>.'))
     parser.add_argument('--short_output_tag_only', action='store_true', default=False,
                         help='Use only run_tag as output folder name under the model result root. Keeps Windows paths short.')
     
@@ -564,7 +567,7 @@ def get_args():
     parser.add_argument('--no_auto_resume', action='store_false', dest='auto_resume',
                         help='Disable auto-resume. Use this for new short-tag experiments to avoid resuming an old run.')
 
-    known_args, _ = parser.parse_known_args()
+    known_args, _ = parser.parse_known_args(argv)
 
     if known_args.enable_deepspeed:
         try:
@@ -581,7 +584,7 @@ def get_args():
     else:
         ds_init = None
 
-    return parser.parse_args(), ds_init
+    return parser.parse_args(argv), ds_init
 # -------------------------------------------------------------------------------------------------------------
 
 class LinearWithConstraint(nn.Linear):
@@ -3258,6 +3261,20 @@ def _reduce_optimizer_lr_on_plateau(optimizer, factor, min_lr):
 # -------------------------------------------------------------------------------------------------------------
 
 # -------------------------------Main function for fine-tuning-------------------------------------------------
+def resolve_output_root(args):
+    """Resolve the base result directory before the unique run tag is appended."""
+
+    configured_root = str(getattr(args, 'output_dir', '') or '').strip()
+    if configured_root:
+        return os.path.normpath(os.path.expanduser(configured_root))
+    return os.path.join(
+        "finetuning_results",
+        args.task_mod,
+        f"{args.model_name}_results",
+        f"finetune_{args.finetune_mod}",
+    )
+
+
 def main(args, ds_init):
 
     if ds_init is not None:
@@ -3271,12 +3288,7 @@ def main(args, ds_init):
 
     # Keep result folder names short enough for Windows path length limits.
     # The previous verbose naming could exceed MAX_PATH once diagnostic .npy files were saved.
-    output_root = os.path.join(
-        "finetuning_results",
-        args.task_mod,
-        f"{args.model_name}_results",
-        f"finetune_{args.finetune_mod}",
-    )
+    output_root = resolve_output_root(args)
 
     short_tag = (
         f"{args.dataset}_e{args.epochs}"

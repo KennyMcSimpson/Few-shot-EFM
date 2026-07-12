@@ -3,6 +3,7 @@ import sys
 import unittest
 
 from tools.run_manifest import expand_manifest, load_manifest
+from run_finetuning import get_args, resolve_output_root
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -67,6 +68,26 @@ class ExperimentManifestCliTests(unittest.TestCase):
 
         self.assertEqual(len(runs), 2)
         self.assertTrue(all("--module_c_preflight_only" in run.command for run in runs))
+
+    def test_expanded_command_is_accepted_by_training_parser(self):
+        run = expand_manifest(
+            load_manifest(MANIFEST),
+            python_executable=sys.executable,
+            output_root=pathlib.Path("portable-outputs"),
+            datasets={"BCI-IV-2A"},
+            models={"CBraMod"},
+            seeds={0},
+            preflight_only=True,
+        )[0]
+
+        args, ds_init = get_args(list(run.command[2:]))
+
+        self.assertIsNone(ds_init)
+        self.assertEqual(args.dataset, "BCI-IV-2A")
+        self.assertEqual(args.model_name, "CBraMod")
+        self.assertTrue(args.module_c_preflight_only)
+        self.assertEqual(args.output_dir, "portable-outputs")
+        self.assertEqual(resolve_output_root(args), "portable-outputs")
 
 
 if __name__ == "__main__":
