@@ -642,6 +642,51 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, mo
             client_state['model_ema'] = get_state_dict(model_ema)
         model.save_checkpoint(save_dir=args.output_dir, tag="checkpoint-%s" % epoch_name, client_state=client_state)           
 
+def _validate_optimizer_resume_schema(optimizer, optimizer_state, checkpoint_path):
+    """Fail clearly before mutating the model when optimizer groups are incompatible."""
+    saved_groups = optimizer_state.get('param_groups', None)
+    current_groups = optimizer.state_dict().get('param_groups', None)
+    if not isinstance(saved_groups, list) or not isinstance(current_groups, list):
+        raise RuntimeError(
+            f"Incompatible legacy optimizer checkpoint schema in {checkpoint_path}: "
+            "missing parameter-group metadata. Start with --no_auto_resume; exact "
+            "legacy optimizer-state migration is unsupported."
+        )
+
+    saved_count = len(saved_groups)
+    current_count = len(current_groups)
+    saved_sizes = [len(group.get('params', ())) for group in saved_groups]
+    current_sizes = [len(group.get('params', ())) for group in current_groups]
+    current_tags = [group.get('param_group_tag', None) for group in current_groups]
+    saved_tags = [group.get('param_group_tag', None) for group in saved_groups]
+    module_e_tagged = any(
+        str(tag or '').startswith('module_e:') for tag in current_tags
+    )
+
+    reasons = []
+    if saved_count != current_count:
+        reasons.append(
+            f"saved_groups={saved_count}, current_groups={current_count}"
+        )
+    elif saved_sizes != current_sizes:
+        reasons.append(
+            f"saved_group_sizes={saved_sizes}, current_group_sizes={current_sizes}"
+        )
+    if module_e_tagged and saved_tags != current_tags:
+        reasons.append(
+            f"optimizer group tags differ: saved={saved_tags}, current={current_tags}"
+        )
+
+    if reasons:
+        raise RuntimeError(
+            f"Incompatible legacy optimizer checkpoint schema in {checkpoint_path}: "
+            f"{'; '.join(reasons)}. This commonly means a pre-structural-Module-E "
+            "checkpoint is being resumed with the tagged Module E optimizer. Start "
+            "with --no_auto_resume (preferably in a new output directory); exact "
+            "legacy optimizer-state migration is unsupported."
+        )
+
+
 def auto_load_model(args, model, model_without_ddp, optimizer, loss_scaler, model_ema=None, optimizer_disc=None):
     output_dir = Path(args.output_dir)
     
@@ -671,9 +716,16 @@ def auto_load_model(args, model, model_without_ddp, optimizer, loss_scaler, mode
                     checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
                 except TypeError:
                     checkpoint = torch.load(args.resume, map_location='cpu')
+            has_optimizer_state = 'optimizer' in checkpoint and 'epoch' in checkpoint
+            if has_optimizer_state:
+                _validate_optimizer_resume_schema(
+                    optimizer,
+                    checkpoint['optimizer'],
+                    args.resume,
+                )
             model_without_ddp.load_state_dict(checkpoint['model']) # strict: bool=True, , strict=False
             print("Resume checkpoint %s" % args.resume)
-            if 'optimizer' in checkpoint and 'epoch' in checkpoint:
+            if has_optimizer_state:
                 optimizer.load_state_dict(checkpoint['optimizer'])
                 print(f"Resume checkpoint at epoch {checkpoint['epoch']}")
                 args.start_epoch = checkpoint['epoch'] + 1
