@@ -54,7 +54,8 @@ class LayerDecayValueAssigner(object):
         return get_num_layer_for_vit(var_name, len(self.values))
 
 
-def get_parameter_groups(model, weight_decay=1e-5, skip_list=(), get_num_layer=None, get_layer_scale=None, **kwargs):
+def get_parameter_groups(model, weight_decay=1e-5, skip_list=(), get_num_layer=None,
+                         get_layer_scale=None, get_param_group_tag=None, **kwargs):
     parameter_group_names = {}
     parameter_group_vars = {}
 
@@ -80,6 +81,9 @@ def get_parameter_groups(model, weight_decay=1e-5, skip_list=(), get_num_layer=N
             group_name = "layer_%d_%s" % (layer_id, group_name)
         else:
             layer_id = None
+        param_group_tag = get_param_group_tag(name) if get_param_group_tag is not None else None
+        if get_param_group_tag is not None:
+            group_name = "%s_tag_%s" % (group_name, str(param_group_tag))
 
         if group_name not in parameter_group_names:
             if get_layer_scale is not None:
@@ -97,6 +101,9 @@ def get_parameter_groups(model, weight_decay=1e-5, skip_list=(), get_num_layer=N
                 "params": [],
                 "lr_scale": scale
             }
+            if get_param_group_tag is not None:
+                parameter_group_names[group_name]["param_group_tag"] = param_group_tag
+                parameter_group_vars[group_name]["param_group_tag"] = param_group_tag
 
         parameter_group_vars[group_name]["params"].append(param)
         parameter_group_names[group_name]["params"].append(name)
@@ -104,17 +111,21 @@ def get_parameter_groups(model, weight_decay=1e-5, skip_list=(), get_num_layer=N
     return list(parameter_group_vars.values())
 
 
-def create_optimizer(args, model, get_num_layer=None, get_layer_scale=None, filter_bias_and_bn=True, skip_list=None, **kwargs):
+def create_optimizer(args, model, get_num_layer=None, get_layer_scale=None,
+                     get_param_group_tag=None, filter_bias_and_bn=True, skip_list=None, **kwargs):
     opt_lower = args.opt.lower()
     weight_decay = args.weight_decay
-    if weight_decay and filter_bias_and_bn:
+    if (weight_decay and filter_bias_and_bn) or get_param_group_tag is not None:
         skip = {}
         if skip_list is not None:
             skip = skip_list
         elif hasattr(model, 'no_weight_decay'):
             skip = model.no_weight_decay()
         print(f"Skip weight decay name marked in model: {skip}")
-        parameters = get_parameter_groups(model, weight_decay, skip, get_num_layer, get_layer_scale, **kwargs)
+        parameters = get_parameter_groups(
+            model, weight_decay, skip, get_num_layer, get_layer_scale,
+            get_param_group_tag=get_param_group_tag, **kwargs
+        )
         weight_decay = 0.
     else:
         parameters = model.parameters()

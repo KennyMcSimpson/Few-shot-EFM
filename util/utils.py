@@ -504,17 +504,26 @@ class NativeScalerWithGradNormCount:
     def __init__(self):
         self._scaler = torch.cuda.amp.GradScaler()
 
-    def __call__(self, loss, optimizer, clip_grad=None, parameters=None, create_graph=False, update_grad=True, layer_names=None):
+    def __call__(self, loss, optimizer, clip_grad=None, parameters=None, create_graph=False,
+                 update_grad=True, layer_names=None, before_optimizer_step=None,
+                 after_optimizer_step=None):
         self._scaler.scale(loss).backward(create_graph=create_graph)
         if update_grad:
-            if clip_grad is not None:
-                assert parameters is not None
-                self._scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
-                norm = torch.nn.utils.clip_grad_norm_(parameters, clip_grad)
-            else:
-                self._scaler.unscale_(optimizer)
-                norm = get_grad_norm_(parameters, layer_names=layer_names)
-            self._scaler.step(optimizer)
+            self._scaler.unscale_(optimizer)
+            step_applied = False
+            try:
+                if before_optimizer_step is not None:
+                    before_optimizer_step()
+                if clip_grad is not None:
+                    assert parameters is not None
+                    norm = torch.nn.utils.clip_grad_norm_(parameters, clip_grad)
+                else:
+                    norm = get_grad_norm_(parameters, layer_names=layer_names)
+                self._scaler.step(optimizer)
+                step_applied = True
+            finally:
+                if after_optimizer_step is not None:
+                    after_optimizer_step(step_applied=step_applied)
             self._scaler.update()
         else:
             norm = None

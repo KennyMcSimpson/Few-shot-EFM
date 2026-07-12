@@ -662,14 +662,24 @@ def train_one_epoch(args, model: torch.nn.Module,
         # this attribute is added by timm on one optimizer (adahessian)
         is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
         loss /= update_freq
+        should_update = (data_iter_step + 1) % update_freq == 0
+        module_e_controller = _module_e_dynamic_pressure_controller(model) if should_update else None
+        before_optimizer_step = None
+        after_optimizer_step = None
+        if module_e_controller is not None:
+            before_optimizer_step = lambda: module_e_controller.prepare_optimizer_step(
+                optimizer, global_step=it, epoch=epoch + 1
+            )
+            after_optimizer_step = lambda step_applied=True: module_e_controller.finish_optimizer_step(
+                optimizer, step_applied=step_applied
+            )
         grad_norm = loss_scaler(loss, optimizer, clip_grad=args.clip_grad,
                                 parameters=model.parameters(), create_graph=is_second_order,
-                                update_grad=(data_iter_step + 1) % update_freq == 0)
+                                update_grad=should_update,
+                                before_optimizer_step=before_optimizer_step,
+                                after_optimizer_step=after_optimizer_step)
         
-        if (data_iter_step + 1) % update_freq == 0:
-            module_e_controller = _module_e_dynamic_pressure_controller(model)
-            if module_e_controller is not None:
-                module_e_controller.finish_step(global_step=it, epoch=epoch + 1)
+        if should_update:
             optimizer.zero_grad()
         loss_scale_value = loss_scaler.state_dict()["scale"]
 

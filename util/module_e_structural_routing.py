@@ -349,14 +349,13 @@ def _tensor_grad_energy_and_count(grad: Any) -> Tuple[float, int]:
     if not math.isfinite(energy) or count <= 0:
         return 0.0, 0
     return max(0.0, energy), count
-# Formal dynamic E mainly reads LoRA-B gradients and then scales branch LoRA gradients.
+# Formal dynamic E observes LoRA-B pressure and controls branch optimizer LRs.
 class ModuleEDynamicPressureController:
     """Online pressure-gated LoRA update controller for Module E.
 
-    Pressure is the mean squared gradient energy on LoRA-B tensors grouped by
-    structural branch. The EMA pressure controls the next optimizer update via
-    branch-specific gradient multipliers. This keeps insertion broad while
-    making Module E's actual update allocation pressure-dependent.
+    Pressure is the mean squared unscaled-gradient energy on LoRA-B tensors.
+    The resulting allocation is applied temporarily to isolated optimizer
+    groups, leaving the gradients themselves unchanged.
     """
 
     def __init__(
@@ -397,10 +396,30 @@ class ModuleEDynamicPressureController:
         self._branch_pressure_param_names: Dict[str, List[str]] = {branch: [] for branch in self.branches}
         self._param_to_branch: Dict[str, str] = {}
         self._param_is_pressure: Dict[str, bool] = {}
+        self._param_objects: Dict[str, Any] = {}
+        self._param_name_by_id: Dict[int, str] = {}
         self._hook_handles: List[Any] = []
+        self._expected_replacement_names: Tuple[str, ...] = tuple()
+        self._bound_optimizer: Optional[Any] = None
+        self._prepared_optimizer: Optional[Any] = None
+        self._stored_group_lrs: List[Tuple[Dict[str, Any], float]] = []
+        self._parameter_snapshots: Dict[str, Any] = {}
+        self._prepared_global_step: Optional[int] = None
+        self._prepared_epoch: Optional[int] = None
+        self._prepared_entropy = 0.0
+        self._allocation_degenerate = 0
         self._steps_seen = 0
 
-    def register_param(self, param_name: Any, branch: Any, is_pressure_param: bool = False) -> bool:
+    def register_param(
+        self,
+        param_name: Any,
+        branch: Any,
+        param: Any = None,
+        is_pressure_param: bool = False,
+    ) -> bool:
+        if isinstance(param, bool) and is_pressure_param is False:
+            is_pressure_param = param
+            param = None
         branch = str(branch or "")
         if branch not in self.branches:
             return False
@@ -411,9 +430,30 @@ class ModuleEDynamicPressureController:
             self._branch_param_names[branch].append(name)
         self._param_to_branch[name] = branch
         self._param_is_pressure[name] = bool(is_pressure_param)
+        if param is not None:
+            existing = self._param_name_by_id.get(id(param))
+            if existing is not None and existing != name:
+                raise RuntimeError(
+                    f"Module E controlled parameter is registered under multiple names: {existing}, {name}."
+                )
+            self._param_objects[name] = param
+            self._param_name_by_id[id(param)] = name
         if is_pressure_param and name not in self._branch_pressure_param_names[branch]:
             self._branch_pressure_param_names[branch].append(name)
         return True
+
+    def controlled_parameter_names(self) -> Tuple[str, ...]:
+        return tuple(self._param_to_branch)
+
+    def branch_for_parameter(self, param: Any) -> Optional[str]:
+        name = self._param_name_by_id.get(id(param))
+        if name is None:
+            return None
+        return self._param_to_branch.get(name)
+
+    def optimizer_group_tag(self, param_name: Any) -> str:
+        branch = self._param_to_branch.get(str(param_name or ""))
+        return f"module_e:{branch}" if branch is not None else "non_module_e"
 
     def branch_param_count(self, branch: Any) -> int:
         return len(self._branch_param_names.get(str(branch or ""), ()))
@@ -449,29 +489,33 @@ class ModuleEDynamicPressureController:
 
         def _hook(grad):
             self.record_gradient(branch, grad, is_pressure_param=is_pressure_param)
-            scale = self.scale_for_branch(branch)
-            if scale == 1.0:
-                return grad
-            return grad * scale
+            return grad
 
         return _hook
 
-    def _compute_next_scales(self) -> Tuple[Dict[str, float], float]:
-        if self._steps_seen < self.warmup_steps:
-            return {branch: 1.0 for branch in self.branches}, 0.0
+    def _active_branches(self) -> Tuple[str, ...]:
+        return tuple(branch for branch in self.branches if self._branch_param_names.get(branch))
 
-        pressures = [max(0.0, self._ema_pressure.get(branch, 0.0)) for branch in self.branches]
+    def _compute_next_scales(self) -> Tuple[Dict[str, float], float, int]:
+        active = self._active_branches()
+        scales = {branch: 1.0 for branch in self.branches}
+        if len(active) <= 1:
+            return scales, 0.0, 1
+        if self._steps_seen < self.warmup_steps:
+            return scales, 0.0, 0
+
+        pressures = [max(0.0, self._ema_pressure.get(branch, 0.0)) for branch in active]
         if sum(pressures) <= 0.0:
-            return {branch: 1.0 for branch in self.branches}, 0.0
+            return scales, 0.0, 0
 
         logs = [math.log(value + 1e-12) / self.temperature for value in pressures]
         max_log = max(logs)
         exp_values = [math.exp(value - max_log) for value in logs]
         denom = sum(exp_values)
         if denom <= 0.0:
-            return {branch: 1.0 for branch in self.branches}, 0.0
+            return scales, 0.0, 0
 
-        n = len(self.branches)
+        n = len(active)
         uniform = 1.0 / max(n, 1)
         weights = [value / denom for value in exp_values]
         gated = [
@@ -482,11 +526,117 @@ class ModuleEDynamicPressureController:
         if n > 1:
             entropy = -sum(weight * math.log(max(weight, 1e-12)) for weight in gated) / math.log(n)
 
-        scales = {}
-        for branch, share in zip(self.branches, gated):
+        for branch, share in zip(active, gated):
             raw_scale = share / uniform
             scales[branch] = min(self.scale_max, max(self.scale_min, float(raw_scale)))
-        return scales, float(entropy)
+        return scales, float(entropy), 0
+
+    def _validate_expected_coverage(self) -> None:
+        if not self._expected_replacement_names:
+            raise RuntimeError("Module E requested but no E replacement names were provided.")
+        missing = []
+        controlled = tuple(self._param_to_branch)
+        for replacement in self._expected_replacement_names:
+            owned = tuple(name for name in controlled if name.startswith(replacement + "."))
+            has_a = any(".lora_a" in name.lower() for name in owned)
+            has_b = any(".lora_b" in name.lower() for name in owned)
+            if not (has_a and has_b):
+                missing.append(replacement)
+        if missing:
+            raise RuntimeError(
+                "Module E structural LoRA coverage is incomplete; every E replacement requires LoRA A/B tensors: "
+                + ", ".join(missing[:8])
+            )
+
+    def bind_optimizer(self, optimizer: Any) -> None:
+        if optimizer is None or not hasattr(optimizer, "param_groups"):
+            raise RuntimeError("Module E requires a concrete optimizer with parameter groups.")
+        if not self._param_objects or len(self._param_objects) != len(self._param_to_branch):
+            raise RuntimeError("Module E cannot bind because controlled parameter objects are incomplete.")
+
+        controlled_ids = {id(param): name for name, param in self._param_objects.items()}
+        occurrences = {param_id: 0 for param_id in controlled_ids}
+        for group_index, group in enumerate(optimizer.param_groups):
+            branches = set()
+            non_e_count = 0
+            for param in group.get("params", ()):
+                param_id = id(param)
+                name = controlled_ids.get(param_id)
+                if name is None:
+                    non_e_count += 1
+                    continue
+                occurrences[param_id] += 1
+                branches.add(self._param_to_branch[name])
+            if len(branches) > 1:
+                raise RuntimeError(f"Module E optimizer group {group_index} mixes E branches: {sorted(branches)}.")
+            if branches and non_e_count:
+                raise RuntimeError(f"Module E optimizer group {group_index} mixes E and non-E parameters.")
+            expected_tag = f"module_e:{next(iter(branches))}" if branches else "non_module_e"
+            if str(group.get("param_group_tag", "")) != expected_tag:
+                raise RuntimeError(
+                    f"Module E optimizer group {group_index} has tag={group.get('param_group_tag')!r}; "
+                    f"expected {expected_tag!r}."
+                )
+
+        missing = [controlled_ids[param_id] for param_id, count in occurrences.items() if count == 0]
+        duplicated = [controlled_ids[param_id] for param_id, count in occurrences.items() if count != 1 and count > 0]
+        if missing or duplicated:
+            raise RuntimeError(
+                f"Module E controlled parameters must appear exactly once; missing={missing[:5]}, duplicated={duplicated[:5]}."
+            )
+        for branch in self._active_branches():
+            if not self._branch_pressure_param_names.get(branch):
+                raise RuntimeError(f"Module E active branch {branch} has no LoRA-B pressure tensors.")
+        if self._expected_replacement_names:
+            self._validate_expected_coverage()
+        self._bound_optimizer = optimizer
+
+    def _read_unscaled_pressure(self) -> None:
+        for branch in self.branches:
+            self._pending_energy[branch] = 0.0
+            self._pending_count[branch] = 0
+            self._pending_param_tensors[branch] = 0
+        for name, param in self._param_objects.items():
+            if self._param_is_pressure.get(name, False):
+                self.record_gradient(self._param_to_branch[name], getattr(param, "grad", None), True)
+
+    def prepare_optimizer_step(
+        self,
+        optimizer: Any,
+        global_step: Optional[int] = None,
+        epoch: Optional[int] = None,
+    ) -> None:
+        if optimizer is not self._bound_optimizer:
+            raise RuntimeError("Module E optimizer must be bound before preparing a step.")
+        if self._prepared_optimizer is not None:
+            raise RuntimeError("Module E optimizer step was prepared twice without finishing.")
+
+        self._read_unscaled_pressure()
+        for branch in self.branches:
+            count = int(self._pending_count.get(branch, 0))
+            raw = float(self._pending_energy.get(branch, 0.0) / count) if count > 0 else 0.0
+            prev = float(self._ema_pressure.get(branch, 0.0))
+            self._raw_pressure[branch] = raw
+            self._ema_pressure[branch] = self.beta * prev + (1.0 - self.beta) * raw
+        scales, entropy, degenerate = self._compute_next_scales()
+        self._branch_scale.update(scales)
+
+        self._parameter_snapshots = {
+            name: param.detach().clone() for name, param in self._param_objects.items()
+        }
+        self._stored_group_lrs = []
+        for group in optimizer.param_groups:
+            base_lr = float(group["lr"])
+            self._stored_group_lrs.append((group, base_lr))
+            tag = str(group.get("param_group_tag", ""))
+            if tag.startswith("module_e:"):
+                branch = tag.split(":", 1)[1]
+                group["lr"] = base_lr * self.scale_for_branch(branch)
+        self._prepared_optimizer = optimizer
+        self._prepared_global_step = global_step
+        self._prepared_epoch = epoch
+        self._prepared_entropy = entropy
+        self._allocation_degenerate = degenerate
 
     def _diagnostic_path(self) -> str:
         if not self.output_dir:
@@ -506,66 +656,76 @@ class ModuleEDynamicPressureController:
                 writer.writeheader()
             writer.writerow(dict(row))
 
-    def finish_step(self, global_step: Optional[int] = None, epoch: Optional[int] = None) -> Dict[str, Any]:
-        raw_pressure = {}
-        for branch in self.branches:
-            count = int(self._pending_count.get(branch, 0))
-            raw = float(self._pending_energy.get(branch, 0.0) / count) if count > 0 else 0.0
-            raw_pressure[branch] = raw
-            prev = float(self._ema_pressure.get(branch, 0.0))
-            self._ema_pressure[branch] = self.beta * prev + (1.0 - self.beta) * raw
-            self._raw_pressure[branch] = raw
+    def finish_optimizer_step(self, optimizer: Any, step_applied: bool = True) -> Dict[str, Any]:
+        if optimizer is not self._prepared_optimizer:
+            raise RuntimeError("Module E optimizer step must be prepared before it is finished.")
+        actual_by_branch = {branch: 0.0 for branch in self.branches}
+        try:
+            if step_applied:
+                squared = {branch: 0.0 for branch in self.branches}
+                for name, before in self._parameter_snapshots.items():
+                    param = self._param_objects[name]
+                    delta = param.detach() - before.to(device=param.device, dtype=param.dtype)
+                    squared[self._param_to_branch[name]] += float(delta.float().pow(2).sum().cpu().item())
+                actual_by_branch = {branch: math.sqrt(max(0.0, value)) for branch, value in squared.items()}
 
-        scales, entropy = self._compute_next_scales()
-        self._branch_scale.update(scales)
+            row: Dict[str, Any] = {
+                "module_e_metric": "dynamic_structural_pressure_gate",
+                "pressure_definition": MODULE_E_DYNAMIC_PRESSURE_DEFINITION,
+                "pressure_source": "unscaled_lora_b_gradient_before_optimizer_step",
+                "pressure_controls_optimizer_lr": 1,
+                "optimizer_control": "temporary_branch_group_lr_multiplier",
+                "pressure_param_scope": "lora_b_only",
+                "controlled_param_scope": "all_lora_params_in_same_structural_branch",
+                "model_name": self.model_name,
+                "run_tag": self.run_tag,
+                "epoch": "" if self._prepared_epoch is None else int(self._prepared_epoch),
+                "global_step": self._steps_seen if self._prepared_global_step is None else int(self._prepared_global_step),
+                "controller_step": self._steps_seen,
+                "step_applied": int(bool(step_applied)),
+                "beta": self.beta,
+                "temperature": self.temperature,
+                "gate_floor": self.gate_floor,
+                "scale_min": self.scale_min,
+                "scale_max": self.scale_max,
+                "warmup_steps": self.warmup_steps,
+                "allocation_entropy": self._prepared_entropy,
+                "allocation_degenerate": int(self._allocation_degenerate),
+                "registered_lora_param_count": self.total_param_count(),
+                "registered_pressure_param_count": self.total_pressure_param_count(),
+                "actual_controlled_update_norm": math.sqrt(
+                    sum(value * value for value in actual_by_branch.values())
+                ),
+            }
+            for branch in self.branches:
+                row[f"raw_pressure_{branch}"] = self._raw_pressure.get(branch, 0.0)
+                row[f"ema_pressure_{branch}"] = self._ema_pressure.get(branch, 0.0)
+                row[f"optimizer_lr_multiplier_{branch}"] = self._branch_scale.get(branch, 1.0)
+                row[f"actual_update_norm_{branch}"] = actual_by_branch.get(branch, 0.0)
+                row[f"lora_param_count_{branch}"] = len(self._branch_param_names.get(branch, ()))
+                row[f"pressure_param_count_{branch}"] = int(self._pending_param_tensors.get(branch, 0))
+            if self._steps_seen % self.diag_freq == 0:
+                self._append_row(row)
+            return row
+        finally:
+            for group, base_lr in self._stored_group_lrs:
+                group["lr"] = base_lr
+            for branch in self.branches:
+                self._pending_energy[branch] = 0.0
+                self._pending_count[branch] = 0
+                self._pending_param_tensors[branch] = 0
+            self._stored_group_lrs = []
+            self._parameter_snapshots = {}
+            self._prepared_optimizer = None
+            self._prepared_global_step = None
+            self._prepared_epoch = None
+            self._steps_seen += 1
 
-        row: Dict[str, Any] = {
-            "module_e_metric": "dynamic_structural_pressure_gate",
-            "pressure_definition": MODULE_E_DYNAMIC_PRESSURE_DEFINITION,
-            "pressure_source": "online_lora_gradient_hook",
-            "pressure_is_pre_e": 0,
-            "pressure_controls_lora_update": 1,
-            "pressure_param_scope": "lora_b_only",
-            "controlled_param_scope": "all_lora_params_in_same_structural_branch",
-            "pressure_reason": "lora_b_is_zero_initialized_output_side_adapter",
-            "warmup_policy": "immediate_pressure_gate" if self.warmup_steps == 0 else "collect_pressure_then_gate",
-            "model_name": self.model_name,
-            "run_tag": self.run_tag,
-            "epoch": "" if epoch is None else int(epoch),
-            "global_step": self._steps_seen if global_step is None else int(global_step),
-            "controller_step": self._steps_seen,
-            "beta": self.beta,
-            "temperature": self.temperature,
-            "gate_floor": self.gate_floor,
-            "scale_min": self.scale_min,
-            "scale_max": self.scale_max,
-            "warmup_steps": self.warmup_steps,
-            "gate_entropy": entropy,
-            "registered_lora_param_count": self.total_param_count(),
-            "registered_pressure_param_count": self.total_pressure_param_count(),
-        }
-        for branch in self.branches:
-            row[f"raw_pressure_{branch}"] = raw_pressure.get(branch, 0.0)
-            row[f"ema_pressure_{branch}"] = self._ema_pressure.get(branch, 0.0)
-            row[f"scale_{branch}"] = self._branch_scale.get(branch, 1.0)
-            row[f"lora_param_count_{branch}"] = len(self._branch_param_names.get(branch, ()))
-            row[f"pressure_param_count_{branch}"] = int(self._pending_param_tensors.get(branch, 0))
 
-        if self._steps_seen % self.diag_freq == 0:
-            self._append_row(row)
-
-        for branch in self.branches:
-            self._pending_energy[branch] = 0.0
-            self._pending_count[branch] = 0
-            self._pending_param_tensors[branch] = 0
-        self._steps_seen += 1
-        return row
-
-
-def attach_module_e_dynamic_pressure_controller(args: Any, model: Any) -> Optional[ModuleEDynamicPressureController]:
+def attach_module_e_dynamic_pressure_controller(args: Any, model: Any) -> ModuleEDynamicPressureController:
     """Attach gradient hooks for dynamic Module E pressure-gated LoRA."""
     if args is None or model is None or not hasattr(model, "named_parameters"):
-        return None
+        raise RuntimeError("Module E requested without a model exposing named parameters.")
 
     existing = getattr(model, "_module_e_dynamic_pressure_controller", None)
     if existing is not None:
@@ -583,25 +743,37 @@ def attach_module_e_dynamic_pressure_controller(args: Any, model: Any) -> Option
         warmup_steps=int(getattr(args, "module_e_warmup_steps", 0)),
         diag_freq=int(getattr(args, "module_e_diag_freq", getattr(args, "diag_freq", 1))),
     )
+    controller._expected_replacement_names = _parse_name_list(
+        getattr(args, "module_e_injected_names", "")
+    )
+    if not controller._expected_replacement_names:
+        raise RuntimeError("Module E requested but no E replacement names were provided.")
 
     hook_count = 0
-    for name, param in model.named_parameters():
-        if not bool(getattr(param, "requires_grad", False)):
-            continue
-        if not _is_lora_adapter_param(name):
-            continue
-        branch = module_e_branch_from_lora_param_name(controller.model_name, name)
-        if branch is None:
-            continue
-        if not controller.register_param(name, branch, is_pressure_param=_is_lora_b_param_name(name)):
-            continue
-        handle = param.register_hook(controller.make_gradient_hook(name))
-        controller._hook_handles.append(handle)
-        hook_count += 1
-
-    if controller.total_param_count() <= 0:
-        print("[ModuleE][WARN] dynamic pressure gate requested but found no structural LoRA tensors to control.")
-        return None
+    try:
+        for name, param in model.named_parameters():
+            if not bool(getattr(param, "requires_grad", False)):
+                continue
+            if not _is_lora_adapter_param(name):
+                continue
+            branch = module_e_branch_from_lora_param_name(controller.model_name, name)
+            if branch is None:
+                continue
+            if not controller.register_param(
+                name, branch, param, is_pressure_param=_is_lora_b_param_name(name)
+            ):
+                continue
+            handle = param.register_hook(controller.make_gradient_hook(name))
+            controller._hook_handles.append(handle)
+            hook_count += 1
+        controller._validate_expected_coverage()
+        for branch in controller._active_branches():
+            if not controller._branch_pressure_param_names.get(branch):
+                raise RuntimeError(f"Module E active branch {branch} has no LoRA-B pressure tensors.")
+    except Exception:
+        for handle in controller._hook_handles:
+            handle.remove()
+        raise
 
     setattr(model, "_module_e_dynamic_pressure_controller", controller)
     if args is not None:

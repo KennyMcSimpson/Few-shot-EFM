@@ -55,6 +55,7 @@ from module_a_lifecycle import (
 )
 
 # Functional-block profiling framework (FB2). Kept outside model core and LoRA implementation.
+_fb_import_error = None
 try:
     from util.fb_policy import add_fb_args, resolve_functional_args, write_resolved_recipe
     from util.fb_probe import save_split_integrity, save_block_registry, save_block_delta_summary
@@ -62,6 +63,7 @@ try:
     from util.module_e_structural_routing import (
         attach_module_e_dynamic_pressure_controller,
         is_module_e_target,
+        module_e_branch_from_lora_param_name,
         module_e_mode_from_args,
         save_module_e_coverage_audit,
         save_module_e_lora_injection_audit,
@@ -75,7 +77,8 @@ try:
         run_module_c_preflight_selection,
     )
     from util.fb_runtime_hooks import run_signal_alignment_probe_after_training
-except Exception as _fb_import_error:
+except Exception as _caught_fb_import_error:
+    _fb_import_error = _caught_fb_import_error
     def add_fb_args(parser): return parser
     def resolve_functional_args(args): return args
     def write_resolved_recipe(args, output_dir): return None
@@ -88,6 +91,7 @@ except Exception as _fb_import_error:
     def save_module_e_structural_pressure_proxy(*args, **kwargs): return None
     def attach_module_e_dynamic_pressure_controller(*args, **kwargs): return None
     def is_module_e_target(*args, **kwargs): return False
+    def module_e_branch_from_lora_param_name(*args, **kwargs): return None
     def module_e_mode_from_args(*args, **kwargs): return "dynamic_pressure_gate"
     def module_d_eval_row_from_details(*args, **kwargs): return {}
     def save_module_d_sbr_eval(*args, **kwargs): return None
@@ -1205,7 +1209,7 @@ def _module_c_selection_contains_e(args):
 
 def _module_e_lora_requested(args):
     target = str(getattr(args, "lora_target", "") or "").lower()
-    if is_module_e_target(target):
+    if target in ("str", "struct", "structural", "struct_mix", "mix", "spatial_attn", "temporal_attn") or is_module_e_target(target):
         return True
     if _is_module_c_execution_target(target) and _module_c_selection_contains_e(args):
         return True
@@ -1223,6 +1227,40 @@ def _module_e_dynamic_pressure_requested(args):
         and _module_e_mode(args) == "dynamic_pressure_gate"
         and _module_e_lora_requested(args)
     )
+
+
+def _attach_requested_module_e_controller(args, model):
+    if not _module_e_dynamic_pressure_requested(args):
+        return None
+    if bool(getattr(args, "enable_deepspeed", False)):
+        raise RuntimeError("Dynamic Module E with DeepSpeed is unsupported in this patch.")
+    try:
+        controller = attach_module_e_dynamic_pressure_controller(args, model)
+    except Exception as exc:
+        raise RuntimeError(f"Requested Module E attachment failed: {exc}") from exc
+    if controller is None:
+        detail = f": {_fb_import_error}" if _fb_import_error is not None else ""
+        raise RuntimeError(f"Requested Module E attachment returned no controller{detail}")
+    return controller
+
+
+def _create_formal_optimizer(args, model, skip_weight_decay_list, assigner=None, controller=None):
+    try:
+        optimizer = create_optimizer(
+            args,
+            model,
+            skip_list=skip_weight_decay_list,
+            get_num_layer=assigner.get_layer_id if assigner is not None else None,
+            get_layer_scale=assigner.get_scale if assigner is not None else None,
+            get_param_group_tag=(controller.optimizer_group_tag if controller is not None else None),
+        )
+        if controller is not None:
+            controller.bind_optimizer(optimizer)
+        return optimizer
+    except Exception as exc:
+        if controller is not None:
+            raise RuntimeError(f"Requested Module E optimizer bind failed: {exc}") from exc
+        raise
 
 
 def _apply_lora_training_setup(model, args):
@@ -1314,7 +1352,14 @@ def _apply_lora_training_setup(model, args):
         else:
             raise ValueError(f'Unknown lora_base_update={args.lora_base_update}')
 
-    args.module_e_injected_names = ";".join(replaced)
+    if _module_e_lora_requested(args):
+        e_replaced = [
+            name for name in replaced
+            if module_e_branch_from_lora_param_name(args.model_name, name) is not None
+        ]
+        args.module_e_injected_names = ";".join(e_replaced)
+    else:
+        args.module_e_injected_names = ";".join(replaced)
 
     # CBraMod mechanism diagnosis controls.
     if args.model_name == 'CBraMod' and getattr(args, 'cbra_train_patch_embed_when_frozen', False):
@@ -3440,8 +3485,7 @@ def main(args, ds_init):
     # model_ema = None
     model_without_ddp = model
 
-    if _module_e_dynamic_pressure_requested(args):
-        attach_module_e_dynamic_pressure_controller(args, model_without_ddp)
+    module_e_controller = _attach_requested_module_e_controller(args, model_without_ddp)
 
     if getattr(args, 'model_name', None) == 'CBraMod' and float(getattr(args, 'cbra_l2sp_lambda', 0.0)) > 0.0:
         _register_cbra_l2sp_reference(model_without_ddp, args, verbose=True)
@@ -3515,10 +3559,13 @@ def main(args, ds_init):
         print("model.gradient_accumulation_steps() = %d" % model.gradient_accumulation_steps())
         assert model.gradient_accumulation_steps() == args.update_freq
     else:
-        optimizer = create_optimizer(
-            args, model_without_ddp, skip_list=skip_weight_decay_list,
-            get_num_layer=assigner.get_layer_id if assigner is not None else None, 
-            get_layer_scale=assigner.get_scale if assigner is not None else None)
+        optimizer = _create_formal_optimizer(
+            args,
+            model_without_ddp,
+            skip_weight_decay_list=skip_weight_decay_list,
+            assigner=assigner,
+            controller=module_e_controller,
+        )
         loss_scaler = NativeScaler()
 
 

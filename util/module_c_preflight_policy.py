@@ -409,7 +409,7 @@ def _optimizer_layer_decay_callbacks(args: Any, model: nn.Module) -> Tuple[Optio
     return assigner.get_layer_id, assigner.get_scale
 
 
-def _create_probe_optimizer(args: Any, model: nn.Module) -> torch.optim.Optimizer:
+def _create_probe_optimizer(args: Any, model: nn.Module, controller: Any = None) -> torch.optim.Optimizer:
     get_num_layer, get_layer_scale = _optimizer_layer_decay_callbacks(args, model)
     optimizer = create_optimizer(
         args,
@@ -417,10 +417,13 @@ def _create_probe_optimizer(args: Any, model: nn.Module) -> torch.optim.Optimize
         skip_list=[],
         get_num_layer=get_num_layer,
         get_layer_scale=get_layer_scale,
+        get_param_group_tag=(controller.optimizer_group_tag if controller is not None else None),
     )
     base_lr = float(getattr(args, "lr", 0.0))
     for group in optimizer.param_groups:
         group["lr"] = base_lr * float(group.get("lr_scale", 1.0))
+    if controller is not None:
+        controller.bind_optimizer(optimizer)
     return optimizer
 
 
@@ -498,7 +501,7 @@ def _run_support_pass(
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not trainable:
         return None, 0, 0
-    optimizer = _create_probe_optimizer(args, model)
+    optimizer = _create_probe_optimizer(args, model, controller=controller)
     optimizer.zero_grad(set_to_none=True)
     update_freq = max(1, int(getattr(args, "update_freq", 1)))
     total_loss = 0.0
@@ -519,13 +522,21 @@ def _run_support_pass(
         (loss / float(update_freq)).backward()
         should_step = (batch_index + 1) % update_freq == 0 or batch_index + 1 == len(batches)
         if should_step:
-            clip_grad = getattr(args, "clip_grad", None)
-            if clip_grad is not None:
-                torch.nn.utils.clip_grad_norm_(trainable, float(clip_grad))
-            optimizer.step()
-            optimizer_steps += 1
             if controller is not None:
-                controller.finish_step(global_step=optimizer_steps - 1, epoch=1)
+                controller.prepare_optimizer_step(
+                    optimizer, global_step=optimizer_steps, epoch=1
+                )
+            step_applied = False
+            try:
+                clip_grad = getattr(args, "clip_grad", None)
+                if clip_grad is not None:
+                    torch.nn.utils.clip_grad_norm_(trainable, float(clip_grad))
+                optimizer.step()
+                step_applied = True
+                optimizer_steps += 1
+            finally:
+                if controller is not None:
+                    controller.finish_optimizer_step(optimizer, step_applied=step_applied)
             optimizer.zero_grad(set_to_none=True)
     return float(total_loss / total_examples), total_examples, optimizer_steps
 
@@ -815,6 +826,9 @@ def run_module_c_preflight_selection(
         branch_args.output_dir = ""
         controller = None
         if "E" in subset and str(getattr(args, "module_e_mode", "")) == "dynamic_pressure_gate":
+            branch_args.module_e_injected_names = ";".join(
+                ownership.action_replacement_names["E"]
+            )
             controller = attach_module_e_dynamic_pressure_controller(branch_args, model)
         branch_criterion = (
             criterion_builder(branch_args, device) if criterion_builder is not None else _default_criterion(branch_args, device)
