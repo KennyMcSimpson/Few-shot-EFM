@@ -2,8 +2,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
+# This source code is licensed under Apache-2.0; see
+# licenses/Apache-2.0.txt in this repository.
 #
 
 import math

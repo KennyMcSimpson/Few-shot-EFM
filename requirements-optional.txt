@@ -1,0 +1,2 @@
+# Optional Linux-only distributed training dependency.
+deepspeed==0.17.2; platform_system == "Linux"

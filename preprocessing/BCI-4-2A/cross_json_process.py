@@ -8,8 +8,8 @@ import sys
 
 data_root = sys.argv[1]  
 print(f"Data root: {data_root}")
-processed_data_path = os.path.join(data_root,'BCI-IV-2A/processed_data')
-data_split_path = './preprocessing/BCI-IV-2A/cross_subject_json'
+processed_data_path = os.path.join(data_root,'BCI-4-2A/processed_data')
+data_split_path = './preprocessing/BCI-4-2A/cross_subject_json'
 os.makedirs(data_split_path, exist_ok=True)
 save_train_path = os.path.join(data_split_path, 'train.json')
 save_val_path = os.path.join(data_split_path, 'val.json')

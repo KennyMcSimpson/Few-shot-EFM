@@ -32,6 +32,7 @@ from util.optim_factory import create_optimizer, get_parameter_groups, LayerDeca
 from util.utils import NativeScalerWithGradNormCount as NativeScaler
 import util.utils as utils
 from util.eegdatasets import EEGDataset
+from util.dataset_config import load_task_dataset_info
 from util.lora import (
     freeze_all_parameters,
     unfreeze_module,
@@ -141,9 +142,11 @@ finetune_list = {
 def get_args():
     parser = argparse.ArgumentParser()
     # Fine-tuning parameters
-    parser.add_argument('--dataset', default='SEED', type=str, 
+    parser.add_argument('--dataset', default='SEED-IV', type=str,
                         choices=['SEED', 'SEED-IV', 'BCI-IV-2A', 'SHU', 'SEED-VIG', 'EEGMAT',
-                                 'Sleep-EDF', 'HMC', 'SHHS', 'TUAB', 'TUEV', 'Things-EEG', 'Siena'])
+                                 'Sleep-EDF', 'HMC', 'SHHS', 'TUAB', 'TUEV', 'Things-EEG', 'Siena'],
+                        help=('Dataset name. Classification/regression require an entry in '
+                              'dataset_config; some choices are retrieval or preprocessing-only.'))
     parser.add_argument('--model_name', default='LaBraM', type=str,
                         choices=['LaBraM', 'CBraMod', 'EEGPT', 'BIOT', 'CSBrain', 'Gram', 'NeurIPT', 'EEGNet', 'LMDA', 'EEGConformer', 'ST-Transformer'])
     parser.add_argument('--csbrain_ckpt', default='./checkpoints/CSBrain.pth', type=str,
@@ -573,7 +576,7 @@ def get_args():
             parser = deepspeed.add_config_arguments(parser)
             ds_init = deepspeed.initialize
         except:
-            print("Please 'pip install deepspeed==0.4.0'")
+            print("Please install the optional dependencies from requirements-optional.txt")
             exit(0)
     else:
         ds_init = None
@@ -3402,10 +3405,9 @@ def main(args, ds_init):
 
     cudnn.benchmark = True
 
-    # get dataset
-    with open(f'./dataset_config/{args.task_mod}.json', 'r') as file:
-        data = json.load(file)
-    dataset_info = data.get(args.dataset)
+    # Classification/regression use the validated task registry. Retrieval has
+    # its own EEGDataset registry and therefore does not require Retrieval.json.
+    dataset_info = load_task_dataset_info(args.task_mod, args.dataset)
     if args.task_mod == 'Retrieval':
         os.environ["WANDB_API_KEY"] = ""
         os.environ["WANDB_MODE"] = 'offline'

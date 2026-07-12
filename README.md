@@ -1,207 +1,160 @@
 # Few-shot EFM
 
-Few-shot EFM is a research codebase for few-shot adaptation of EEG foundation
-models. It is built on the AdaBrain-Bench training framework, but the focus of
-this repository is the project-specific adaptation layer: functional-block LoRA,
-diagnostic module selection, and validation-only adapter lifecycle evaluation
-for small-data EEG classification.
+Few-shot EFM is a research codebase for adapting EEG foundation models when
+only a small labelled support set is available. It extends
+[AdaBrain-Bench](https://github.com/Jamine-W/AdaBrain-Bench) with model-aware
+functional-block LoRA, validation-only adapter selection, and a reproducible
+Module C search over the B/D/E adaptation actions.
 
-This is not a clean-room replacement for AdaBrain-Bench. The dataset loaders,
-many baseline wrappers, and the main fine-tuning loop inherit from that
-framework. The added research logic is organized around model-aware adapter
-targets and diagnostics rather than a leaderboard copy of the original
-benchmark.
+This repository is a research fork, not a clean-room reimplementation. The
+training loop, dataset interface, preprocessing foundations, and several model
+wrappers originate from AdaBrain-Bench. The project-specific additions and the
+vendored integrations are documented in
+[Architecture](docs/architecture.md) and
+[Third-party notices](THIRD_PARTY_NOTICES.md).
 
-## Scope
+## What is included
 
-The repository tracks source code, configuration, preprocessing scripts, and
-documentation. It does not track local datasets, generated split JSON files,
-checkpoints, logs, or experiment result folders. Large artifacts and completed
-runs are stored separately on Hugging Face:
+- Eleven training backbones: LaBraM, CBraMod, EEGPT, BIOT, CSBrain, Gram,
+  NeurIPT, EEGNet, LMDA, EEGConformer, and ST-Transformer.
+- Eight datasets connected to the training registry: BCI-IV-2A, EEGMAT, HMC,
+  SEED-IV, SEED-VIG, Siena, Sleep-EDF, and TUEV.
+- Five additional preprocessing-only integrations: SEED, SHHS, SHU, TUAB, and
+  Things-EEG. They are not advertised as trainable until a dataset config is
+  added and validated.
+- Full fine-tuning, linear probing, and LoRA adaptation.
+- Functional-block diagnostics and Modules A-E for few-shot adapter control.
+- Portable Python entrypoints for dataset preparation and experiment
+  manifests. The public tree intentionally contains no batch or shell runners.
+
+Raw datasets, generated split indexes, checkpoints, logs, and result folders
+are intentionally excluded from Git. Released artifacts belong in the
+[Few-shot EFM Hugging Face collection](https://huggingface.co/datasets/KennySimpson/few-shot-EFM).
+
+## Repository map
 
 ```text
-https://huggingface.co/datasets/KennySimpson/few-shot-EFM
-```
-
-## Main Components
-
-```text
-run_finetuning.py              Main training and evaluation entrypoint
-engine_for_finetuning.py       Training loop, evaluation, loss, calibration, lifecycle hooks
-module_a_lifecycle.py          Validation-only adapter lifecycle and adaptive-SWA utilities
-
-models/                        EEG model wrappers and backbone integrations
-util/lora.py                   LoRA injection and trainable-parameter control
-util/fb_*.py                   Functional-block registry, policy, probes, and collection
-util/module_b_*.py             Signal/input-side adaptation helpers
-util/module_c_*.py             Exhaustive matched one-pass Module C subset search
-util/module_d_*.py             Semantic refinement utilities
-util/module_e_*.py             Structural routing and pressure-guided helpers
-
-preprocessing/                 Dataset preprocessing and split-generation scripts
-dataset_config/                Dataset root/config definitions
-external/                      Vendored integrations for Gram and NeurIPT
-tools/                         Lightweight analysis utilities
+run_finetuning.py          training and evaluation entrypoint
+engine_for_finetuning.py   epoch loops, metrics, and lifecycle hooks
+module_a_lifecycle.py      validation-only checkpoint/lifecycle selection
+models/                    model wrappers and local backbone integrations
+util/                      LoRA plus Modules B-E and diagnostics
+preprocessing/             dataset-specific Python preprocessors
+dataset_config/            training-visible dataset metadata
+experiment_manifests/      portable experiment matrices
+tools/                     dataset and manifest command-line utilities
+external/                  isolated Gram and NeurIPT source integrations
+tests/                     unit and repository-contract tests
+docs/                      architecture, data, and reproducibility guides
 ```
 
 ## Installation
 
-```bash
+Python 3.10 is the reference environment.
+
+```console
 conda create -n fewshot-efm python=3.10
 conda activate fewshot-efm
 pip install -r requirements.txt
 ```
 
-Place pretrained model weights under `checkpoints/` locally. The default
-filenames expected by `run_finetuning.py` are:
+The pinned PyTorch build targets CUDA 11.8. Choose the matching official
+PyTorch wheel for a different CUDA or CPU platform. DeepSpeed is optional and
+Linux-only in this project:
 
-```text
-labram-base.pth
-pretrained_weights.pth
-eegpt_mcae_58chs_4s_large4E.ckpt
-EEG-six-datasets-18-channels.ckpt
-CSBrain.pth
-gram_base.pth
-neuript_stage2.pth
+```console
+pip install -r requirements-optional.txt
 ```
 
-Model weights are not committed to Git.
+Keep pretrained weights in a local `checkpoints/` directory. The default
+filenames are defined by `finetune_list` in `run_finetuning.py`; weights are not
+stored in this repository.
 
-## Dataset Preparation
+## Dataset preparation
 
-See `DATASETS.md` for dataset organization and split-generation details. In
-short:
+The cross-platform dataset utility discovers the checked-in Python
+preprocessors and separately reports whether each dataset is training
+configured:
 
-```bash
-bash preprocessing/data_preprocess.sh /path/to/data/root TUEV
-bash preprocessing/json_process.sh /path/to/data/root TUEV cross
+```console
+python tools/dataset_cli.py list
+python tools/dataset_cli.py prepare TUEV /path/to/eeg
+python tools/dataset_cli.py split TUEV /path/to/eeg --mode cross
+python tools/dataset_cli.py audit preprocessing/TUEV/cross_subject_json
 ```
 
-Generated files such as `preprocessing/TUEV/cross_subject_json/train.json`
-contain local filesystem paths. They are intentionally ignored by Git and
-should be regenerated on each machine.
+The audit checks exact-path and basename overlap across `train.json`,
+`val.json`, and `test.json`. Read [Dataset support](docs/datasets.md) before
+using a new dataset; preprocessing availability and end-to-end training support
+are deliberately reported as different states.
 
-## TUEV Split Integrity
+## Training examples
 
-The original Ada-style TUEV preprocessing can leave validation samples
-physically present in both `processed_data/train_dir` and
-`processed_data/eval_dir`: validation files are copied from `train_dir` into
-`eval_dir`, but the original copies are not removed from `train_dir`.
+Full fine-tuning:
 
-This repository avoids that leakage in the training path. For TUEV,
-`preprocessing/TUEV/cross_json_process.py` builds validation from `eval_dir`
-and excludes any validation basename from the generated training JSON:
-
-```python
-val_basenames = {f for f in os.listdir(val_folder) if f.endswith(".pkl")}
-train_files = [
-    os.path.join(train_folder, f)
-    for f in os.listdir(train_folder)
-    if f.endswith(".pkl") and f not in val_basenames
-]
+```console
+python run_finetuning.py --dataset Sleep-EDF --model_name LaBraM \
+  --task_mod Classification --subject_mod fewshot --finetune_mod full \
+  --k_shot 0.05 --epochs 30 --batch_size 16 --lr 1e-4 --seed 0
 ```
 
-Use `run_finetuning.py`, which reads the generated JSON indexes through
-`CustomDataLoader` or `FewShotDataLoader`. Do not train TUEV by directly
-enumerating `processed_data/train_dir` and `processed_data/eval_dir`, because
-that bypasses the JSON-level de-overlap step.
+Functional-block LoRA:
 
-For other datasets, the same rule applies at the JSON level: train, validation,
-and test should not contain the exact same file path or basename. Some datasets
-may use validation windows from training subjects; subject overlap alone is not
-the same as file-level leakage.
-
-## Running
-
-Full fine-tuning example:
-
-```bash
-python run_finetuning.py \
-  --dataset TUEV \
-  --model_name LaBraM \
-  --task_mod Classification \
-  --subject_mod fewshot \
-  --finetune_mod full \
-  --k_shot 0.05 \
-  --epochs 30 \
-  --batch_size 16 \
-  --lr 1e-4 \
-  --norm_method z_score \
-  --sampling_rate 200 \
-  --seed 0
+```console
+python run_finetuning.py --dataset SEED-IV --model_name EEGPT \
+  --task_mod Classification --subject_mod fewshot --finetune_mod lora \
+  --k_shot 0.05 --lora_target semantic --lora_rank 4 --lora_alpha 8 \
+  --fb_enable --fb_probe --fb_collect --seed 0
 ```
 
-LoRA with functional-block diagnostics:
+Module C exhaustive B/D/E preflight:
 
-```bash
-python run_finetuning.py \
-  --dataset TUEV \
-  --model_name LaBraM \
-  --task_mod Classification \
-  --subject_mod fewshot \
-  --finetune_mod lora \
-  --k_shot 0.05 \
-  --epochs 30 \
-  --batch_size 16 \
-  --lr 1e-4 \
-  --loss_type sqrt_balanced_ce \
-  --best_metric balanced_accuracy \
-  --lora_target semantic \
-  --lora_base_update full \
-  --lora_rank 4 \
-  --lora_alpha 8 \
-  --fb_enable \
-  --fb_probe \
-  --fb_recipe sem_lif \
-  --fb_collect
+```console
+python run_finetuning.py --dataset BCI-IV-2A --model_name BIOT \
+  --task_mod Classification --subject_mod fewshot --finetune_mod lora \
+  --k_shot 0.05 --lora_target module_c --module_c_candidates B,D,E \
+  --module_c_preflight_train_batches 0 --module_c_preflight_val_batches 0 \
+  --module_c_preflight_only
 ```
 
-Module-C exhaustive B/D/E search:
+Module C evaluates all seven non-empty subsets with the same complete support
+pass and complete validation pass. `EMPTY` is a reference only. The selected
+subset minimizes sample-level class-macro validation log-loss; exact ties prefer
+fewer actions, fewer adapter parameters, then canonical B/D/E order. Module C
+selection is intentionally fail-closed when `world_size` is greater than one.
 
-```bash
-python run_finetuning.py \
-  --dataset TUEV \
-  --task_mod Classification \
-  --model_name LaBraM \
-  --subject_mod fewshot \
-  --k_shot 0.05 \
-  --finetune_mod lora \
-  --lora_target module_c \
-  --module_c_candidates B,D,E \
-  --module_c_preflight_train_batches 0 \
-  --module_c_preflight_val_batches 0
+The checked 4-dataset, 6-model seed-0 matrix can be previewed or executed without
+machine-specific runners:
+
+```console
+python tools/run_manifest.py experiment_manifests/module_c_exhaustive_seed0_4datasets.json
+python tools/run_manifest.py experiment_manifests/module_c_exhaustive_seed0_4datasets.json --execute
 ```
 
-The default `0/0` scope uses one complete support pass and the complete
-validation split. Both use `SequentialSampler` with `drop_last=False`, so every
-available example is covered once. `EMPTY` is retained only as a reference;
-`B`, `D`, `E`, `B+D`, `B+E`, `D+E`, and `B+D+E` each receive the same anchored
-support pass. The nonempty subset with the lowest sample-level class-macro
-validation log-loss is selected, with exact ties resolved by fewer actions,
-then fewer adapter parameters, then canonical B/D/E order. Add
-`--module_c_preflight_only` to write the decision and timing diagnostics without
-starting formal training.
+Preview is the default. Training begins only when `--execute` is supplied.
 
-The checked experiment matrix and fixed arguments live in
-`experiment_manifests/module_c_exhaustive_seed0_4datasets.json`. Machine-specific
-launch scripts are intentionally kept outside the public repository; each
-matrix entry invokes `run_finetuning.py` directly with the manifest arguments,
-plus `--dataset`, `--model_name`, `--seed`, `--output_dir`, and `--run_tag`.
+## Documentation
 
-## Reproducibility Notes
+- [Architecture and contribution boundary](docs/architecture.md)
+- [Dataset support and split integrity](docs/datasets.md)
+- [Reproducibility and experiment manifests](docs/reproducibility.md)
+- [Adding a backbone](docs/adding-a-backbone.md)
+- [Third-party notices](THIRD_PARTY_NOTICES.md)
 
-- Keep raw datasets and processed data local.
-- Regenerate split JSON files locally after preprocessing.
-- Keep checkpoints and experiment outputs outside Git.
-- Use validation metrics for adapter selection. Do not select hyperparameters
-  from test performance.
-- When reporting TUEV results, state that validation basenames are excluded
-  from the generated training JSON.
+## Status and limitations
 
-## Attribution
+This is active research software. Passing unit tests establish interface and
+protocol invariants; they do not substitute for dataset-level scientific
+validation. The checked Module C manifest currently covers TUEV, Sleep-EDF,
+BCI-IV-2A, and SEED-IV. Other training-configured datasets remain available for
+the general training path but are not implicitly claimed as part of that
+specific Module C matrix.
 
-Few-shot EFM builds on AdaBrain-Bench for the baseline training framework,
-dataset interface, and several backbone integrations. Please acknowledge the
-original AdaBrain-Bench project when using this repository. The additional code
-in this fork focuses on few-shot EEGFM adaptation, functional-block LoRA
-diagnostics, and adapter lifecycle evaluation.
+## License and attribution
+
+Project-authored changes and the inherited AdaBrain-Bench framework are
+distributed under the [MIT License](LICENSE). Bundled third-party portions keep
+their own notices and terms. Retain upstream copyright notices and cite the
+original model and dataset publications used in your experiments. See
+[Third-party notices](THIRD_PARTY_NOTICES.md) for source boundaries, license
+copies, and upstream links.

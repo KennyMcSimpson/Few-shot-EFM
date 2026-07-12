@@ -2,8 +2,8 @@
   "BCI-IV-2A": {
     "root": {
       "multi": "./preprocessing/BCI-4-2A/multi_subject_json",
-      "cross": "./preprocessing/BCI-4-2A/multi_subject_json",
-      "fewshot": "./preprocessing/BCI-4-2A/multi_subject_json"
+      "cross": "./preprocessing/BCI-4-2A/cross_subject_json",
+      "fewshot": "./preprocessing/BCI-4-2A/cross_subject_json"
     },
     "num_classes": 4,
     "num_t": 4
