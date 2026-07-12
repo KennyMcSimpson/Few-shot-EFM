@@ -24,6 +24,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+def _require_finite_loss(value, context):
+    """Return a finite scalar loss or fail before any backward/optimizer path."""
+    if not math.isfinite(value):
+        raise FloatingPointError(f"Non-finite loss {value} in {context}")
+    return value
+
+
 def _get_class_weight_tensor(args, device):
     """Return class-weight tensor prepared in run_finetuning.py, or None.
 
@@ -654,10 +661,9 @@ def train_one_epoch(args, model: torch.nn.Module,
         if l2sp_terms > 0:
             loss = loss + l2sp_loss
 
-        loss_value = loss.item()
-
-        if not math.isfinite(loss_value):
-            print("Warning: Loss is {}".format(loss_value))
+        loss_value = _require_finite_loss(
+            loss.item(), f"{args.task_mod} train_one_epoch"
+        )
 
         # this attribute is added by timm on one optimizer (adahessian)
         is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
@@ -997,9 +1003,7 @@ def train_model(args, eeg_model, dataloader, optimizer, device,
         loss_scale = eeg_model.module.loss_scale if args.distributed else eeg_model.loss_scale
         img_loss = eeg_model.loss_func(eeg_features, img_features, loss_scale)
         loss = img_loss
-        loss_value = loss.item()
-        if not math.isfinite(loss_value):
-            print("Loss is {}.".format(loss_value))
+        loss_value = _require_finite_loss(loss.item(), "Retrieval train_model")
 
         max_norm = args.clip_grad
         if loss_scaler is None:
