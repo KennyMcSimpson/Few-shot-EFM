@@ -71,6 +71,7 @@ try:
     )
     from util.module_d_semantic_refinement import module_d_eval_row_from_details, save_module_d_sbr_eval
     from util.module_c_preflight_policy import (
+        _resolve_module_c_support_batch_limit,
         capture_module_c_rng_state,
         module_c_preflight_requested,
         restore_module_c_rng_state,
@@ -96,6 +97,7 @@ except Exception as _caught_fb_import_error:
     def module_d_eval_row_from_details(*args, **kwargs): return {}
     def save_module_d_sbr_eval(*args, **kwargs): return None
     def module_c_preflight_requested(*args, **kwargs): return False
+    def _resolve_module_c_support_batch_limit(*args, **kwargs): return 0
     def capture_module_c_rng_state(*args, **kwargs): return None
     def restore_module_c_rng_state(*args, **kwargs): return None
     def run_module_c_preflight_selection(*args, **kwargs): return None
@@ -1320,6 +1322,7 @@ def _apply_lora_training_setup(model, args):
             r=args.lora_rank,
             alpha=args.lora_alpha,
             dropout=args.lora_dropout,
+            module_c_seed=int(getattr(args, 'seed', 0)),
             verbose=True,
         )
         if len(replaced) == 0:
@@ -1919,6 +1922,52 @@ def _make_train_eval_loader(args, dataset_train):
         **_data_loader_kwargs(args, drop_last=False),
     )
     return data_loader_train_eval
+
+
+def _make_module_c_preflight_loaders(args, dataset_train, dataset_val):
+    if dataset_val is None:
+        raise RuntimeError("Automatic Module C requires a validation dataset.")
+    support_loader = torch.utils.data.DataLoader(
+        dataset_train,
+        sampler=torch.utils.data.SequentialSampler(dataset_train),
+        batch_size=int(args.batch_size),
+        **_data_loader_kwargs(args, drop_last=True),
+    )
+    validation_loader = torch.utils.data.DataLoader(
+        dataset_val,
+        sampler=torch.utils.data.SequentialSampler(dataset_val),
+        batch_size=int(args.batch_size),
+        **_data_loader_kwargs(args, drop_last=False),
+    )
+    return support_loader, validation_loader
+
+
+def _ensure_module_c_preflight_has_no_resume(args):
+    resume_checkpoint = utils.resolve_resume_checkpoint(args)
+    if resume_checkpoint is not None:
+        raise RuntimeError(
+            "Automatic Module C topology recovery from a resume checkpoint is unsupported "
+            f"({resume_checkpoint}). Use a new output directory and no resume checkpoint."
+        )
+
+
+def _build_training_schedules(args, num_training_steps_per_epoch):
+    if args.lr_schedule_type == 'cosine':
+        lr_schedule_values = utils.cosine_scheduler(
+            args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch,
+            warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps,
+        )
+    elif args.lr_schedule_type in ['constant', 'plateau']:
+        lr_schedule_values = None
+        print(f"[LR] Using {args.lr_schedule_type} LR schedule. Initial optimizer LR is kept from create_optimizer().")
+    else:
+        raise ValueError(f"Unknown lr_schedule_type={args.lr_schedule_type}")
+    if args.weight_decay_end is None:
+        args.weight_decay_end = args.weight_decay
+    wd_schedule_values = utils.cosine_scheduler(
+        args.weight_decay, args.weight_decay_end, args.epochs, num_training_steps_per_epoch)
+    print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
+    return lr_schedule_values, wd_schedule_values
 
 
 def _select_metric(stats, metric_name):
@@ -3376,6 +3425,12 @@ def main(args, ds_init):
         dataset_val = None
         dataset_test = None
 
+    total_batch_size = args.batch_size * args.update_freq * utils.get_world_size()
+    num_training_steps_per_epoch = len(dataset_train) // total_batch_size
+    lr_schedule_values, wd_schedule_values = _build_training_schedules(
+        args, num_training_steps_per_epoch
+    )
+
     # if True:  # args.distributed:
     global_rank = 0
     if args.distributed:
@@ -3447,8 +3502,14 @@ def main(args, ds_init):
 
     module_c_preflight_ran = False
     if module_c_preflight_requested(args):
+        _ensure_module_c_preflight_has_no_resume(args)
         print("[ModuleC] running matched low-budget search before formal LoRA training.")
-        preflight_rng_state = capture_module_c_rng_state((data_loader_train, data_loader_val))
+        module_c_support_loader, module_c_validation_loader = _make_module_c_preflight_loaders(
+            args, dataset_train, dataset_val
+        )
+        preflight_rng_state = capture_module_c_rng_state(
+            (module_c_support_loader, module_c_validation_loader)
+        )
         probe_model = None
         try:
             probe_model = _build_module_c_preflight_probe_model(args, ch_names, dataset_info["num_t"])
@@ -3456,11 +3517,14 @@ def main(args, ds_init):
             run_module_c_preflight_selection(
                 args=args,
                 model=probe_model,
-                data_loader_train=data_loader_train,
-                data_loader_val=data_loader_val,
+                data_loader_train=module_c_support_loader,
+                data_loader_val=module_c_validation_loader,
                 device=device,
                 criterion_builder=_build_module_e_pressure_criterion,
                 is_main_process=utils.is_main_process(),
+                num_training_steps_per_epoch=num_training_steps_per_epoch,
+                lr_schedule_values=lr_schedule_values,
+                wd_schedule_values=wd_schedule_values,
             )
             module_c_preflight_ran = True
         finally:
@@ -3518,8 +3582,6 @@ def main(args, ds_init):
         )
         return
 
-    total_batch_size = args.batch_size * args.update_freq * utils.get_world_size()
-    num_training_steps_per_epoch = len(dataset_train) // total_batch_size
     print("LR = %.8f" % args.lr)
     print("Batch size = %d" % total_batch_size)
     print("Update frequent = %d" % args.update_freq)
@@ -3567,24 +3629,6 @@ def main(args, ds_init):
             controller=module_e_controller,
         )
         loss_scaler = NativeScaler()
-
-
-    if args.lr_schedule_type == 'cosine':
-        lr_schedule_values = utils.cosine_scheduler(
-            args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch,
-            warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps,
-        )
-    elif args.lr_schedule_type in ['constant', 'plateau']:
-        # Keep optimizer's own learning rates. Plateau mode will reduce them after evaluation.
-        lr_schedule_values = None
-        print(f"[LR] Using {args.lr_schedule_type} LR schedule. Initial optimizer LR is kept from create_optimizer().")
-    else:
-        raise ValueError(f"Unknown lr_schedule_type={args.lr_schedule_type}")
-    if args.weight_decay_end is None:
-        args.weight_decay_end = args.weight_decay
-    wd_schedule_values = utils.cosine_scheduler(
-        args.weight_decay, args.weight_decay_end, args.epochs, num_training_steps_per_epoch)
-    print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
 
     # load checkpoint for resume
     utils.auto_load_model(

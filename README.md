@@ -172,10 +172,14 @@ python run_finetuning.py \
   --module_c_preflight_val_batches 0
 ```
 
-The default `0/0` scope uses the complete support and validation splits. Each
-visited subset receives one matched support pass, and ranking uses paired,
-subject-clustered validation log-loss. Add `--module_c_preflight_only` to write
-the decision and timing diagnostics without starting formal training.
+The default `0/0` scope uses the complete formal-visible support epoch and the
+complete validation split. Support uses `SequentialSampler` with
+`drop_last=True`, so Ada excludes the raw tail exactly as formal training does;
+validation uses `SequentialSampler` with `drop_last=False` and covers every
+example once. Each visited subset receives the same matched support pass, and
+ranking uses paired, subject-clustered validation log-loss. Add
+`--module_c_preflight_only` to write the decision and timing diagnostics without
+starting formal training.
 
 ## Reproducibility Notes
 

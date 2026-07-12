@@ -92,6 +92,7 @@ class _BranchEvaluation:
     adapter_parameter_count: int
     trainable_parameter_count: int
     support_fingerprint: str
+    optimizer_schedule_trace: Tuple[Dict[str, Any], ...]
     elapsed_seconds: float
 
     def summary(self) -> Dict[str, Any]:
@@ -107,6 +108,7 @@ class _BranchEvaluation:
             "adapter_parameter_count": int(self.adapter_parameter_count),
             "trainable_parameter_count": int(self.trainable_parameter_count),
             "support_fingerprint": self.support_fingerprint,
+            "optimizer_schedule_trace": [dict(row) for row in self.optimizer_schedule_trace],
             "elapsed_seconds": float(self.elapsed_seconds),
         }
 
@@ -218,6 +220,16 @@ def _collect_probe_batches(data_loader: Any, max_batches: int) -> List[Sequence[
     return batches
 
 
+def _resolve_module_c_support_batch_limit(
+    formal_batch_limit: int, debug_batch_cap: int
+) -> int:
+    formal_limit = int(formal_batch_limit)
+    if formal_limit <= 0:
+        raise ValueError("Module C requires a positive formal support batch limit.")
+    debug_cap = int(debug_batch_cap)
+    return min(formal_limit, debug_cap) if debug_cap > 0 else formal_limit
+
+
 def _support_fingerprint(batches: Sequence[Sequence[Any]]) -> str:
     digest = hashlib.sha256()
     for index, batch in enumerate(batches):
@@ -226,6 +238,7 @@ def _support_fingerprint(batches: Sequence[Sequence[Any]]) -> str:
         digest.update(str(index).encode("ascii"))
         digest.update(str(tuple(samples.shape)).encode("ascii"))
         digest.update(str(tuple(labels.shape)).encode("ascii"))
+        digest.update(samples.detach().cpu().contiguous().numpy().tobytes())
         digest.update(labels.detach().cpu().contiguous().numpy().tobytes())
     return digest.hexdigest()
 
@@ -283,6 +296,7 @@ def install_module_c_action_registry(
     r: int,
     alpha: float,
     dropout: float,
+    seed: int = 0,
 ) -> ActionOwnership:
     """Install each action separately and audit exact, disjoint LoRA ownership."""
 
@@ -311,6 +325,7 @@ def install_module_c_action_registry(
                 r=int(r),
                 alpha=float(alpha),
                 dropout=float(dropout),
+                module_c_seed=int(seed),
                 verbose=False,
             )
         )
@@ -497,6 +512,9 @@ def _run_support_pass(
     device: torch.device,
     criterion: nn.Module,
     controller: Any = None,
+    lr_schedule_values: Optional[Sequence[float]] = None,
+    wd_schedule_values: Optional[Sequence[float]] = None,
+    optimizer_schedule_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Optional[float], int, int]:
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not trainable:
@@ -522,6 +540,31 @@ def _run_support_pass(
         (loss / float(update_freq)).backward()
         should_step = (batch_index + 1) % update_freq == 0 or batch_index + 1 == len(batches)
         if should_step:
+            if lr_schedule_values is not None:
+                if optimizer_steps >= len(lr_schedule_values):
+                    raise RuntimeError("Module C LR schedule is shorter than the support optimizer-step budget.")
+                lr_value = float(lr_schedule_values[optimizer_steps])
+                for group in optimizer.param_groups:
+                    group["lr"] = lr_value * float(group.get("lr_scale", 1.0))
+            else:
+                lr_value = None
+            if wd_schedule_values is not None:
+                if optimizer_steps >= len(wd_schedule_values):
+                    raise RuntimeError("Module C WD schedule is shorter than the support optimizer-step budget.")
+                wd_value = float(wd_schedule_values[optimizer_steps])
+                for group in optimizer.param_groups:
+                    if float(group.get("weight_decay", 0.0)) > 0.0:
+                        group["weight_decay"] = wd_value
+            else:
+                wd_value = None
+            if optimizer_schedule_trace is not None:
+                optimizer_schedule_trace.append(
+                    {
+                        "optimizer_step": int(optimizer_steps),
+                        "lr_schedule_value": lr_value,
+                        "weight_decay_schedule_value": wd_value,
+                    }
+                )
             prepared = False
             step_applied = False
             try:
@@ -585,6 +628,8 @@ def _anchor_task_head(
     device: torch.device,
     criterion: nn.Module,
     effective_classes: int,
+    lr_schedule_values: Optional[Sequence[float]] = None,
+    wd_schedule_values: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
     initial_losses, _labels, initial_per_class, initial_macro = _validation_losses(
         args, model, validation_batches, device
@@ -598,8 +643,16 @@ def _anchor_task_head(
         named[name].requires_grad_(True)
     anchor_rng = capture_module_c_rng_state()
     restore_module_c_rng_state(anchor_rng)
+    optimizer_schedule_trace: List[Dict[str, Any]] = []
     support_loss, support_examples, optimizer_steps = _run_support_pass(
-        args, model, support_batches, device, criterion
+        args,
+        model,
+        support_batches,
+        device,
+        criterion,
+        lr_schedule_values=lr_schedule_values,
+        wd_schedule_values=wd_schedule_values,
+        optimizer_schedule_trace=optimizer_schedule_trace,
     ) if head_names else (None, 0, 0)
     _final_losses, _labels, final_per_class, final_macro = _validation_losses(
         args, model, validation_batches, device
@@ -617,6 +670,7 @@ def _anchor_task_head(
         "support_passes": 1 if head_names else 0,
         "support_examples": int(support_examples),
         "optimizer_steps": int(optimizer_steps),
+        "optimizer_schedule_trace": optimizer_schedule_trace,
         "support_loss": None if support_loss is None else float(support_loss),
         "validation_loss_before": float(initial_macro),
         "validation_loss_after": float(final_macro),
@@ -746,6 +800,9 @@ def run_module_c_preflight_selection(
     device: torch.device,
     criterion_builder: Optional[Callable[[Any, torch.device], nn.Module]] = None,
     is_main_process: bool = True,
+    num_training_steps_per_epoch: Optional[int] = None,
+    lr_schedule_values: Optional[Sequence[float]] = None,
+    wd_schedule_values: Optional[Sequence[float]] = None,
 ) -> ModuleCPreflightResult:
     """Resolve a nonempty B/D/E subset with matched one-pass branch trials."""
 
@@ -761,9 +818,17 @@ def run_module_c_preflight_selection(
     if data_loader_train is None or data_loader_val is None:
         raise RuntimeError("Module C requires distinct support/train and validation dataloaders.")
 
-    support_batches = _collect_probe_batches(
-        data_loader_train, int(getattr(args, "module_c_preflight_train_batches", 0))
+    if num_training_steps_per_epoch is None:
+        formal_support_batch_limit = len(data_loader_train)
+    else:
+        formal_support_batch_limit = int(num_training_steps_per_epoch) * max(
+            1, int(getattr(args, "update_freq", 1))
+        )
+    support_batch_limit = _resolve_module_c_support_batch_limit(
+        formal_support_batch_limit,
+        int(getattr(args, "module_c_preflight_train_batches", 0)),
     )
+    support_batches = _collect_probe_batches(data_loader_train, support_batch_limit)
     validation_batches = _collect_probe_batches(
         data_loader_val, int(getattr(args, "module_c_preflight_val_batches", 0))
     )
@@ -784,6 +849,8 @@ def run_module_c_preflight_selection(
         device,
         criterion,
         effective_classes,
+        lr_schedule_values=lr_schedule_values,
+        wd_schedule_values=wd_schedule_values,
     )
     anchored_named = dict(model.named_parameters())
     if set(anchored_named) != set(original_trainability):
@@ -802,6 +869,7 @@ def run_module_c_preflight_selection(
         r=int(getattr(args, "lora_rank", 4)),
         alpha=float(getattr(args, "lora_alpha", 8.0)),
         dropout=float(getattr(args, "lora_dropout", 0.0)),
+        seed=int(getattr(args, "seed", 0)),
     )
     initial_state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
     model.to(device)
@@ -835,6 +903,7 @@ def run_module_c_preflight_selection(
         branch_criterion = (
             criterion_builder(branch_args, device) if criterion_builder is not None else _default_criterion(branch_args, device)
         )
+        optimizer_schedule_trace: List[Dict[str, Any]] = []
         support_loss, support_examples, optimizer_steps = _run_support_pass(
             branch_args,
             model,
@@ -842,6 +911,9 @@ def run_module_c_preflight_selection(
             device,
             branch_criterion,
             controller=controller,
+            lr_schedule_values=lr_schedule_values,
+            wd_schedule_values=wd_schedule_values,
+            optimizer_schedule_trace=optimizer_schedule_trace,
         )
         losses, labels, per_class_loss, macro_loss = _validation_losses(
             branch_args, model, validation_batches, device
@@ -873,6 +945,7 @@ def run_module_c_preflight_selection(
             adapter_parameter_count=adapter_count,
             trainable_parameter_count=sum(int(parameter.numel()) for parameter in model.parameters() if parameter.requires_grad),
             support_fingerprint=support_fingerprint,
+            optimizer_schedule_trace=tuple(optimizer_schedule_trace),
             elapsed_seconds=float(time.perf_counter() - branch_started),
         )
         _remove_dynamic_controller(model)
@@ -1024,6 +1097,10 @@ def run_module_c_preflight_selection(
     train_cap = int(getattr(args, "module_c_preflight_train_batches", 0))
     val_cap = int(getattr(args, "module_c_preflight_val_batches", 0))
     total_seconds = float(time.perf_counter() - started)
+    support_visible_examples = sum(int(batch[0].shape[0]) for batch in support_batches)
+    validation_visible_examples = sum(int(batch[0].shape[0]) for batch in validation_batches)
+    support_raw_examples = len(data_loader_train.dataset)
+    validation_raw_examples = len(data_loader_val.dataset)
     payload = {
         "module_c_selection_rule": MODULE_C_PREFLIGHT_SELECTION_RULE,
         "test_used_for_selection": 0,
@@ -1068,10 +1145,10 @@ def run_module_c_preflight_selection(
         "head_anchor": head_anchor,
         "probe_training": {
             "support_passes_per_branch": 1,
-            "budget_unit_reason": "one complete exposure to the selected support split",
+            "budget_unit_reason": "one complete formal-visible support epoch; Ada drop_last=True excludes the raw tail",
             "optimizer": str(getattr(args, "opt", "")),
             "base_learning_rate": float(getattr(args, "lr", 0.0)),
-            "learning_rate_rule": "configured downstream base LR, constant within the one-pass probe",
+            "learning_rate_rule": "formal epoch-0 schedule; constant and plateau modes retain configured optimizer LR",
             "weight_decay": float(getattr(args, "weight_decay", 0.0)),
             "lora_base_update": str(getattr(args, "lora_base_update", "")),
             "full_update_base_control": "same_pre_injection_base_trainability_for_every_branch",
@@ -1079,9 +1156,25 @@ def run_module_c_preflight_selection(
             "lora_alpha": float(getattr(args, "lora_alpha", 0.0)),
             "lora_dropout": float(getattr(args, "lora_dropout", 0.0)),
             "support_batch_cap": train_cap,
+            "support_formal_batch_limit": formal_support_batch_limit,
+            "support_effective_batch_limit": support_batch_limit,
             "validation_batch_cap": val_cap,
-            "support_scope": "full" if train_cap <= 0 else "debug_capped",
-            "validation_scope": "full" if val_cap <= 0 else "debug_capped",
+            "support_scope": "formal_visible" if support_batch_limit >= formal_support_batch_limit else "debug_capped",
+            "validation_scope": "complete" if val_cap <= 0 else "debug_capped",
+            "support_loader": {
+                "sampler_type": type(getattr(data_loader_train, "sampler", None)).__name__,
+                "drop_last": bool(getattr(data_loader_train, "drop_last", False)),
+                "raw_dataset_size": int(support_raw_examples),
+                "visible_example_count": int(support_visible_examples),
+                "coverage_fraction": float(support_visible_examples / support_raw_examples) if support_raw_examples else 0.0,
+            },
+            "validation_loader": {
+                "sampler_type": type(getattr(data_loader_val, "sampler", None)).__name__,
+                "drop_last": bool(getattr(data_loader_val, "drop_last", False)),
+                "raw_dataset_size": int(validation_raw_examples),
+                "visible_example_count": int(validation_visible_examples),
+                "coverage_fraction": float(validation_visible_examples / validation_raw_examples) if validation_raw_examples else 0.0,
+            },
             "formal_state_transfer": 0,
         },
         "action_ownership": {

@@ -62,7 +62,7 @@
 
 - [x] Write failing smoke tests proving the head is trainable before action trials, matched reference/candidate branches see identical support data, direct validation loss replaces `-<g,delta>`, and conditional combinations are evaluated rather than summed. The self-review removed the brittle uniform-loss hard gate and retained it as a diagnostic.
 - [x] Run the smoke tests and confirm old zero-update implementation fails them.
-- [x] Implement one-pass head anchoring, branch snapshot/restore, formal trainability controls, complete support scans, per-example validation losses, and subject metadata grouping.
+- [x] Implement one-pass head anchoring, branch snapshot/restore, formal trainability controls, the complete formal-visible support epoch (`drop_last=True` excludes the raw tail), complete validation (`drop_last=False`), per-example validation losses, and subject metadata grouping.
 - [x] Implement dynamic forward additions and singleton-only alternative-pair rescue using the pure policy; remove backward deletion.
 - [x] Write CSV/JSON diagnostics containing head behavior, branch budgets, per-class effects, confidence evidence, search trace, ownership, and evidence strength.
 - [x] Rerun all Module C tests.

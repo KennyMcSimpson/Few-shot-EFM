@@ -9,13 +9,18 @@ from unittest.mock import patch
 try:
     import torch
     import torch.nn as nn
-    from torch.utils.data import DataLoader, Dataset, TensorDataset
+    from torch.utils.data import DataLoader, Dataset, SequentialSampler, TensorDataset
 except ModuleNotFoundError:  # pragma: no cover - depends on the training env.
     torch = None
     nn = None
 
 if torch is not None:
+    from run_finetuning import (
+        _make_module_c_preflight_loaders,
+        _resolve_module_c_support_batch_limit,
+    )
     from util.module_c_preflight_policy import (
+        _run_support_pass,
         capture_module_c_rng_state,
         restore_module_c_rng_state,
         run_module_c_preflight_selection,
@@ -196,6 +201,111 @@ class ModuleCPreflightSmokeTests(unittest.TestCase):
                 payload["probe_training"]["full_update_base_control"],
                 "same_pre_injection_base_trainability_for_every_branch",
             )
+
+    def test_preflight_loaders_match_formal_optimizer_geometry_and_epoch_zero_schedule(self):
+        support_ids = torch.arange(11, dtype=torch.float32)
+        support_samples = support_ids.view(-1, 1, 1).expand(-1, 4, 5).clone()
+        support_labels = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1])
+        validation_ids = torch.arange(8, dtype=torch.float32) + 100.0
+        validation_samples = validation_ids.view(-1, 1, 1).expand(-1, 4, 5).clone()
+        validation_labels = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1])
+        validation_subjects = ["s0", "s0", "s0", "s1", "s1", "s1", "s2", "s2"]
+        support_dataset = TensorDataset(support_samples, support_labels)
+        validation_dataset = _MetadataDataset(
+            validation_samples, validation_labels, validation_subjects
+        )
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            args = _args(output_dir, classes=3)
+            args.batch_size = 3
+            args.update_freq = 2
+            args.num_workers = 0
+            args.pin_mem = False
+            args.module_c_preflight_train_batches = 99
+            support_loader, validation_loader = _make_module_c_preflight_loaders(
+                args, support_dataset, validation_dataset
+            )
+
+            self.assertIsInstance(support_loader.sampler, SequentialSampler)
+            self.assertTrue(support_loader.drop_last)
+            self.assertEqual(
+                [batch[0][:, 0, 0].tolist() for batch in support_loader],
+                [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0], [6.0, 7.0, 8.0]],
+            )
+            self.assertIsInstance(validation_loader.sampler, SequentialSampler)
+            self.assertFalse(validation_loader.drop_last)
+            self.assertEqual(
+                [value for batch in validation_loader for value in batch[0][:, 0, 0].tolist()],
+                validation_ids.tolist(),
+            )
+            self.assertEqual(_resolve_module_c_support_batch_limit(2, 0), 2)
+            self.assertEqual(_resolve_module_c_support_batch_limit(2, 1), 1)
+            self.assertEqual(_resolve_module_c_support_batch_limit(2, 99), 2)
+
+            seen_support_ids = []
+
+            def recording_support_pass(*call_args, **call_kwargs):
+                batches = call_args[2]
+                seen_support_ids.append(
+                    tuple(
+                        int(value)
+                        for batch in batches
+                        for value in batch[0][:, 0, 0].tolist()
+                    )
+                )
+                return _run_support_pass(*call_args, **call_kwargs)
+
+            with patch(
+                "util.module_c_preflight_policy._run_support_pass",
+                side_effect=recording_support_pass,
+            ):
+                result = run_module_c_preflight_selection(
+                    args=args,
+                    model=_TinyGram(classes=3),
+                    data_loader_train=support_loader,
+                    data_loader_val=validation_loader,
+                    device=torch.device("cpu"),
+                    num_training_steps_per_epoch=1,
+                    lr_schedule_values=[0.0125],
+                    wd_schedule_values=[0.025],
+                )
+
+            self.assertTrue(seen_support_ids)
+            self.assertEqual(set(seen_support_ids), {(0, 1, 2, 3, 4, 5)})
+            expected_trace = [
+                {
+                    "optimizer_step": 0,
+                    "lr_schedule_value": 0.0125,
+                    "weight_decay_schedule_value": 0.025,
+                }
+            ]
+            self.assertEqual(result.head_anchor["optimizer_schedule_trace"], expected_trace)
+            self.assertEqual(
+                {json.dumps(trace["optimizer_schedule_trace"], sort_keys=True)
+                 for trace in result.branch_traces.values()},
+                {json.dumps(expected_trace, sort_keys=True)},
+            )
+            self.assertTrue(
+                all(trace["support_examples"] == 6 for trace in result.branch_traces.values())
+            )
+            self.assertTrue(
+                all(trace["optimizer_steps"] == 1 for trace in result.branch_traces.values())
+            )
+
+            with open(result.decision_json_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            support_scope = payload["probe_training"]["support_loader"]
+            self.assertEqual(support_scope["sampler_type"], "SequentialSampler")
+            self.assertTrue(support_scope["drop_last"])
+            self.assertEqual(support_scope["raw_dataset_size"], 11)
+            self.assertEqual(support_scope["visible_example_count"], 6)
+            self.assertAlmostEqual(support_scope["coverage_fraction"], 6.0 / 11.0)
+            validation_scope = payload["probe_training"]["validation_loader"]
+            self.assertEqual(validation_scope["sampler_type"], "SequentialSampler")
+            self.assertFalse(validation_scope["drop_last"])
+            self.assertEqual(validation_scope["raw_dataset_size"], 8)
+            self.assertEqual(validation_scope["visible_example_count"], 8)
+            self.assertEqual(validation_scope["coverage_fraction"], 1.0)
 
     def test_binary_bce_search_uses_both_labels(self):
         support_loader, validation_loader = self._loaders(classes=2)

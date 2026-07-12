@@ -12,8 +12,8 @@ The current selector freezes a newly initialized task head, derives one AdamW vi
 
 1. Build a disposable model from the same pretrained checkpoint used by formal training.
 2. Audit every candidate action before probing. Every action must own a nonempty, disjoint adapter parameter set. Unowned or multiply owned parameters are fatal errors.
-3. Anchor the real task head for one complete support pass while the pretrained feature extractor is frozen. Record its class-balanced validation cross-entropy before and after anchoring, together with the uniform reference `log(C)`, as diagnostics. These values are not hard selection gates: a short head pass can be weak on a difficult dataset, while all subsequent action branches are still matched from the same anchored state.
-4. At each search state `S`, create one matched reference branch and one branch for every addition `S + a`. Every branch starts from the same state, sees the same complete support pass in the same order, and uses the formal optimizer, learning rate, weight decay, trainability policy, LoRA rank/alpha/dropout, task-head policy, and Module E controller settings. The only intended difference is the candidate action.
+3. Anchor the real task head for one complete formal-visible support epoch while the pretrained feature extractor is frozen. Support uses `SequentialSampler` with `drop_last=True`, so Ada excludes the raw tail exactly as formal training does. Record class-balanced validation cross-entropy before and after anchoring, together with the uniform reference `log(C)`, as diagnostics. These values are not hard selection gates: a short head pass can be weak on a difficult dataset, while all subsequent action branches are still matched from the same anchored state.
+4. At each search state `S`, create one matched reference branch and one branch for every addition `S + a`. Every branch starts from the same state, sees the same complete formal-visible support epoch in the same order, and uses the formal optimizer, epoch-0 learning-rate and weight-decay schedules, trainability policy, LoRA rank/alpha/dropout, task-head policy, and Module E controller settings. Validation uses `SequentialSampler` with `drop_last=False` and remains complete. The only intended difference is the candidate action.
 5. Compute paired per-example validation cross-entropy improvement between the matched reference and candidate branches. Aggregate windows within `(subject, class)`, average subjects within each class, then average classes. This produces a common action utility without giving any action a mechanism-specific bonus.
 6. Estimate uncertainty with delete-one-subject cluster jackknife pseudo-values. Use one-sided `alpha=0.05` tests and Holm correction within each search stage. Window-level independence must never be claimed. Because sequential stages reuse the same validation split, these p-values are stability screens rather than confirmatory post-selection inference.
 7. A supported addition has Holm-adjusted positive evidence for class-balanced gain and no Holm-adjusted evidence of harm for any observed class. Choose the largest point gain among supported actions, then the largest worst-class gain; adapter parameter count breaks only an exact evidence tie.
@@ -45,8 +45,8 @@ The selector uses only a common downstream risk measure for ranking. Module B si
 
 ## Fixed Design Choices
 
-- One support epoch per matched trial is the minimum complete data-exposure unit.
-- The head anchor receives exactly one complete support pass; its validation behavior is reported rather than thresholded.
+- One complete formal-visible support epoch per matched trial is the minimum matched data-exposure unit; Ada `drop_last=True` excludes the raw tail.
+- The head anchor receives exactly one complete formal-visible support epoch; complete validation uses `drop_last=False`, and its behavior is reported rather than thresholded.
 - `alpha=0.05` is fixed statistical error control.
 - Three subject clusters are the minimum for reported jackknife evidence, giving at least two t-reference degrees of freedom; classes represented by fewer than two subjects cannot support a class-harm test.
 - Interaction order two is the lowest order that represents synergy or conflict.

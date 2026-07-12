@@ -5,6 +5,7 @@
 # modifying the original model source files.
 # --------------------------------------------------------
 
+import hashlib
 import math
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -790,6 +791,7 @@ def apply_lora_to_eegfm(
     alpha: float = 8.0,
     dropout: float = 0.1,
     verbose: bool = True,
+    module_c_seed: int = 0,
 ) -> List[str]:
     """
     Inject LoRA into AdaBrain-Bench EEGFM wrappers.
@@ -813,30 +815,61 @@ def apply_lora_to_eegfm(
       - all_linear: broader ablation; not recommended as first run.
     """
     model_name = model_name.lower()
-    plan = _lora_target_plan(
-        lora_target,
-        module_c_selected=module_c_selected,
-        module_b_sites=module_b_sites,
+    is_module_c = _is_module_c_execution_target(lora_target)
+    cpu_rng_state = torch.get_rng_state().clone() if is_module_c else None
+    cuda_was_initialized = bool(is_module_c and torch.cuda.is_initialized())
+    cuda_rng_state = (
+        [state.clone() for state in torch.cuda.get_rng_state_all()]
+        if cuda_was_initialized
+        else None
     )
-    max_layer_idx = _max_layer_index(model)
-    handler = LORA_MODEL_MODULE_HANDLERS.get(model_name)
+    try:
+        plan = _lora_target_plan(
+            lora_target,
+            module_c_selected=module_c_selected,
+            module_b_sites=module_b_sites,
+        )
+        max_layer_idx = _max_layer_index(model)
+        handler = LORA_MODEL_MODULE_HANDLERS.get(model_name)
 
-    replaced: List[str] = []
+        replaced: List[str] = []
 
-    if plan.use_input_side:
-        replaced.extend(_install_input_side_lora(model, r=r, alpha=alpha, dropout=dropout))
+        if plan.use_input_side:
+            replaced.extend(_install_input_side_lora(model, r=r, alpha=alpha, dropout=dropout))
 
-    # Use a snapshot because we will replace modules during iteration.
-    for name, module in list(model.named_modules()):
-        if name == "":
-            continue
+        # Use a snapshot because we will replace modules during iteration.
+        for name, module in list(model.named_modules()):
+            if name == "":
+                continue
 
-        current_module = _get_module_by_name(model, name)
-        if current_module is not module:
-            continue
+            current_module = _get_module_by_name(model, name)
+            if current_module is not module:
+                continue
 
-        if handler is not None:
-            handler(model, name, module, plan, lora_target, max_layer_idx, r, alpha, dropout, replaced)
+            if handler is not None:
+                handler(model, name, module, plan, lora_target, max_layer_idx, r, alpha, dropout, replaced)
+
+        if is_module_c:
+            with torch.no_grad():
+                for full_name, parameter in model.named_parameters():
+                    name_parts = full_name.split(".")
+                    if "lora_A" in name_parts:
+                        seed_material = f"{int(module_c_seed)}\0{full_name}".encode("utf-8")
+                        stable_seed = int.from_bytes(
+                            hashlib.sha256(seed_material).digest()[:8], "big", signed=False
+                        )
+                        generator = torch.Generator(device=parameter.device)
+                        generator.manual_seed(stable_seed)
+                        nn.init.kaiming_uniform_(
+                            parameter, a=math.sqrt(5), generator=generator
+                        )
+                    elif "lora_B" in name_parts:
+                        nn.init.zeros_(parameter)
+    finally:
+        if is_module_c:
+            torch.set_rng_state(cpu_rng_state)
+            if cuda_was_initialized:
+                torch.cuda.set_rng_state_all(cuda_rng_state)
 
     if verbose:
         print(f"[LoRA] model={model_name}, target={lora_target}, r={r}, alpha={alpha}, dropout={dropout}")

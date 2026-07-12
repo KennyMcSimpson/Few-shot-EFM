@@ -1,3 +1,4 @@
+import hashlib
 import unittest
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ except ModuleNotFoundError:  # pragma: no cover - depends on the training env.
 
 if torch is not None:
     from run_finetuning import _apply_lora_training_setup
+    from util.lora import apply_lora_to_eegfm
     from util.module_c_preflight_policy import (
         _configure_branch_trainability,
         install_module_c_action_registry,
@@ -118,6 +120,16 @@ if torch is not None:
 
 @unittest.skipIf(torch is None, "torch is not installed in this Python environment")
 class ModuleCLoraInterfaceTests(unittest.TestCase):
+    @staticmethod
+    def _adapter_hashes(model):
+        return {
+            name: hashlib.sha256(
+                parameter.detach().cpu().contiguous().numpy().tobytes()
+            ).hexdigest()
+            for name, parameter in model.named_parameters()
+            if "lora_A" in name or "lora_B" in name
+        }
+
     def _audit(self, model, model_name):
         ownership = install_module_c_action_registry(
             model=model,
@@ -216,6 +228,87 @@ class ModuleCLoraInterfaceTests(unittest.TestCase):
 
     def test_csbrain_actions_are_nonempty_and_disjoint(self):
         self._audit(_TinyDualAttention(csbrain=True), "CSBrain")
+
+    def test_union_and_selected_only_module_c_adapters_have_identical_hashes(self):
+        fixtures = (
+            ("BIOT", _TinyBIOT),
+            ("EEGPT", _TinyMergedTransformer),
+            ("CBraMod", lambda: _TinyDualAttention(csbrain=False)),
+            ("Gram", _TinyGram),
+        )
+        for model_name, factory in fixtures:
+            with self.subTest(model_name=model_name):
+                union_model = factory()
+                install_module_c_action_registry(
+                    model=union_model,
+                    model_name=model_name,
+                    candidate_modules=("B", "D", "E"),
+                    module_b_sites="both",
+                    r=2,
+                    alpha=4.0,
+                    dropout=0.0,
+                    seed=37,
+                )
+                selected_model = factory()
+                apply_lora_to_eegfm(
+                    model=selected_model,
+                    model_name=model_name,
+                    lora_target="module_c",
+                    module_c_selected=("E",),
+                    module_b_sites="both",
+                    r=2,
+                    alpha=4.0,
+                    dropout=0.0,
+                    module_c_seed=37,
+                    verbose=False,
+                )
+
+                union_hashes = self._adapter_hashes(union_model)
+                selected_hashes = self._adapter_hashes(selected_model)
+                self.assertTrue(selected_hashes)
+                self.assertEqual(
+                    {name: union_hashes[name] for name in selected_hashes},
+                    selected_hashes,
+                )
+                self.assertTrue(
+                    all(
+                        torch.count_nonzero(dict(selected_model.named_parameters())[name]) == 0
+                        for name in selected_hashes
+                        if "lora_B" in name
+                    )
+                )
+
+    def test_module_c_injection_preserves_cpu_and_initialized_cuda_rng(self):
+        model = _TinyBIOT()
+        torch.manual_seed(1234)
+        cpu_before = torch.get_rng_state().clone()
+        cuda_before = None
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(1234)
+            cuda_before = [state.clone() for state in torch.cuda.get_rng_state_all()]
+
+        apply_lora_to_eegfm(
+            model=model,
+            model_name="BIOT",
+            lora_target="module_c",
+            module_c_selected=("E",),
+            module_b_sites="both",
+            r=2,
+            alpha=4.0,
+            dropout=0.0,
+            module_c_seed=9,
+            verbose=False,
+        )
+
+        self.assertTrue(torch.equal(torch.get_rng_state(), cpu_before))
+        if cuda_before is not None:
+            self.assertEqual(len(torch.cuda.get_rng_state_all()), len(cuda_before))
+            self.assertTrue(
+                all(
+                    torch.equal(after, before)
+                    for after, before in zip(torch.cuda.get_rng_state_all(), cuda_before)
+                )
+            )
 
 
 if __name__ == "__main__":
