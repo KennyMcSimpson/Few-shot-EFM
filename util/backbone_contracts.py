@@ -11,6 +11,7 @@ import fnmatch
 import hashlib
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, Tuple
 
 import torch.nn as nn
@@ -239,3 +240,25 @@ def backbone_bd_contract_hash(model_name: str) -> str:
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def save_backbone_bd_contract_audit(args, model: nn.Module):
+    """Persist the B/D contract and the sites realized by the common injector."""
+    payload = getattr(model, "_backbone_bd_contract_audit", None)
+    if not isinstance(payload, dict):
+        return None
+
+    output_dir = str(getattr(args, "output_dir", "") or "").strip()
+    if not output_dir:
+        raise BackboneContractError("B/D contract audit requires args.output_dir.")
+
+    diagnostics_dir = Path(output_dir) / "diagnostics"
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    path = diagnostics_dir / "backbone_bd_contract.json"
+    temporary_path = diagnostics_dir / "backbone_bd_contract.json.tmp"
+    temporary_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    temporary_path.replace(path)
+    return str(path)

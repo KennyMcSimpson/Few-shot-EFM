@@ -9,9 +9,28 @@ from unittest.mock import patch
 
 import engine_for_finetuning
 import run_finetuning
+import torch
+from util.lora import (
+    validate_full_lora_base_trainability,
+    validate_optimizer_parameter_coverage,
+)
 
 
 class GenericTrainingDefaultsTests(unittest.TestCase):
+    def test_lora_base_update_has_no_silent_default(self):
+        with patch.object(sys, "argv", ["run_finetuning.py"]):
+            args, _ = run_finetuning.get_args()
+        self.assertIsNone(args.lora_base_update)
+
+    def test_lora_setup_requires_explicit_base_update_mode(self):
+        args = SimpleNamespace(
+            task_mod="Classification",
+            model_name="BIOT",
+            lora_base_update=None,
+        )
+        with self.assertRaisesRegex(ValueError, "explicit.*lora_base_update"):
+            run_finetuning._apply_lora_training_setup(torch.nn.Linear(2, 1), args)
+
     def test_cudnn_autotuner_is_disabled_for_variable_eeg_shapes(self):
         backend = SimpleNamespace(benchmark=True)
         with patch.object(run_finetuning, "cudnn", backend):
@@ -67,6 +86,48 @@ class GenericTrainingDefaultsTests(unittest.TestCase):
         self.assertIn("val_selection_bacc_min02_std", reader.fieldnames)
         self.assertEqual(rows[0]["val_selection_bacc_worst_std"], "0.61")
         self.assertEqual(rows[0]["val_selection_bacc_min02_std"], "0.58")
+
+
+class FullFTLoRAContractTests(unittest.TestCase):
+    def test_full_lora_trainability_accepts_exact_restoration(self):
+        model = torch.nn.Linear(2, 1)
+        model.bias.requires_grad_(False)
+        before = {id(parameter): parameter.requires_grad for parameter in model.parameters()}
+        self.assertIsNone(validate_full_lora_base_trainability(model, before))
+
+    def test_full_lora_trainability_rejects_changed_or_missing_base_parameters(self):
+        model = torch.nn.Linear(2, 1)
+        before = {id(parameter): parameter.requires_grad for parameter in model.parameters()}
+        model.weight.requires_grad_(False)
+        with self.assertRaisesRegex(RuntimeError, "trainability changed"):
+            validate_full_lora_base_trainability(model, before)
+
+        model = torch.nn.Linear(2, 1)
+        before = {id(parameter): parameter.requires_grad for parameter in model.parameters()}
+        model.weight = torch.nn.Parameter(torch.zeros_like(model.weight))
+        with self.assertRaisesRegex(RuntimeError, "parameter objects disappeared"):
+            validate_full_lora_base_trainability(model, before)
+
+    def test_optimizer_coverage_accepts_each_trainable_parameter_once(self):
+        model = torch.nn.Linear(2, 1)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        self.assertIsNone(validate_optimizer_parameter_coverage(model, optimizer))
+
+    def test_optimizer_coverage_rejects_missing_duplicate_and_frozen_parameters(self):
+        model = torch.nn.Linear(2, 1)
+        missing = torch.optim.SGD([model.weight], lr=0.1)
+        with self.assertRaisesRegex(RuntimeError, "missing trainable parameters.*bias"):
+            validate_optimizer_parameter_coverage(model, missing)
+
+        duplicate = torch.optim.SGD(model.parameters(), lr=0.1)
+        duplicate.param_groups.append({**duplicate.param_groups[0], "params": [model.weight]})
+        with self.assertRaisesRegex(RuntimeError, "duplicate parameters.*weight"):
+            validate_optimizer_parameter_coverage(model, duplicate)
+
+        model.bias.requires_grad_(False)
+        includes_frozen = torch.optim.SGD(model.parameters(), lr=0.1)
+        with self.assertRaisesRegex(RuntimeError, "frozen parameters.*bias"):
+            validate_optimizer_parameter_coverage(model, includes_frozen)
 
 
 class NonFiniteLossSafetyTests(unittest.TestCase):

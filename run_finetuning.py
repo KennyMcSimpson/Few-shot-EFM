@@ -33,6 +33,7 @@ from util.utils import NativeScalerWithGradNormCount as NativeScaler
 import util.utils as utils
 from util.eegdatasets import EEGDataset
 from util.dataset_config import load_task_dataset_info
+from util.backbone_contracts import save_backbone_bd_contract_audit
 from util.lora import (
     freeze_all_parameters,
     unfreeze_module,
@@ -40,6 +41,8 @@ from util.lora import (
     mark_lora_and_selected_modules_trainable,
     print_trainable_parameters,
     set_lora_runtime_scale,
+    validate_full_lora_base_trainability,
+    validate_optimizer_parameter_coverage,
 )
 from engine_for_finetuning import (
     train_one_epoch,
@@ -334,12 +337,12 @@ def get_args(argv=None):
                             'both = raw-input residual plus 1x1 channel-bridge LoRA (default); '
                             'input = raw-input residual only; bridge = existing channel-bridge LoRA only.'
                         ))
-    parser.add_argument('--lora_base_update', default='freeze', type=str, choices=['freeze', 'full'],
+    parser.add_argument('--lora_base_update', default=None, type=str, choices=['freeze', 'full'],
                         help=(
                             'How to handle original backbone parameters when LoRA is injected. '
                             'freeze = standard Frozen-LoRA: freeze original W and train LoRA/head only. '
                             'full = Full FT + LoRA: keep original W trainable and also train LoRA. '
-                            'Use this to separate the freeze variable from the LoRA variable.'
+                            'LoRA runs must choose this explicitly so the freeze variable cannot change silently.'
                         ))
     parser.add_argument('--lora_rank', default=4, type=int,
                         help='LoRA rank r.')
@@ -1223,6 +1226,7 @@ def _create_formal_optimizer(args, model, skip_weight_decay_list, assigner=None,
         )
         if controller is not None:
             controller.bind_optimizer(optimizer)
+        validate_optimizer_parameter_coverage(model, optimizer)
         return optimizer
     except Exception as exc:
         if controller is not None:
@@ -1235,6 +1239,11 @@ def _apply_lora_training_setup(model, args):
         raise ValueError('LoRA mode is currently implemented for Classification/Regression, not Retrieval.')
     if args.model_name not in ['LaBraM', 'CBraMod', 'EEGPT', 'BIOT', 'CSBrain', 'Gram']:
         raise ValueError(f'LoRA mode currently supports EEGFMs only, got {args.model_name}.')
+    if getattr(args, 'lora_base_update', None) not in ('freeze', 'full'):
+        raise ValueError(
+            'LoRA runs require an explicit --lora_base_update full or '
+            '--lora_base_update freeze.'
+        )
 
     # Important experimental control:
     #   lora_base_update=freeze -> standard Frozen-LoRA. Original W is frozen; LoRA/head are trainable.
@@ -1271,6 +1280,7 @@ def _apply_lora_training_setup(model, args):
             if args.lora_train_chan_conv and hasattr(model, 'chan_conv'):
                 unfreeze_module(model.chan_conv)
         elif args.lora_base_update == 'full':
+            validate_full_lora_base_trainability(model, pre_lora_trainability)
             if not args.lora_train_head and hasattr(model, 'task_head'):
                 for p in model.task_head.parameters():
                     p.requires_grad = False
@@ -1314,6 +1324,7 @@ def _apply_lora_training_setup(model, args):
                 if restore and not (parameter.is_floating_point() or parameter.is_complex()):
                     raise RuntimeError('A non-differentiable pre-LoRA parameter was unexpectedly trainable.')
                 parameter.requires_grad_(restore)
+            validate_full_lora_base_trainability(model, pre_lora_trainability)
             if not args.lora_train_head and hasattr(model, 'task_head'):
                 for p in model.task_head.parameters():
                     p.requires_grad = False
@@ -3554,6 +3565,7 @@ def main(args, ds_init):
     print("Model = %s" % str(model_without_ddp))
     print('number of params:', n_parameters)
     save_block_registry(args, model_without_ddp)
+    save_backbone_bd_contract_audit(args, model_without_ddp)
     save_module_e_coverage_audit(args, model_without_ddp)
     save_module_e_lora_injection_audit(args, model_without_ddp)
 

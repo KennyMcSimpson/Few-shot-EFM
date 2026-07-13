@@ -1,4 +1,8 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
 import torch.nn as nn
 
@@ -9,6 +13,7 @@ from util.backbone_contracts import (
     get_backbone_bd_contract,
     resolve_backbone_bd_sites,
     resolve_canonical_head,
+    save_backbone_bd_contract_audit,
 )
 from util.lora import apply_lora_to_eegfm
 
@@ -240,6 +245,33 @@ class BackboneContractTests(unittest.TestCase):
                 "main_model.model.blocks.0.mlp.fc2",
             ),
         )
+
+    def test_injection_audit_records_contract_and_realized_d_sites(self):
+        model = _biot()
+        apply_lora_to_eegfm(
+            model,
+            "BIOT",
+            lora_target="semantic",
+            r=2,
+            alpha=4.0,
+            dropout=0.0,
+            verbose=False,
+        )
+        with tempfile.TemporaryDirectory() as output_dir:
+            path = save_backbone_bd_contract_audit(
+                SimpleNamespace(output_dir=output_dir),
+                model,
+            )
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["model_name"], "BIOT")
+        self.assertEqual(payload["contract_hash"], backbone_bd_contract_hash("BIOT"))
+        self.assertEqual(payload["resolved_bridge_sites"], [])
+        self.assertEqual(
+            payload["resolved_semantic_ffn_sites"],
+            ["main_model.layers.0.w1", "main_model.layers.0.w2"],
+        )
+        self.assertEqual(payload["injected_d_sites"], payload["resolved_semantic_ffn_sites"])
 
 
 if __name__ == "__main__":

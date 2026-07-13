@@ -8,13 +8,17 @@
 import hashlib
 import math
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .backbone_contracts import resolve_backbone_bd_sites
+from .backbone_contracts import (
+    backbone_bd_contract_hash,
+    get_backbone_bd_contract,
+    resolve_backbone_bd_sites,
+)
 from .module_b_signal_alignment import (
     LoRAConv1d1x1,
     install_input_side_lora,
@@ -794,6 +798,26 @@ def apply_lora_to_eegfm(
             if handler is not None:
                 handler(model, name, module, plan, lora_target, max_layer_idx, r, alpha, dropout, replaced)
 
+        contract = get_backbone_bd_contract(model_name)
+        injected_b_sites = sorted(
+            ({"input_side_lora"} if plan.use_input_side and "input_side_lora" in replaced else set())
+            | (bridge_paths & set(replaced))
+        )
+        injected_d_sites = sorted(semantic_paths & set(replaced))
+        model._backbone_bd_contract_audit = {
+            "schema_version": 1,
+            "model_name": contract.model_name,
+            "contract_hash": backbone_bd_contract_hash(model_name),
+            "raw_input_site": bool(contract.raw_input_site),
+            "requested_input_side": bool(plan.use_input_side),
+            "requested_bridge": bool(plan.use_bridge),
+            "requested_semantic_ffn": bool(plan.use_ffn),
+            "resolved_bridge_sites": sorted(bridge_paths),
+            "resolved_semantic_ffn_sites": sorted(semantic_paths),
+            "injected_b_sites": injected_b_sites,
+            "injected_d_sites": injected_d_sites,
+        }
+
         if is_module_c:
             with torch.no_grad():
                 for full_name, parameter in model.named_parameters():
@@ -881,6 +905,91 @@ def count_trainable_parameters(model: nn.Module) -> Dict[str, int]:
         "trainable": trainable,
         "frozen": total - trainable,
     }
+
+
+def validate_full_lora_base_trainability(
+    model: nn.Module,
+    pre_lora_trainability: Mapping[int, bool],
+) -> None:
+    """Verify that Full FT + LoRA preserved every original parameter object/state."""
+    current = {
+        id(parameter): (name, parameter)
+        for name, parameter in model.named_parameters()
+    }
+    missing_ids = sorted(set(pre_lora_trainability) - set(current))
+    if missing_ids:
+        raise RuntimeError(
+            "Full FT + LoRA base parameter objects disappeared during injection: "
+            f"count={len(missing_ids)}."
+        )
+
+    changed = [
+        name
+        for parameter_id, (name, parameter) in current.items()
+        if parameter_id in pre_lora_trainability
+        and bool(parameter.requires_grad) != bool(pre_lora_trainability[parameter_id])
+    ]
+    if changed:
+        raise RuntimeError(
+            "Full FT + LoRA base trainability changed during injection: "
+            + ", ".join(sorted(changed))
+        )
+
+
+def validate_optimizer_parameter_coverage(model: nn.Module, optimizer) -> None:
+    """Require exact, once-only optimizer coverage of all trainable parameters."""
+    named_parameters = dict(model.named_parameters())
+    name_by_id = {id(parameter): name for name, parameter in named_parameters.items()}
+    parameter_by_id = {id(parameter): parameter for parameter in named_parameters.values()}
+
+    counts: Dict[int, int] = {}
+    for group in optimizer.param_groups:
+        for parameter in group.get("params", ()):
+            parameter_id = id(parameter)
+            counts[parameter_id] = counts.get(parameter_id, 0) + 1
+
+    trainable_ids = {
+        parameter_id
+        for parameter_id, parameter in parameter_by_id.items()
+        if parameter.requires_grad
+    }
+    optimizer_ids = set(counts)
+
+    missing = sorted(name_by_id[parameter_id] for parameter_id in trainable_ids - optimizer_ids)
+    if missing:
+        raise RuntimeError(
+            "Optimizer is missing trainable parameters: " + ", ".join(missing)
+        )
+
+    duplicate = sorted(
+        name_by_id.get(parameter_id, f"<unregistered:{parameter_id}>")
+        for parameter_id, count in counts.items()
+        if count != 1
+    )
+    if duplicate:
+        raise RuntimeError(
+            "Optimizer contains duplicate parameters: " + ", ".join(duplicate)
+        )
+
+    frozen = sorted(
+        name_by_id[parameter_id]
+        for parameter_id in optimizer_ids & set(parameter_by_id)
+        if not parameter_by_id[parameter_id].requires_grad
+    )
+    if frozen:
+        raise RuntimeError(
+            "Optimizer contains frozen parameters: " + ", ".join(frozen)
+        )
+
+    unregistered = sorted(
+        f"<unregistered:{parameter_id}>"
+        for parameter_id in optimizer_ids - set(parameter_by_id)
+    )
+    if unregistered:
+        raise RuntimeError(
+            "Optimizer contains parameters not owned by the model: "
+            + ", ".join(unregistered)
+        )
 
 
 def print_trainable_parameters(model: nn.Module, max_lines: int = 120) -> None:
