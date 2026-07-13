@@ -48,7 +48,8 @@ if torch is not None:
             super().__init__()
             self.input_channels = 4
             self.main_model = nn.Module()
-            self.main_model.blocks = nn.ModuleList([_Block()])
+            self.main_model.model = nn.Module()
+            self.main_model.model.blocks = nn.ModuleList([_Block()])
             self.task_head = nn.Linear(4, 3)
 
 
@@ -89,9 +90,11 @@ if torch is not None:
 
 
     class _TinyMergedTransformer(nn.Module):
-        def __init__(self):
+        def __init__(self, with_bridge=False):
             super().__init__()
             self.input_channels = 4
+            if with_bridge:
+                self.chan_conv = nn.Conv1d(4, 4, kernel_size=1)
             self.main_model = nn.Module()
             self.main_model.blocks = nn.ModuleList([_MergedBlock()])
             self.task_head = nn.Linear(4, 3)
@@ -222,7 +225,7 @@ class ModuleCLoraInterfaceTests(unittest.TestCase):
     def test_eegpt_and_labram_actions_are_nonempty_and_disjoint(self):
         for model_name in ("EEGPT", "LaBraM"):
             with self.subTest(model_name=model_name):
-                self._audit(_TinyMergedTransformer(), model_name)
+                self._audit(_TinyMergedTransformer(with_bridge=model_name == "EEGPT"), model_name)
 
     def test_cbramod_actions_are_nonempty_and_disjoint(self):
         self._audit(_TinyDualAttention(csbrain=False), "CBraMod")
@@ -233,7 +236,7 @@ class ModuleCLoraInterfaceTests(unittest.TestCase):
     def test_union_and_every_nonempty_selected_subset_have_identical_hashes(self):
         fixtures = (
             ("BIOT", _TinyBIOT),
-            ("EEGPT", _TinyMergedTransformer),
+            ("EEGPT", lambda: _TinyMergedTransformer(with_bridge=True)),
             ("CBraMod", lambda: _TinyDualAttention(csbrain=False)),
             ("Gram", _TinyGram),
         )

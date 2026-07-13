@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .backbone_contracts import resolve_backbone_bd_sites
 from .module_b_signal_alignment import (
     LoRAConv1d1x1,
     install_input_side_lora,
@@ -25,7 +26,6 @@ from .module_c_lora_search import parse_module_ids
 from .module_d_semantic_refinement import (
     layer_selected_for_semantic,
     max_semantic_layer_index,
-    should_include_csbrain_spectral_proj,
     should_lora_semantic_ffn,
 )
 from .module_e_structural_routing import (
@@ -480,12 +480,6 @@ def _layer_selected_for_ffn(module_name: str, lora_target: str, max_idx: Optiona
     return layer_selected_for_semantic(module_name, target, max_idx)
 
 
-def _csbrain_spectral_selection_target(plan: LoraTargetPlan) -> str:
-    if _is_module_c_execution_target(plan.target_lower) and plan.use_ffn:
-        return "semantic"
-    return plan.target_lower
-
-
 def _should_lora_input_side(
     lora_target: str,
     module_c_selected: Optional[str | Iterable[str]] = None,
@@ -543,25 +537,16 @@ def _apply_lora_to_biot_module(
     replaced: List[str],
 ) -> None:
     lower = name.lower()
-    if plan.use_bridge and name == "chan_conv" and isinstance(module, nn.Conv1d):
-        _record_replacement(model, name, LoRAConv1d1x1(module, r=r, alpha=alpha, dropout=dropout), replaced)
-    elif isinstance(module, nn.Linear):
+    if isinstance(module, nn.Linear):
         should_replace = False
-        is_attention_projection = False
         if lower.endswith("to_q") and "q" in plan.enabled_parts:
             should_replace = True
-            is_attention_projection = True
         elif lower.endswith("to_k") and "k" in plan.enabled_parts:
             should_replace = True
-            is_attention_projection = True
         elif lower.endswith("to_v") and "v" in plan.enabled_parts:
             should_replace = True
-            is_attention_projection = True
         elif lower.endswith("to_out") and "o" in plan.enabled_parts:
             should_replace = True
-            is_attention_projection = True
-        elif plan.use_ffn and (lower.endswith("w1") or lower.endswith("w2")):
-            should_replace = _layer_selected_for_ffn(name, lora_target, max_layer_idx)
         elif plan.use_all_linear and lower.startswith("main_model."):
             should_replace = True
 
@@ -596,9 +581,7 @@ def _apply_lora_to_cbramod_module(
             )
     elif isinstance(module, nn.Linear):
         should_replace = False
-        if plan.use_ffn and (lower.endswith("linear1") or lower.endswith("linear2")):
-            should_replace = _layer_selected_for_ffn(name, lora_target, max_layer_idx)
-        elif plan.use_all_linear and lower.startswith("main_model."):
+        if plan.use_all_linear and lower.startswith("main_model."):
             should_replace = True
         if should_replace:
             _replace_with_lora_linear(model, name, module, r, alpha, dropout, replaced)
@@ -617,18 +600,14 @@ def _apply_lora_to_eegpt_labram_module(
     replaced: List[str],
 ) -> None:
     lower = name.lower()
-    if plan.use_bridge and name == "chan_conv" and isinstance(module, nn.Conv1d):
-        _record_replacement(model, name, LoRAConv1d1x1(module, r=r, alpha=alpha, dropout=dropout), replaced)
-    elif isinstance(module, nn.Linear):
+    if isinstance(module, nn.Linear):
         should_replace = False
         new_module = None
-        is_attention_projection = False
 
         if lower.endswith("attn.qkv"):
             qkv_parts = [p for p in plan.enabled_parts if p in ("q", "k", "v")]
             if qkv_parts:
                 should_replace = True
-                is_attention_projection = True
                 new_module = LoRAMergedQKVLinear(
                     module,
                     r=r,
@@ -638,12 +617,7 @@ def _apply_lora_to_eegpt_labram_module(
                 )
         elif lower.endswith("attn.proj") and "o" in plan.enabled_parts:
             should_replace = True
-            is_attention_projection = True
             new_module = LoRALinear(module, r=r, alpha=alpha, dropout=dropout)
-        elif plan.use_ffn and (lower.endswith("mlp.fc1") or lower.endswith("mlp.fc2")):
-            should_replace = _layer_selected_for_ffn(name, lora_target, max_layer_idx)
-            if should_replace:
-                new_module = LoRALinear(module, r=r, alpha=alpha, dropout=dropout)
         elif plan.use_all_linear and lower.startswith("main_model."):
             should_replace = True
             new_module = LoRALinear(module, r=r, alpha=alpha, dropout=dropout)
@@ -679,17 +653,7 @@ def _apply_lora_to_csbrain_module(
             )
     elif isinstance(module, nn.Linear):
         should_replace = False
-        if plan.use_ffn and (
-            lower.endswith("linear1")
-            or lower.endswith("linear2")
-            or lower.endswith("global_fc")
-            or (
-                "spectral_proj" in lower
-                and should_include_csbrain_spectral_proj(_csbrain_spectral_selection_target(plan))
-            )
-        ):
-            should_replace = _layer_selected_for_ffn(name, lora_target, max_layer_idx)
-        elif plan.use_all_linear and lower.startswith("main_model."):
+        if plan.use_all_linear and lower.startswith("main_model."):
             should_replace = True
         if should_replace:
             _replace_with_lora_linear(model, name, module, r, alpha, dropout, replaced)
@@ -723,8 +687,6 @@ def _apply_lora_to_gram_module(
             ))
             is_layer_fusion = ("proj_layers" in lower)
             should_replace = is_attn_linear or is_layer_fusion
-        if not should_replace and plan.use_ffn and any(k in lower for k in ("mlp", "ffn", "fc", "linear")):
-            should_replace = _layer_selected_for_ffn(name, lora_target, max_layer_idx)
         if not should_replace and plan.use_all_linear and lower.startswith("main_model."):
             should_replace = True
 
@@ -764,7 +726,7 @@ def apply_lora_to_eegfm(
       - EEGPT: merged attn.qkv Linear and attn.proj Linear.
       - LaBraM: merged attn.qkv Linear and attn.proj Linear.
       - CSBrain: inter-window/inter-region MultiheadAttention and FFN Linear layers.
-      - Gram: generic Linear LoRA on classifier/encoder paths; restoration/codebook paths are skipped.
+      - Gram: explicit encoder-MLP B/D sites plus existing structural Linear routing.
 
     lora_target:
       - qv: first-round recommended baseline. Q/V only.
@@ -795,6 +757,15 @@ def apply_lora_to_eegfm(
 
         replaced: List[str] = []
 
+        bridge_paths = {
+            site.module_path
+            for site in resolve_backbone_bd_sites(model, model_name, "B")
+        } if plan.use_bridge else set()
+        semantic_paths = {
+            site.module_path
+            for site in resolve_backbone_bd_sites(model, model_name, "D")
+        } if plan.use_ffn else set()
+
         if plan.use_input_side:
             replaced.extend(_install_input_side_lora(model, r=r, alpha=alpha, dropout=dropout))
 
@@ -805,6 +776,19 @@ def apply_lora_to_eegfm(
 
             current_module = _get_module_by_name(model, name)
             if current_module is not module:
+                continue
+
+            if name in bridge_paths:
+                _record_replacement(
+                    model,
+                    name,
+                    LoRAConv1d1x1(module, r=r, alpha=alpha, dropout=dropout),
+                    replaced,
+                )
+                continue
+
+            if name in semantic_paths and _layer_selected_for_ffn(name, lora_target, max_layer_idx):
+                _replace_with_lora_linear(model, name, module, r, alpha, dropout, replaced)
                 continue
 
             if handler is not None:

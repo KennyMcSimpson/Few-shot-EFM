@@ -10,6 +10,7 @@ from util.backbone_contracts import (
     resolve_backbone_bd_sites,
     resolve_canonical_head,
 )
+from util.lora import apply_lora_to_eegfm
 
 
 class _MLP(nn.Module):
@@ -82,6 +83,7 @@ def _gram():
     model.main_model.model = _Container()
     model.main_model.model.blocks = nn.ModuleList([_TransformerBlock()])
     model.main_model.model.proj_layers = nn.ModuleList([nn.Linear(4, 4)])
+    model.main_model.model.linear_projection = nn.Linear(4, 4)
     model.main_model.model.cls_head = nn.Linear(4, 3)
     model.main_model.model.decoder = nn.Linear(4, 4)
     return model
@@ -139,6 +141,7 @@ class BackboneContractTests(unittest.TestCase):
         gram_d = {site.module_path for site in resolve_backbone_bd_sites(gram, "Gram", "D")}
         self.assertNotIn("main_model.blocks.0.global_fc", csbrain_d)
         self.assertNotIn("main_model.model.proj_layers.0", gram_d)
+        self.assertNotIn("main_model.model.linear_projection", gram_d)
         self.assertNotIn("main_model.model.cls_head", gram_d)
         self.assertNotIn("main_model.model.decoder", gram_d)
 
@@ -164,6 +167,79 @@ class BackboneContractTests(unittest.TestCase):
             get_backbone_bd_contract("Unknown")
         with self.assertRaises(BackboneContractError):
             resolve_backbone_bd_sites(_biot(), "BIOT", "E")
+
+    def test_existing_four_backbones_keep_exact_semantic_injection_names(self):
+        fixtures = {
+            "BIOT": (_biot(), ("main_model.layers.0.w1", "main_model.layers.0.w2")),
+            "EEGPT": (_merged_transformer(True), ("main_model.blocks.0.mlp.fc1", "main_model.blocks.0.mlp.fc2")),
+            "LaBraM": (_merged_transformer(False), ("main_model.blocks.0.mlp.fc1", "main_model.blocks.0.mlp.fc2")),
+            "CBraMod": (_linear_transformer(), ("main_model.blocks.0.linear1", "main_model.blocks.0.linear2")),
+        }
+        for model_name, (model, expected) in fixtures.items():
+            with self.subTest(model=model_name):
+                actual = apply_lora_to_eegfm(
+                    model,
+                    model_name,
+                    lora_target="semantic",
+                    r=2,
+                    alpha=4.0,
+                    dropout=0.0,
+                    verbose=False,
+                )
+                self.assertEqual(tuple(actual), expected)
+
+    def test_contract_driven_bridge_injection_includes_csbrain(self):
+        fixtures = {
+            "BIOT": _biot(),
+            "EEGPT": _merged_transformer(True),
+            "CSBrain": _linear_transformer(True, nn.Conv1d(4, 4, 1)),
+        }
+        for model_name, model in fixtures.items():
+            with self.subTest(model=model_name):
+                actual = apply_lora_to_eegfm(
+                    model,
+                    model_name,
+                    lora_target="signal_align",
+                    module_b_sites="bridge",
+                    r=2,
+                    alpha=4.0,
+                    dropout=0.0,
+                    verbose=False,
+                )
+                self.assertEqual(actual, ["chan_conv"])
+
+    def test_csbrain_semantic_injection_excludes_global_fc(self):
+        actual = apply_lora_to_eegfm(
+            _linear_transformer(True, nn.Conv1d(4, 4, 1)),
+            "CSBrain",
+            lora_target="semantic",
+            r=2,
+            alpha=4.0,
+            dropout=0.0,
+            verbose=False,
+        )
+        self.assertEqual(
+            tuple(actual),
+            ("main_model.blocks.0.linear1", "main_model.blocks.0.linear2"),
+        )
+
+    def test_gram_semantic_injection_is_limited_to_encoder_mlp(self):
+        actual = apply_lora_to_eegfm(
+            _gram(),
+            "Gram",
+            lora_target="semantic",
+            r=2,
+            alpha=4.0,
+            dropout=0.0,
+            verbose=False,
+        )
+        self.assertEqual(
+            tuple(actual),
+            (
+                "main_model.model.blocks.0.mlp.fc1",
+                "main_model.model.blocks.0.mlp.fc2",
+            ),
+        )
 
 
 if __name__ == "__main__":

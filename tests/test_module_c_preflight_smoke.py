@@ -75,13 +75,14 @@ if torch is not None:
             super().__init__()
             self.input_channels = 4
             self.main_model = nn.Module()
-            self.main_model.blocks = nn.ModuleList([_TinyBlock()])
+            self.main_model.model = nn.Module()
+            self.main_model.model.blocks = nn.ModuleList([_TinyBlock()])
             self.task_head = nn.Linear(4, classes)
             self.integer_state = nn.Parameter(torch.tensor(0, dtype=torch.long), requires_grad=False)
 
         def forward(self, samples):
             hidden = samples.mean(dim=-1)
-            block = self.main_model.blocks[0]
+            block = self.main_model.model.blocks[0]
             hidden = torch.tanh(block.attn.query(hidden) + block.attn.value(hidden))
             hidden = torch.tanh(block.mlp.fc1(hidden))
             hidden = block.mlp.fc2(hidden)
