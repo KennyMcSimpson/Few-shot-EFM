@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import engine_for_finetuning
@@ -11,6 +12,15 @@ import run_finetuning
 
 
 class GenericTrainingDefaultsTests(unittest.TestCase):
+    def test_cudnn_autotuner_is_disabled_for_variable_eeg_shapes(self):
+        backend = SimpleNamespace(benchmark=True)
+        with patch.object(run_finetuning, "cudnn", backend):
+            run_finetuning._configure_cudnn_runtime()
+            self.assertFalse(backend.benchmark)
+        self.assertIn(
+            "_configure_cudnn_runtime()", inspect.getsource(run_finetuning.main)
+        )
+
     def test_boundary_anchor_default_and_snapshot_help_are_generic(self):
         with patch.object(sys, "argv", ["run_finetuning.py"]):
             args, _ = run_finetuning.get_args()

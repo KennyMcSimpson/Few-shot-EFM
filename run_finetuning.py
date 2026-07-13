@@ -3275,6 +3275,11 @@ def resolve_output_root(args):
     )
 
 
+def _configure_cudnn_runtime():
+    """Use stable algorithms for variable-shape EEG loaders and preflight."""
+    cudnn.benchmark = False
+
+
 def main(args, ds_init):
 
     if ds_init is not None:
@@ -3415,7 +3420,7 @@ def main(args, ds_init):
     np.random.seed(seed)
     random.seed(seed)
 
-    cudnn.benchmark = True
+    _configure_cudnn_runtime()
 
     # Classification/regression use the validated task registry. Retrieval has
     # its own EEGDataset registry and therefore does not require Retrieval.json.
