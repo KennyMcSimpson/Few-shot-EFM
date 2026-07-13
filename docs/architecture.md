@@ -49,6 +49,32 @@ general structural-routing action. Model-specific registries only map that
 general role onto the actual spatial, temporal, or mixing parameters exposed by
 each backbone; a BIOT mapping does not create a separate “BIOT E”.
 
+## B/D backbone contract
+
+`util/backbone_contracts.py` is the formal source of truth for Module B bridge
+sites and Module D semantic FFN sites. The scientific actions remain shared;
+the contract only translates those actions into each backbone's real module
+paths and expected PyTorch types.
+
+| Backbone | B input residual | Optional B bridge | D semantic FFN |
+| --- | --- | --- | --- |
+| BIOT | raw EEG | `chan_conv` | `w1`, `w2` |
+| EEGPT | raw EEG | `chan_conv` | `mlp.fc1`, `mlp.fc2` |
+| LaBraM | raw EEG | none | `mlp.fc1`, `mlp.fc2` |
+| CBraMod | raw EEG | none | `linear1`, `linear2` |
+| CSBrain | raw EEG | conditional `chan_conv` | `linear1`, `linear2` |
+| Gram | raw EEG | none | encoder `blocks.*.mlp.fc1/fc2` |
+
+Missing required sites and unexpected module types fail before training.
+`diagnostics/backbone_bd_contract.json` records the contract hash and the
+resolved/injected B/D sites for each LoRA run.
+
+The formal method uses `--lora_base_update full`: all original trainable
+backbone parameters remain trainable and selected B/D/E sites receive
+additional LoRA residuals. LoRA runs must state `full` or `freeze` explicitly;
+there is no silent base-update default. The optimizer is checked to contain
+every trainable parameter exactly once and no frozen parameters.
+
 ## Module C protocol
 
 With candidates `B,D,E`, Module C scores `EMPTY`, `B`, `D`, `E`, `BD`, `BE`,
@@ -86,7 +112,8 @@ changing the trainable topology; do not present that as an exact resume.
 - Add dataset training support through `dataset_config/`; a preprocessing script
   alone is not an end-to-end integration.
 - Keep model-specific tensor reshaping inside its wrapper.
-- Register LoRA targets by functional role and test the resolved parameter set.
+- Register B/D targets in `util/backbone_contracts.py`, keep structural routing
+  in the Module E implementation, and test the exact resolved parameter set.
 - Keep generated data, checkpoints, and results outside Git.
 - Add protocol tests whenever a change affects selection, split integrity,
   optimizer stepping, or checkpoint restoration.

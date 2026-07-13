@@ -39,8 +39,13 @@ an interface mismatch.
 
 ## 5. Map functional regions
 
-Update `util/fb_registry.py` and `util/lora.py` so LoRA targets resolve to real
-parameters. Map architectural names onto the shared roles:
+Add a thin declaration to `util/backbone_contracts.py` so Module B/D targets
+resolve to real parameters. Declare the canonical task head, raw-input support,
+an optional Conv1d channel bridge, and the exact semantic FFN/MLP paths. The
+shared resolver validates module types and the common injector performs the
+actual wrapping.
+
+Map exploratory diagnostics in `util/fb_registry.py` onto the shared roles:
 
 ```text
 input_front  spatial  temporal  spectral  mixing  semantic  readout
@@ -48,7 +53,8 @@ input_front  spatial  temporal  spectral  mixing  semantic  readout
 
 Module E remains the general structural-routing role. A backbone-specific
 pattern table is an implementation mapping, not a new model-specific module.
-Check both false positives and false negatives in parameter-name matching.
+Do not add B/D substring heuristics to `util/lora.py`. Check both false
+positives and false negatives with exact resolved-site tests.
 
 ## 6. Test integration
 
@@ -57,7 +63,7 @@ At minimum, verify:
 1. wrapper import and forward shape;
 2. required checkpoint failure and explicit scratch-debug behavior;
 3. resolved LoRA targets and trainable-parameter counts;
-4. optimizer construction after LoRA injection;
+4. Full-FT base trainability restoration and exact optimizer coverage;
 5. one training/evaluation smoke step;
 6. Module C branch construction if the backbone claims B/D/E coverage;
 7. checkpoint resume compatibility.

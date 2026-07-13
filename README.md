@@ -3,8 +3,8 @@
 Few-shot EFM is a research codebase for adapting EEG foundation models when
 only a small labelled support set is available. It extends
 [AdaBrain-Bench](https://github.com/Jamine-W/AdaBrain-Bench) with model-aware
-functional-block LoRA, validation-only adapter selection, and a reproducible
-Module C search over the B/D/E adaptation actions.
+functional low-rank residuals on top of full fine-tuning, validation-only
+adapter selection, and a reproducible Module C search over the B/D/E actions.
 
 This repository is a research fork, not a clean-room reimplementation. The
 training loop, dataset interface, preprocessing foundations, and several model
@@ -22,7 +22,7 @@ vendored integrations are documented in
 - Five additional preprocessing-only integrations: SEED, SHHS, SHU, TUAB, and
   Things-EEG. They are not advertised as trainable until a dataset config is
   added and validated.
-- Full fine-tuning, linear probing, and LoRA adaptation.
+- Full fine-tuning and Full-FT-plus-LoRA adaptation.
 - Functional-block diagnostics and Modules A-E for few-shot adapter control.
 - Portable Python entrypoints for dataset preparation and experiment
   manifests. The public tree intentionally contains no batch or shell runners.
@@ -103,7 +103,8 @@ Functional-block LoRA:
 ```console
 python run_finetuning.py --dataset SEED-IV --model_name EEGPT \
   --task_mod Classification --subject_mod fewshot --finetune_mod lora \
-  --k_shot 0.05 --lora_target semantic --lora_rank 4 --lora_alpha 8 \
+  --k_shot 0.05 --lora_base_update full --lora_target semantic \
+  --lora_rank 4 --lora_alpha 8 \
   --fb_enable --fb_probe --fb_collect --seed 0
 ```
 
@@ -112,7 +113,8 @@ Module C exhaustive B/D/E preflight:
 ```console
 python run_finetuning.py --dataset BCI-IV-2A --model_name BIOT \
   --task_mod Classification --subject_mod fewshot --finetune_mod lora \
-  --k_shot 0.05 --lora_target module_c --module_c_candidates B,D,E \
+  --k_shot 0.05 --lora_base_update full --lora_target module_c \
+  --module_c_candidates B,D,E \
   --module_c_preflight_train_batches 0 --module_c_preflight_val_batches 0 \
   --module_c_preflight_only
 ```
