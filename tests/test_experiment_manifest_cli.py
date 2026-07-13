@@ -1,3 +1,5 @@
+import contextlib
+import io
 import pathlib
 import sys
 import unittest
@@ -11,6 +13,11 @@ MANIFEST = ROOT / "experiment_manifests" / "module_c_exhaustive_seed0_4datasets.
 
 
 class ExperimentManifestCliTests(unittest.TestCase):
+    def test_training_parser_rejects_removed_backbone(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                get_args(["--model_name", "NeurI" + "PT"])
+
     def test_module_c_manifest_expands_to_24_unique_runs(self):
         runs = expand_manifest(
             load_manifest(MANIFEST),

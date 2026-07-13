@@ -28,7 +28,7 @@ def add_fb_args(parser):
     parser.add_argument("--module_c_preflight_val_batches", default=0, type=int, help="Module C validation preflight batch cap. <=0 scans complete validation with SequentialSampler and drop_last=False; positive values are debug upper bounds.")
     parser.add_argument("--module_c_preflight_only", action="store_true", default=False, help="Run exhaustive Module C preflight, write diagnostics, and exit before formal training.")
     return parser
-MODEL_DEFAULT_RECIPE={"BIOT":"sem_lif","LaBraM":"sem_lif","EEGPT":"sig_align","CBraMod":"str_mix","Gram":"gram_diag","CSBrain":"csb_diag","NeurIPT":"probe_only"}
+MODEL_DEFAULT_RECIPE={"BIOT":"sem_lif","LaBraM":"sem_lif","EEGPT":"sig_align","CBraMod":"str_mix","Gram":"gram_diag","CSBrain":"csb_diag"}
 MODULE_B_METADATA_KEYS=(
     "module_b_current","module_b_role","module_b_is_active",
     "module_b_is_pure_isolation","module_b_sites",

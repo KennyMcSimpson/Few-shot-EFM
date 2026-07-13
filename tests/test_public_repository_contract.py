@@ -48,6 +48,28 @@ class PublicRepositoryContractTests(unittest.TestCase):
             self.assertNotIn("D:\\", serialized)
             self.assertNotIn("/home/", serialized)
 
+    def test_removed_backbone_has_no_public_integration(self):
+        removed_name = "NeurI" + "PT"
+        removed_lower = removed_name.lower()
+        self.assertFalse((ROOT / "external" / removed_name).exists())
+        self.assertFalse((ROOT / "models" / f"{removed_lower}_ada.py").exists())
+
+        searchable_suffixes = {".py", ".md", ".json", ".toml", ".txt", ".yml", ".yaml"}
+        references = []
+        for path in ROOT.rglob("*"):
+            if not path.is_file() or ".git" in path.parts:
+                continue
+            if path == pathlib.Path(__file__).resolve() or path.suffix.lower() not in searchable_suffixes:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8").lower()
+            except UnicodeDecodeError:
+                continue
+            if removed_lower in text or removed_lower in path.as_posix().lower():
+                references.append(path.relative_to(ROOT).as_posix())
+
+        self.assertEqual(sorted(references), [])
+
 
 if __name__ == "__main__":
     unittest.main()

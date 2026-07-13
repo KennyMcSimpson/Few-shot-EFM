@@ -34,17 +34,6 @@ their MIT notices. This notice does not assert a broader license for unmarked
 Gram source; users who redistribute that subset should verify terms with the
 upstream authors.
 
-## NeurIPT
-
-- Local source: `external/NeurIPT/`
-- Original project information: `external/NeurIPT/README_NeurIPT_original.md`
-- Retained license: `external/NeurIPT/LICENSE`
-- Local use: selected model and utility code required by
-  `models/neuript_ada.py`.
-
-Only the integration subset needed by this project is present. The original
-README may mention assets or runners that are not included in this repository.
-
 ## Other backbone implementations
 
 `run_finetuning.py` and model wrappers acknowledge additional upstream code

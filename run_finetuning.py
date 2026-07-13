@@ -114,10 +114,6 @@ try:
     from models.gram_ada import GramAdaBackbone
 except Exception:
     GramAdaBackbone = None
-try:
-    from models.neuript_ada import NeurIPTAdaBackbone
-except Exception:
-    NeurIPTAdaBackbone = None
 from models.EEGNet import EEGNet
 from models.LMDA import LMDA
 from models.EEGConformer import Conformer
@@ -134,7 +130,6 @@ finetune_list = {
     'BIOT': "./checkpoints/EEG-six-datasets-18-channels.ckpt",
     'CSBrain': './checkpoints/CSBrain.pth',
     'Gram': './checkpoints/gram_base.pth',
-    'NeurIPT': './checkpoints/neuript_stage2.pth'
 }
 # ---------------------------------------------------------------------------------------------------------------------
 
@@ -148,7 +143,7 @@ def get_args(argv=None):
                         help=('Dataset name. Classification/regression require an entry in '
                               'dataset_config; some choices are retrieval or preprocessing-only.'))
     parser.add_argument('--model_name', default='LaBraM', type=str,
-                        choices=['LaBraM', 'CBraMod', 'EEGPT', 'BIOT', 'CSBrain', 'Gram', 'NeurIPT', 'EEGNet', 'LMDA', 'EEGConformer', 'ST-Transformer'])
+                        choices=['LaBraM', 'CBraMod', 'EEGPT', 'BIOT', 'CSBrain', 'Gram', 'EEGNet', 'LMDA', 'EEGConformer', 'ST-Transformer'])
     parser.add_argument('--csbrain_ckpt', default='./checkpoints/CSBrain.pth', type=str,
                         help='CSBrain pretrained checkpoint path.')
     parser.add_argument('--gram_ckpt', default='./checkpoints/gram_base.pth', type=str,
@@ -161,29 +156,6 @@ def get_args(argv=None):
                         help='Allow Gram to run without gram_base.pth. Use only for interface debugging, not official FM baseline.')
     parser.add_argument('--csbrain_allow_scratch', action='store_true', default=False,
                         help='Allow CSBrain to run without CSBrain.pth. Use only for interface debugging, not official FM baseline.')
-    parser.add_argument('--neuript_ckpt', default='./checkpoints/neuript_stage2.pth', type=str,
-                        help='NeurIPT stage-2 pretrained checkpoint path.')
-    parser.add_argument('--neuript_source_root', default='external/NeurIPT', type=str,
-                        help='Path to NeurIPT source root. Default external/NeurIPT is included in this patch.')
-    parser.add_argument('--neuript_allow_scratch', action='store_true', default=False,
-                        help='Allow NeurIPT to run without pretrained checkpoint. Use only for shape/debug runs, not official FM baseline.')
-    parser.add_argument('--neuript_data_dim', default=20, type=int,
-                        help='NeurIPT input channel dimension after channel adapter. TUEV official setting is 20.')
-    parser.add_argument('--neuript_total_len', default=320, type=int,
-                        help='NeurIPT temporal length after interpolation. TUEV official setting is 320.')
-    parser.add_argument('--neuript_d_model', default=768, type=int)
-    parser.add_argument('--neuript_d_ff', default=768, type=int)
-    parser.add_argument('--neuript_n_heads', default=8, type=int)
-    parser.add_argument('--neuript_dropout', default=0.1, type=float)
-    parser.add_argument('--neuript_c_layers', default=6, type=int)
-    parser.add_argument('--neuript_part', default='Functional', type=str, choices=['Hemispheres', 'Sagittal', 'Coronal', 'Functional'])
-    parser.add_argument('--neuript_merge_layers', default='1,4,1,2,1,2', type=str)
-    parser.add_argument('--neuript_enc_expert', default='0,0,2,4,4,6', type=str)
-    parser.add_argument('--neuript_hidden_dim', default=512, type=int)
-    parser.add_argument('--neuript_hidden_dim_shared', default=768, type=int)
-    parser.add_argument('--neuript_top_k', default=0.5, type=float)
-    parser.add_argument('--neuript_noise_std', default=0.001, type=float)
-    parser.add_argument('--neuript_w_importance', default=0.008, type=float)
     parser.add_argument('--task_mod', default="Classification", type=str, choices=['Classification', 'Regression', 'Retrieval'],
                         help='type of task')
     parser.add_argument('--subject_mod', default="multi", type=str, choices=['multi', 'cross', 'fewshot', 'single'],
@@ -1086,19 +1058,6 @@ class Ada_Gram(nn.Module):
 
 
 
-class Ada_NeurIPT(nn.Module):
-    def __init__(self, args, ch_names, num_t, from_pretrain=False):
-        super().__init__()
-        if NeurIPTAdaBackbone is None:
-            raise ImportError('models.neuript_ada could not be imported. Put neuript_ada.py under models/.')
-        self.main_model = NeurIPTAdaBackbone(args, ch_names, num_t, from_pretrain=from_pretrain)
-        # Expose internal classification head so frozen-LoRA mode can keep the readout trainable.
-        self.task_head = getattr(self.main_model.model, 'classification_head', nn.Identity())
-
-    def forward(self, x):
-        # The internal NeurIPT model already includes its classification head.
-        return self.main_model(x)
-
 class Ada_EEGNet(nn.Module):
     def __init__(self, args, ch_names, num_t):
         super().__init__()
@@ -1274,7 +1233,7 @@ def _create_formal_optimizer(args, model, skip_weight_decay_list, assigner=None,
 def _apply_lora_training_setup(model, args):
     if args.task_mod == 'Retrieval':
         raise ValueError('LoRA mode is currently implemented for Classification/Regression, not Retrieval.')
-    if args.model_name not in ['LaBraM', 'CBraMod', 'EEGPT', 'BIOT', 'CSBrain', 'Gram', 'NeurIPT']:
+    if args.model_name not in ['LaBraM', 'CBraMod', 'EEGPT', 'BIOT', 'CSBrain', 'Gram']:
         raise ValueError(f'LoRA mode currently supports EEGFMs only, got {args.model_name}.')
 
     # Important experimental control:
@@ -1508,7 +1467,7 @@ def get_models(args, ch_names, num_t):
     from_pretrain = False
     if (
         not getattr(args, 'disable_pretrained_loading', False)
-        and args.model_name in ['LaBraM', 'CBraMod', 'EEGPT', 'BIOT', 'CSBrain', 'Gram', 'NeurIPT']
+        and args.model_name in ['LaBraM', 'CBraMod', 'EEGPT', 'BIOT', 'CSBrain', 'Gram']
     ):
         if args.finetune_mod in ['full', 'linear', 'lora']:
             from_pretrain=True
@@ -1563,9 +1522,6 @@ def get_models(args, ch_names, num_t):
         model = Ada_Gram(args, ch_names, num_t, from_pretrain=from_pretrain)
         # Official Gram fine-tune model already returns task logits.
         model.task_head = nn.Identity()
-    elif args.model_name == 'NeurIPT':
-        model = Ada_NeurIPT(args, ch_names, num_t, from_pretrain=from_pretrain)
-        # NeurIPT includes the classifier internally; model.task_head is an alias used for frozen-LoRA trainability.
     elif args.model_name == 'EEGNet':
         model = Ada_EEGNet(args, ch_names, num_t)
         if args.task_mod == 'Classification':

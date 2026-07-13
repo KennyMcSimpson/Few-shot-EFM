@@ -15,8 +15,8 @@ vendored integrations are documented in
 
 ## What is included
 
-- Eleven training backbones: LaBraM, CBraMod, EEGPT, BIOT, CSBrain, Gram,
-  NeurIPT, EEGNet, LMDA, EEGConformer, and ST-Transformer.
+- Ten training backbones: LaBraM, CBraMod, EEGPT, BIOT, CSBrain, Gram,
+  EEGNet, LMDA, EEGConformer, and ST-Transformer.
 - Eight datasets connected to the training registry: BCI-IV-2A, EEGMAT, HMC,
   SEED-IV, SEED-VIG, Siena, Sleep-EDF, and TUEV.
 - Five additional preprocessing-only integrations: SEED, SHHS, SHU, TUAB, and
@@ -43,7 +43,7 @@ preprocessing/             dataset-specific Python preprocessors
 dataset_config/            training-visible dataset metadata
 experiment_manifests/      portable experiment matrices
 tools/                     dataset and manifest command-line utilities
-external/                  isolated Gram and NeurIPT source integrations
+external/                  isolated Gram source integration
 tests/                     unit and repository-contract tests
 docs/                      architecture, data, and reproducibility guides
 ```

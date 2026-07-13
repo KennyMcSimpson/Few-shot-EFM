@@ -30,9 +30,9 @@ or substantially extends:
 - unit tests for adaptation semantics, training safety, and public-repository
   contracts.
 
-`external/Gram` and `external/NeurIPT` are isolated third-party source
-integrations. They should not be described as original Few-shot EFM model code.
-See `THIRD_PARTY_NOTICES.md` and the original READMEs retained in each directory.
+`external/Gram` is an isolated third-party source integration. It should not be
+described as original Few-shot EFM model code. See `THIRD_PARTY_NOTICES.md` and
+the original README retained in that directory.
 
 ## Adaptation modules
 

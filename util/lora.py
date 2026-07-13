@@ -732,43 +732,6 @@ def _apply_lora_to_gram_module(
         _replace_with_lora_linear(model, name, module, r, alpha, dropout, replaced)
 
 
-def _apply_lora_to_neuript_module(
-    model: nn.Module,
-    name: str,
-    module: nn.Module,
-    plan: LoraTargetPlan,
-    lora_target: str,
-    max_layer_idx: Optional[int],
-    r: int,
-    alpha: float,
-    dropout: float,
-    replaced: List[str],
-) -> None:
-    lower = name.lower()
-    if not isinstance(module, nn.Linear):
-        return
-
-    should_replace = False
-    if any(k in lower for k in ("classification_head",)):
-        should_replace = False
-    elif any(k in lower for k in ("time_attention", "dim_attention")):
-        if lower.endswith("query_projection") and "q" in plan.enabled_parts:
-            should_replace = True
-        elif lower.endswith("key_projection") and "k" in plan.enabled_parts:
-            should_replace = True
-        elif lower.endswith("value_projection") and "v" in plan.enabled_parts:
-            should_replace = True
-        elif lower.endswith("out_projection") and "o" in plan.enabled_parts:
-            should_replace = True
-    elif plan.use_ffn and any(k in lower for k in ("mlp", "experts", "shared_expert", "linear_trans")):
-        should_replace = _layer_selected_for_ffn(name, lora_target, max_layer_idx)
-    elif plan.use_all_linear and lower.startswith("main_model."):
-        should_replace = True
-
-    if should_replace:
-        _replace_with_lora_linear(model, name, module, r, alpha, dropout, replaced)
-
-
 LORA_MODEL_MODULE_HANDLERS = {
     "biot": _apply_lora_to_biot_module,
     "cbramod": _apply_lora_to_cbramod_module,
@@ -776,7 +739,6 @@ LORA_MODEL_MODULE_HANDLERS = {
     "labram": _apply_lora_to_eegpt_labram_module,
     "csbrain": _apply_lora_to_csbrain_module,
     "gram": _apply_lora_to_gram_module,
-    "neuript": _apply_lora_to_neuript_module,
 }
 
 
@@ -803,7 +765,6 @@ def apply_lora_to_eegfm(
       - LaBraM: merged attn.qkv Linear and attn.proj Linear.
       - CSBrain: inter-window/inter-region MultiheadAttention and FFN Linear layers.
       - Gram: generic Linear LoRA on classifier/encoder paths; restoration/codebook paths are skipped.
-      - NeurIPT: TSA temporal/spatial projection LoRA and PMoE/MLP low-rank adapters.
 
     lora_target:
       - qv: first-round recommended baseline. Q/V only.
