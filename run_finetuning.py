@@ -3247,6 +3247,17 @@ def _configure_cudnn_runtime():
     cudnn.benchmark = False
 
 
+def _validate_lora_cli_contract(args):
+    if str(getattr(args, 'finetune_mod', '') or '').lower() != 'lora':
+        return None
+    if getattr(args, 'lora_base_update', None) not in ('freeze', 'full'):
+        raise ValueError(
+            'LoRA runs require an explicit --lora_base_update full or '
+            '--lora_base_update freeze.'
+        )
+    return None
+
+
 def main(args, ds_init):
 
     if ds_init is not None:
@@ -3256,6 +3267,7 @@ def main(args, ds_init):
 
     # FB2: resolve framework switches before output tag/model/optimizer are built.
     args = resolve_functional_args(args)
+    _validate_lora_cli_contract(args)
     args.module_e_mode = module_e_mode_from_args(args)
 
     # Keep result folder names short enough for Windows path length limits.

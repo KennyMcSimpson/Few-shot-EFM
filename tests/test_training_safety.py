@@ -31,6 +31,16 @@ class GenericTrainingDefaultsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "explicit.*lora_base_update"):
             run_finetuning._apply_lora_training_setup(torch.nn.Linear(2, 1), args)
 
+    def test_lora_cli_contract_fails_before_output_or_model_setup(self):
+        args, _ = run_finetuning.get_args(["--finetune_mod", "lora"])
+        with self.assertRaisesRegex(ValueError, "explicit.*lora_base_update"):
+            run_finetuning._validate_lora_cli_contract(args)
+
+        args, _ = run_finetuning.get_args(
+            ["--finetune_mod", "lora", "--lora_base_update", "full"]
+        )
+        self.assertIsNone(run_finetuning._validate_lora_cli_contract(args))
+
     def test_cudnn_autotuner_is_disabled_for_variable_eeg_shapes(self):
         backend = SimpleNamespace(benchmark=True)
         with patch.object(run_finetuning, "cudnn", backend):
