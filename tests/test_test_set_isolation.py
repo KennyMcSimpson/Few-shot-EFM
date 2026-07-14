@@ -185,6 +185,31 @@ class TestSetIsolationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             select_protocol(Args())
 
+    def test_binary_classification_allows_adaptive_swa_only(self):
+        tree = ast.parse((ROOT / "run_finetuning.py").read_text(encoding="utf-8"))
+        select_protocol = _load_pure_function(tree, "_select_final_test_protocol")
+
+        class BinaryAdaptiveSwaArgs:
+            snapshot_eval = False
+            boundary_anchor_eval = False
+            adaptive_swa_eval = True
+            proto_eval = False
+            adapter_calib_eval = False
+            task_mod = "Classification"
+            nb_classes = 1
+            start_epoch = 0
+            distributed = False
+
+        self.assertEqual(select_protocol(BinaryAdaptiveSwaArgs()), "adaptive_swa")
+
+        class BinarySnapshotArgs(BinaryAdaptiveSwaArgs):
+            snapshot_eval = True
+            adaptive_swa_eval = False
+            monitor_dynamics = True
+
+        with self.assertRaises(ValueError):
+            select_protocol(BinarySnapshotArgs())
+
     def test_snapshot_protocol_requires_epoch_monitoring(self):
         tree = ast.parse((ROOT / "run_finetuning.py").read_text(encoding="utf-8"))
         select_protocol = _load_pure_function(tree, "_select_final_test_protocol")

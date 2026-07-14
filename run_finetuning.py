@@ -2078,14 +2078,20 @@ def _select_final_test_protocol(args) -> str:
             f'got {enabled}. Run separate experiments instead.'
         )
     selected = enabled[0] if enabled else 'standard'
-    if selected != 'standard' and (
-        str(getattr(args, 'task_mod', 'Classification')) != 'Classification'
-        or int(getattr(args, 'nb_classes', 2)) <= 1
-    ):
-        raise ValueError(
-            f'Final test protocol {selected!r} currently requires multiclass '
-            'classification.'
-        )
+    if selected != 'standard':
+        task_mod = str(getattr(args, 'task_mod', 'Classification'))
+        stored_classes = int(getattr(args, 'nb_classes', 2))
+        effective_classes = 2 if stored_classes == 1 else stored_classes
+        if task_mod != 'Classification' or effective_classes < 2:
+            raise ValueError(
+                f'Final test protocol {selected!r} requires classification '
+                'with at least two effective labels.'
+            )
+        if selected != 'adaptive_swa' and stored_classes <= 1:
+            raise ValueError(
+                f'Final test protocol {selected!r} currently requires multiclass '
+                'classification.'
+            )
     if selected == 'snapshot' and not bool(getattr(args, 'monitor_dynamics', False)):
         raise ValueError(
             'Snapshot final evaluation requires --monitor_dynamics so '

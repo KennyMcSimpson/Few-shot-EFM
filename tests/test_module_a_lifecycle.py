@@ -1,7 +1,9 @@
 import argparse
+import tempfile
 import unittest
 
 import numpy as np
+import torch
 
 import module_a_lifecycle as lifecycle
 
@@ -186,6 +188,98 @@ class ModuleALifecycleSafetyTests(unittest.TestCase):
                 args=args,
             )
         )
+
+
+    def test_binary_forgetting_rows_cover_both_real_labels(self):
+        args = _default_args()
+        args.nb_classes = 1
+        window_details = {
+            "y_true": np.asarray([0, 0, 1, 1]),
+            "y_pred": np.asarray([0, 1, 1, 0]),
+        }
+        final_details = {"y_pred": np.asarray([0, 0, 1, 1])}
+
+        summary, class_rows = lifecycle._adaptive_swa_forgetting_rows(
+            window_details, final_details, args, 1, 1, 1
+        )
+
+        self.assertEqual(summary["total_count"], 4)
+        self.assertEqual([row["class_id"] for row in class_rows], [0, 1])
+        self.assertEqual([row["support"] for row in class_rows], [2, 2])
+
+    def test_binary_adaptive_swa_runs_validation_selection_and_one_test(self):
+        args = _default_args(
+            "--adaptive_swa_eval",
+            "--adaptive_swa_min_len",
+            "1",
+            "--adaptive_swa_max_len",
+            "1",
+            "--adaptive_swa_epoch_max",
+            "1",
+            "--adaptive_swa_no_save_selected_ckpt",
+        )
+        args.task_mod = "Classification"
+        args.nb_classes = 1
+        args.epochs = 1
+        args.lora_target = "module_c"
+        args.fb_recipe = ""
+        args.eval_logit_adjust = False
+
+        model = torch.nn.Linear(1, 1)
+        snapshots = [
+            lifecycle.capture_lifecycle_snapshot(
+                model, epoch_id=1, trainable_names={"weight", "bias"}
+            )
+        ]
+        calls = []
+
+        def fake_evaluate(
+            _args,
+            loader,
+            _model,
+            _device,
+            header,
+            ch_names,
+            metrics,
+            return_details,
+            logit_bias=None,
+        ):
+            del _args, _model, _device, ch_names, metrics, logit_bias
+            calls.append((loader, header))
+            return (
+                {
+                    "accuracy": 0.75,
+                    "balanced_accuracy": 0.75,
+                    "worst_class_recall": 0.50,
+                    "recall_std": 0.25,
+                    "pr_auc": 0.80,
+                    "roc_auc": 0.85,
+                },
+                {
+                    "per_class_recall": np.asarray([0.50, 1.00]),
+                    "y_true": np.asarray([0, 0, 1, 1]),
+                    "y_pred": np.asarray([0, 1, 1, 1]),
+                },
+            )
+
+        val_loader = object()
+        test_loader = object()
+        with tempfile.TemporaryDirectory() as tmp:
+            args.output_dir = tmp
+            result = lifecycle.run_lifecycle_window_search(
+                args=args,
+                model=model,
+                data_loader_val=val_loader,
+                data_loader_test=test_loader,
+                device=torch.device("cpu"),
+                metrics=["accuracy", "balanced_accuracy", "pr_auc", "roc_auc"],
+                snapshots=snapshots,
+                evaluate_fn=fake_evaluate,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["test_used_for_selection"], 0)
+        self.assertEqual(sum(loader is test_loader for loader, _ in calls), 1)
 
 
 if __name__ == "__main__":

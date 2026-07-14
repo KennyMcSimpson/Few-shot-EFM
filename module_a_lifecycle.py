@@ -646,7 +646,9 @@ def _adaptive_swa_forgetting_rows(window_details, final_details, args, start_epo
     }
 
     class_rows = []
-    for cls in range(int(getattr(args, 'nb_classes', 0) or 0)):
+    stored_classes = int(getattr(args, 'nb_classes', 0) or 0)
+    effective_classes = 2 if stored_classes == 1 else stored_classes
+    for cls in range(effective_classes):
         cls_mask = y_true == cls
         support = count(cls_mask)
         if support <= 0:
@@ -696,8 +698,10 @@ def run_lifecycle_window_search(args, model, data_loader_val, data_loader_test, 
         raise ValueError('run_lifecycle_window_search requires evaluate_fn')
     if not getattr(args, 'adaptive_swa_eval', False):
         return None
-    if args.task_mod != 'Classification' or int(args.nb_classes) <= 1:
-        print('[Adaptive-SWA] skipped: only multiclass classification is supported.')
+    stored_classes = int(getattr(args, 'nb_classes', 0) or 0)
+    effective_classes = 2 if stored_classes == 1 else stored_classes
+    if args.task_mod != 'Classification' or effective_classes < 2:
+        print('[Adaptive-SWA] skipped: classification with at least two effective labels is required.')
         return None
     if data_loader_val is None or data_loader_test is None:
         print('[Adaptive-SWA] skipped: validation/test loader missing.')
