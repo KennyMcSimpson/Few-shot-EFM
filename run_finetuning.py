@@ -73,7 +73,7 @@ try:
         save_module_e_lora_injection_audit,
         save_module_e_structural_pressure_proxy,
     )
-    from util.module_d_semantic_refinement import module_d_eval_row_from_details, save_module_d_sbr_eval
+    from util.module_d_semantic_refinement import save_module_d_sbr_eval
     from util.module_c_preflight_policy import (
         _resolve_module_c_support_batch_limit,
         capture_module_c_rng_state,
@@ -98,7 +98,6 @@ except Exception as _caught_fb_import_error:
     def is_module_e_target(*args, **kwargs): return False
     def module_e_branch_from_lora_param_name(*args, **kwargs): return None
     def module_e_mode_from_args(*args, **kwargs): return "dynamic_pressure_gate"
-    def module_d_eval_row_from_details(*args, **kwargs): return {}
     def save_module_d_sbr_eval(*args, **kwargs): return None
     def module_c_preflight_requested(*args, **kwargs): return False
     def _resolve_module_c_support_batch_limit(*args, **kwargs): return 0
@@ -477,9 +476,9 @@ def get_args(argv=None):
     parser.add_argument('--snapshot_select_metric', default='', type=str,
                         help='Metric used to rank snapshots. Empty means args.best_metric. Use names without val_ prefix, e.g. selection_bacc_worst_std.')
     parser.add_argument('--snapshot_include_top1', action='store_true', default=True,
-                        help='Also save a top1 snapshot row besides top-k ensemble.')
+                        help='Deprecated compatibility flag; final test reports only the validation-fixed top-k ensemble.')
     parser.add_argument('--snapshot_no_top1', action='store_false', dest='snapshot_include_top1',
-                        help='Do not save the top1 snapshot row.')
+                        help='Deprecated compatibility flag; top1 test comparison is always disabled.')
 
 
     # Offline adapter/front-end strength calibration. This is evaluation-only;
@@ -1962,16 +1961,15 @@ def _build_training_schedules(args, num_training_steps_per_epoch):
 
 
 def _select_metric(stats, metric_name):
-    """
-    优先取 args.best_metric；如果没有，就回退到 accuracy。
-    """
+    """Return the explicitly requested metric without silent substitution."""
     if stats is None:
         return None
     if metric_name in stats:
         return stats[metric_name]
-    if "accuracy" in stats:
-        return stats["accuracy"]
-    return None
+    raise KeyError(
+        f"Requested metric {metric_name!r} is unavailable; "
+        f"available metrics: {sorted(stats.keys())}"
+    )
 
 
 def _add_selection_metrics(stats, details, args):
@@ -2040,16 +2038,6 @@ def _add_selection_metrics(stats, details, args):
     return stats
 
 
-def _corresponding_test_metric_for_selection(test_stats, best_metric):
-    """When selecting by a composite val score, report corresponding test BAcc."""
-    if test_stats is None:
-        return None
-    if str(best_metric).startswith("selection_"):
-        return test_stats.get("balanced_accuracy", None)
-    return _select_metric(test_stats, best_metric)
-
-
-
 def _safe_float(x):
     try:
         if x is None or x == "":
@@ -2064,9 +2052,175 @@ def _safe_float(x):
 
 def _snapshot_metric_column(metric_name: str) -> str:
     metric_name = str(metric_name or '').strip()
-    if metric_name.startswith('val_') or metric_name.startswith('test_') or metric_name.startswith('train_eval_'):
+    if metric_name.startswith(('test_', 'train_', 'train_eval_')):
+        raise ValueError(
+            'Snapshot selection must use validation metrics only; '
+            f'got {metric_name!r}.'
+        )
+    if metric_name.startswith('val_'):
         return metric_name
     return f'val_{metric_name}'
+
+
+def _select_final_test_protocol(args) -> str:
+    """Choose exactly one validation-selected protocol allowed to see test data."""
+    protocols = (
+        ('snapshot', 'snapshot_eval'),
+        ('boundary_anchor', 'boundary_anchor_eval'),
+        ('adaptive_swa', 'adaptive_swa_eval'),
+        ('prototype', 'proto_eval'),
+        ('adapter_calibration', 'adapter_calib_eval'),
+    )
+    enabled = [name for name, attr in protocols if bool(getattr(args, attr, False))]
+    if len(enabled) > 1:
+        raise ValueError(
+            'Only one final test protocol may be enabled per run; '
+            f'got {enabled}. Run separate experiments instead.'
+        )
+    selected = enabled[0] if enabled else 'standard'
+    if selected != 'standard' and (
+        str(getattr(args, 'task_mod', 'Classification')) != 'Classification'
+        or int(getattr(args, 'nb_classes', 2)) <= 1
+    ):
+        raise ValueError(
+            f'Final test protocol {selected!r} currently requires multiclass '
+            'classification.'
+        )
+    if selected == 'snapshot' and not bool(getattr(args, 'monitor_dynamics', False)):
+        raise ValueError(
+            'Snapshot final evaluation requires --monitor_dynamics so '
+            'validation metrics and matching epoch checkpoints are recorded.'
+        )
+    if selected == 'adaptive_swa' and int(getattr(args, 'start_epoch', 0)) > 0:
+        raise ValueError(
+            'Adaptive-SWA lifecycle windows use in-memory epoch snapshots and '
+            'cannot resume mid-protocol. Start a fresh output directory.'
+        )
+    if int(getattr(args, 'start_epoch', 0)) > 0 and (
+        bool(getattr(args, 'adapter_swa', False))
+        or bool(getattr(args, 'adapter_swa_eval', False))
+        or float(getattr(args, 'cbra_eval_front_beta', 1.0)) != 1.0
+    ):
+        raise ValueError(
+            'Resume cannot reconstruct the adapter-SWA accumulator or the '
+            'original CBraMod interpolation baseline. Start a fresh output '
+            'directory for temporary validation-state protocols.'
+        )
+    if (
+        int(getattr(args, 'start_epoch', 0)) > 0
+        and str(getattr(args, 'lr_schedule_type', 'cosine')) == 'plateau'
+    ):
+        raise ValueError(
+            'Plateau scheduler counters are not persisted; exact mid-run '
+            'resume is unsupported. Start a fresh output directory.'
+        )
+    if (
+        bool(getattr(args, 'distributed', False))
+        and str(getattr(args, 'task_mod', '')) == 'Retrieval'
+    ):
+        raise ValueError(
+            'Retrieval final evaluation is not distributed-safe; use a '
+            'single process so the fixed final test suite covers one dataset.'
+        )
+    if bool(getattr(args, 'distributed', False)) and selected != 'standard':
+        raise ValueError(
+            f'Final test protocol {selected!r} is not distributed-safe. '
+            'Use a single process for this evaluator.'
+        )
+    return selected
+
+
+def _ensure_single_process_protocol(args):
+    """Fail closed while the entrypoint has no valid multi-process lifecycle."""
+    env_world_sizes = []
+    for name in (
+        'WORLD_SIZE',
+        'LOCAL_WORLD_SIZE',
+        'OMPI_COMM_WORLD_SIZE',
+        'SLURM_NTASKS',
+        'PMI_SIZE',
+    ):
+        try:
+            env_world_sizes.append(int(os.environ.get(name, '1') or '1'))
+        except (TypeError, ValueError):
+            env_world_sizes.append(1)
+    runtime_world_size = 1
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        runtime_world_size = int(torch.distributed.get_world_size())
+    actual_world_size = max([runtime_world_size] + (env_world_sizes or [1]))
+    if (
+        bool(getattr(args, 'enable_deepspeed', False))
+        or bool(getattr(args, 'distributed', False))
+        or actual_world_size > 1
+    ):
+        raise RuntimeError(
+            'This training entrypoint currently enforces a single-process '
+            'scientific protocol. Native DDP/DeepSpeed lifecycle, selection, '
+            'and partitioned checkpoint semantics are not implemented safely.'
+        )
+
+
+def _ensure_resume_controller_state(args, module_e_controller):
+    """Reject an inexact Module E resume until controller EMA is persisted."""
+    if int(getattr(args, 'start_epoch', 0)) > 0 and module_e_controller is not None:
+        raise RuntimeError(
+            'Module E controller EMA/step state is not stored in legacy '
+            'training checkpoints. Exact resume is unsupported; start a '
+            'fresh output directory with --no_auto_resume.'
+        )
+
+
+def _require_final_test_result(protocol, row, test_available):
+    """Reject a run that enabled final testing but produced no final report."""
+    if row is None and (bool(test_available) or protocol != 'standard'):
+        raise RuntimeError(
+            f'Final test protocol {protocol!r} produced no result. Refusing '
+            'to finish with an absent or stale test report.'
+        )
+    return row
+
+
+def _load_validation_best_checkpoint(args):
+    """Load the persisted validation winner required to continue a run safely."""
+    if int(getattr(args, 'start_epoch', 0)) <= 0:
+        return None, None
+
+    path = Path(args.output_dir) / 'checkpoint-best.pth'
+    if not path.is_file():
+        raise FileNotFoundError(
+            f'Resuming from epoch {args.start_epoch} requires {path}. '
+            'Without the prior validation winner, later epochs cannot be '
+            'compared without silently changing the selection protocol.'
+        )
+    try:
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(path, map_location='cpu')
+    if not isinstance(checkpoint, dict) or not isinstance(checkpoint.get('model'), dict):
+        raise RuntimeError(f'Invalid validation-best checkpoint: {path}')
+
+    selected_epoch = checkpoint.get('selected_epoch', None)
+    if not isinstance(selected_epoch, int):
+        raise RuntimeError(
+            f'Legacy validation-best checkpoint {path} has no verified numeric '
+            'selected_epoch. Start a fresh output directory.'
+        )
+    expected_metric = (
+        str(getattr(args, 'best_metric', 'balanced_accuracy'))
+        if str(getattr(args, 'task_mod', 'Classification')) == 'Classification'
+        else 'R2_Score'
+    )
+    if checkpoint.get('selected_by') != 'validation':
+        raise RuntimeError(
+            f'Validation-best checkpoint {path} lacks validation-selection provenance.'
+        )
+    if checkpoint.get('selection_metric') != expected_metric:
+        raise RuntimeError(
+            f'Validation-best checkpoint {path} used metric '
+            f'{checkpoint.get("selection_metric")!r}, but this run requests '
+            f'{expected_metric!r}. Start a fresh output directory.'
+        )
+    return checkpoint['model'], selected_epoch
 
 
 def _read_snapshot_candidates(metrics_csv, select_metric):
@@ -2141,23 +2295,6 @@ def _collect_logits_and_targets(args, data_loader, model, device, logit_bias=Non
         logits_list.append(output.detach().cpu())
         target_list.append(target.detach().cpu())
     return torch.cat(logits_list, dim=0), torch.cat(target_list, dim=0)
-
-
-def _merge_prefixed_scalar_stats(dst, prefix, src):
-    """Merge scalar stats into dst with a prefix, avoiding arrays/dicts."""
-    if dst is None or src is None:
-        return dst
-    for k, v in src.items():
-        if isinstance(v, (list, tuple, dict)):
-            continue
-        if hasattr(v, "shape"):
-            continue
-        try:
-            if isinstance(v, (float, int, np.floating, np.integer, str, bool)) or v is None:
-                dst[f"{prefix}_{k}"] = float(v) if isinstance(v, (np.floating, np.integer)) else v
-        except Exception:
-            pass
-    return dst
 
 
 @torch.no_grad()
@@ -2249,11 +2386,7 @@ def _evaluate_logit_prototype_fusion(args, support_loader, query_loader, model, 
 def _load_epoch_checkpoint_into_model(model, ckpt_path):
     ckpt = torch.load(ckpt_path, map_location='cpu')
     state = ckpt.get('model', ckpt)
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if len(missing) > 0:
-        print(f"[Snapshot] load {os.path.basename(ckpt_path)} missing keys: {len(missing)}")
-    if len(unexpected) > 0:
-        print(f"[Snapshot] load {os.path.basename(ckpt_path)} unexpected keys: {len(unexpected)}")
+    model.load_state_dict(state, strict=True)
 
 
 def _write_snapshot_candidates(diag_dir, ranked_rows, metric_col):
@@ -2262,8 +2395,7 @@ def _write_snapshot_candidates(diag_dir, ranked_rows, metric_col):
     fieldnames = ['rank', 'epoch', 'select_metric_col', 'select_score',
                   'val_balanced_accuracy', 'val_selection_bacc_worst_std',
                   'val_selection_bacc_min02_std',
-                  'val_worst_class_recall', 'val_selection_min02', 'val_recall_std',
-                  'test_balanced_accuracy', 'test_accuracy']
+                  'val_worst_class_recall', 'val_selection_min02', 'val_recall_std']
     with open(out, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -2280,8 +2412,6 @@ def _write_snapshot_candidates(diag_dir, ranked_rows, metric_col):
                 'val_worst_class_recall': r.get('val_worst_class_recall', ''),
                 'val_selection_min02': r.get('val_selection_min02', ''),
                 'val_recall_std': r.get('val_recall_std', ''),
-                'test_balanced_accuracy': r.get('test_balanced_accuracy', ''),
-                'test_accuracy': r.get('test_accuracy', ''),
             })
     print(f"[Snapshot] candidates saved to: {out}")
 
@@ -2327,7 +2457,9 @@ def _run_snapshot_ensemble_report(args, model, data_loader_val, data_loader_test
     final_state = _get_model_cpu_state(model)
 
     rows = []
-    for use_k in ([1, len(selected)] if getattr(args, 'snapshot_include_top1', True) and len(selected) > 1 else [len(selected)]):
+    # The ensemble definition (including K) is fixed entirely by validation.
+    # Do not also report a top-1 test candidate from the same run.
+    for use_k in [len(selected)]:
         use_items = selected[:use_k]
         logits_accum = None
         true_ref = None
@@ -2402,6 +2534,7 @@ def _run_snapshot_ensemble_report(args, model, data_loader_val, data_loader_test
     print(f"[Snapshot] ensemble report saved to: {out_csv}")
 
     model.load_state_dict(final_state, strict=False)
+    return rows[-1] if rows else None
 
 
 
@@ -2539,7 +2672,7 @@ def _choose_boundary_anchor_from_trace(args):
     return chosen['_epoch'], 'best_validation_score', chosen
 
 
-def _maybe_update_boundary_anchor(args, model, epoch_id, val_stats, val_details, test_stats, test_details,
+def _maybe_update_boundary_anchor(args, model, epoch_id, val_stats, val_details,
                                   current_best_score, current_best_epoch):
     """Log every eligible boundary score and optionally save max-score anchor.
 
@@ -2576,13 +2709,15 @@ def _maybe_update_boundary_anchor(args, model, epoch_id, val_stats, val_details,
         'val_class0': _details_class_recall(val_details, 0),
         'val_class2': _details_class_recall(val_details, 2),
         'val_class5': _details_class_recall(val_details, 5),
-        # test values are diagnostic only and are never used for anchor selection
-        'test_bacc_diag': '' if test_stats is None else test_stats.get('balanced_accuracy', ''),
-        'test_acc_diag': '' if test_stats is None else test_stats.get('accuracy', ''),
-        'test_class0_diag': _details_class_recall(test_details, 0),
-        'test_class2_diag': _details_class_recall(test_details, 2),
-        'test_class5_diag': _details_class_recall(test_details, 5),
     }
+    epoch_checkpoint_tag = f'boundary_epoch_{int(epoch_id):03d}'
+    _save_monitor_checkpoint(
+        args=args,
+        model=model,
+        epoch=int(epoch_id),
+        tag=epoch_checkpoint_tag,
+    )
+    row['checkpoint_tag'] = epoch_checkpoint_tag
     diag_dir = os.path.join(args.output_dir, "diagnostics")
     os.makedirs(diag_dir, exist_ok=True)
     _append_csv_row(os.path.join(diag_dir, "boundary_anchor_trace.csv"), row)
@@ -2599,7 +2734,7 @@ def _maybe_update_boundary_anchor(args, model, epoch_id, val_stats, val_details,
         _write_boundary_anchor_row(args, update_row)
         print(
             f"[BoundaryAnchor] max-update epoch={epoch_id}, metric={metric_name}, "
-            f"score={score:.6f}, diag_test_bacc={row['test_bacc_diag']}"
+            f"score={score:.6f}"
         )
         return score, int(epoch_id)
 
@@ -2608,17 +2743,14 @@ def _maybe_update_boundary_anchor(args, model, epoch_id, val_stats, val_details,
 
 def _load_anchor_epoch_state(args, epoch):
     ckpt_dir = os.path.join(args.output_dir, "monitor_checkpoints")
-    epoch_path = os.path.join(ckpt_dir, f"epoch_{int(epoch):03d}.pth")
+    epoch_path = os.path.join(ckpt_dir, f"boundary_epoch_{int(epoch):03d}.pth")
     if os.path.exists(epoch_path):
         obj = torch.load(epoch_path, map_location='cpu')
         return obj, epoch_path
-    # fallback to max-update tag if needed
-    tag = str(getattr(args, 'boundary_anchor_tag', 'boundary_anchor') or 'boundary_anchor')
-    tag_path = os.path.join(ckpt_dir, f"{tag}.pth")
-    if os.path.exists(tag_path):
-        obj = torch.load(tag_path, map_location='cpu')
-        return obj, tag_path
-    raise FileNotFoundError(f"No anchor checkpoint found for epoch={epoch}; tried {epoch_path} and {tag_path}")
+    raise FileNotFoundError(
+        f"No exact boundary checkpoint found for epoch={epoch}: {epoch_path}. "
+        "Refusing to substitute a different epoch."
+    )
 
 
 def _run_boundary_anchor_final_eval(args, model, data_loader_val, data_loader_test, device, metrics):
@@ -2637,7 +2769,7 @@ def _run_boundary_anchor_final_eval(args, model, data_loader_val, data_loader_te
     obj, ckpt_path = _load_anchor_epoch_state(args, chosen_epoch)
     state = obj.get('model', obj)
     epoch = obj.get('epoch', chosen_epoch)
-    model.load_state_dict(state, strict=False)
+    model.load_state_dict(state, strict=True)
 
     val_stats, val_details = evaluate(
         args, data_loader_val, model, device,
@@ -2685,7 +2817,8 @@ def _run_boundary_anchor_final_eval(args, model, data_loader_val, data_loader_te
         f"test BAcc={row.get('test_balanced_accuracy', float('nan'))}"
     )
 
-    model.load_state_dict(final_state, strict=False)
+    model.load_state_dict(final_state, strict=True)
+    return row
 
 
 
@@ -2911,11 +3044,7 @@ def _load_epoch_state_with_front_beta(model, ckpt_path, init_state_path=None, fr
         state = mixed_state
     else:
         state = trained_state
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if len(missing) > 0:
-        print(f"[AdapterCalib] load {os.path.basename(ckpt_path)} missing keys: {len(missing)}")
-    if len(unexpected) > 0:
-        print(f"[AdapterCalib] load {os.path.basename(ckpt_path)} unexpected keys: {len(unexpected)}")
+    model.load_state_dict(state, strict=True)
 
 
 def _flatten_eval_row(prefix, stats, row):
@@ -2933,6 +3062,31 @@ def _add_per_class_to_row(prefix, details, row):
     if pcr is not None:
         for i, v in enumerate(pcr):
             row[f'{prefix}_class_{i}'] = '' if np.isnan(v) else float(v)
+
+
+def _prepare_final_test_artifact(args):
+    """Remove reports from an older invocation before any new selection work."""
+    diag_dir = os.path.join(args.output_dir, 'diagnostics')
+    path = os.path.join(diag_dir, 'final_test_metrics.json')
+    temp_path = path + '.tmp'
+    for candidate in (path, temp_path):
+        if os.path.exists(candidate):
+            os.remove(candidate)
+
+
+def _write_final_test_artifact(args, row):
+    """Persist the single post-selection test report separately from epoch logs."""
+    if row is None or not utils.is_main_process():
+        return row
+    diag_dir = os.path.join(args.output_dir, 'diagnostics')
+    os.makedirs(diag_dir, exist_ok=True)
+    path = os.path.join(diag_dir, 'final_test_metrics.json')
+    temp_path = path + '.tmp'
+    with open(temp_path, 'w', encoding='utf-8') as f:
+        json.dump(_json_safe_dict(row), f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, path)
+    print(f"[Protocol] final test artifact saved to: {path}")
+    return row
 
 
 def _run_adapter_strength_calibration(args, model, data_loader_val, data_loader_test, device, metrics):
@@ -3008,20 +3162,19 @@ def _run_adapter_strength_calibration(args, model, data_loader_val, data_loader_
                     logit_bias = None
                     val_stats_for_select = val_stats_raw
                     val_details_for_select = val_details_raw
-                    test_header = f'Adapter-Test-E{ep}-s{scale:g}-b{beta:g}'
                     if strength is not None:
                         logit_bias = build_logit_adjust_bias(
                             val_details_raw, nb_classes=args.nb_classes,
                             strength=float(strength), clip=args.logit_adjust_clip,
                         )
-                        test_header += f'-cal{float(strength):g}'
-
-                    test_stats, test_details = evaluate(
-                        args, data_loader_test, model, device,
-                        header=test_header + ':', metrics=metrics,
-                        return_details=True, logit_bias=logit_bias,
-                    )
-                    _add_selection_metrics(test_stats, test_details, args)
+                        val_stats_for_select, val_details_for_select = evaluate(
+                            args, data_loader_val, model, device,
+                            header=f'Adapter-Val-Cal-E{ep}-s{scale:g}-b{beta:g}-cal{float(strength):g}:',
+                            metrics=metrics, return_details=True, logit_bias=logit_bias,
+                        )
+                        _add_selection_metrics(
+                            val_stats_for_select, val_details_for_select, args
+                        )
 
                     row = {
                         'epoch': ep,
@@ -3031,21 +3184,29 @@ def _run_adapter_strength_calibration(args, model, data_loader_val, data_loader_
                         'front_beta': float(beta),
                         'calib_strength': '' if strength is None else float(strength),
                         'source_output_dir': old_output_dir,
+                        'test_used_for_selection': 0,
                     }
-                    _flatten_eval_row('val', val_stats_raw, row)
-                    _flatten_eval_row('test', test_stats, row)
-                    _add_per_class_to_row('val', val_details_raw, row)
-                    _add_per_class_to_row('test', test_details, row)
+                    _flatten_eval_row('val', val_stats_for_select, row)
+                    _add_per_class_to_row('val', val_details_for_select, row)
                     rows.append(row)
 
-                    val_score = float(val_stats_raw.get('balanced_accuracy', val_stats_raw.get('accuracy', 0.0)))
+                    val_score = _select_metric(
+                        val_stats_for_select,
+                        getattr(args, 'adapter_eval_metric', 'balanced_accuracy'),
+                    )
+                    if val_score is None:
+                        continue
+                    val_score = float(val_score)
                     if best_item is None or val_score > best_item['select_score']:
                         best_item = {'select_score': val_score, 'row': row}
 
     if not rows:
         raise RuntimeError('adapter_calib_eval produced no rows; check checkpoints and tags.')
 
-    # Write all rows.
+    if best_item is None:
+        raise RuntimeError('adapter_calib_eval found no candidate with a valid validation score.')
+
+    # Write the validation-only sweep before touching the test set.
     out_csv = os.path.join(collect_dir, f'{safe_exp}_adapter_scale_sweep.csv')
     fieldnames = []
     for row in rows:
@@ -3057,14 +3218,56 @@ def _run_adapter_strength_calibration(args, model, data_loader_val, data_loader_
         writer.writeheader()
         writer.writerows(rows)
 
-    # Write selected row only.
-    selected_csv = os.path.join(collect_dir, f'{safe_exp}_adapter_scale_selected.csv')
-    with open(selected_csv, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerow(best_item['row'])
+    # Reload the single validation-selected configuration, then evaluate test once.
+    selected_row = dict(best_item['row'])
+    selected_row.update({
+        'protocol': 'adapter_calibration',
+        'selected_by': 'validation',
+        'test_used_for_selection': 0,
+    })
+    selected_epoch = int(selected_row['epoch'])
+    selected_scale = float(selected_row['lora_scale'])
+    selected_beta = float(selected_row['front_beta'])
+    selected_strength = selected_row.get('calib_strength', '')
+    selected_ckpt = os.path.join(ckpt_dir, f'epoch_{selected_epoch:03d}.pth')
+    _load_epoch_state_with_front_beta(
+        model,
+        selected_ckpt,
+        init_state_path=init_state_path,
+        front_beta=selected_beta,
+    )
+    set_lora_runtime_scale(model, selected_scale, verbose=False)
+    selected_val_stats, selected_val_details = evaluate(
+        args, data_loader_val, model, device,
+        header=f'Adapter-Selected-Val-E{selected_epoch}:',
+        metrics=metrics, return_details=True,
+    )
+    selected_bias = None
+    if selected_strength != '':
+        selected_bias = build_logit_adjust_bias(
+            selected_val_details,
+            nb_classes=args.nb_classes,
+            strength=float(selected_strength),
+            clip=args.logit_adjust_clip,
+        )
+    selected_test_stats, selected_test_details = evaluate(
+        args, data_loader_test, model, device,
+        header=f'Adapter-Selected-Test-E{selected_epoch}:',
+        metrics=metrics, return_details=True, logit_bias=selected_bias,
+    )
+    _add_selection_metrics(selected_test_stats, selected_test_details, args)
+    _flatten_eval_row('test', selected_test_stats, selected_row)
+    _add_per_class_to_row('test', selected_test_details, selected_row)
 
-    br = best_item['row']
+    # Write the selected configuration with its one final test result.
+    selected_csv = os.path.join(collect_dir, f'{safe_exp}_adapter_scale_selected.csv')
+    selected_fieldnames = list(selected_row.keys())
+    with open(selected_csv, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=selected_fieldnames)
+        writer.writeheader()
+        writer.writerow(selected_row)
+
+    br = selected_row
     print(f"[AdapterCalib] saved sweep: {out_csv}")
     print(f"[AdapterCalib] saved selected: {selected_csv}")
     print(
@@ -3073,6 +3276,7 @@ def _run_adapter_strength_calibration(args, model, data_loader_val, data_loader_
         f"val_BAcc={float(br.get('val_balanced_accuracy', float('nan'))) * 100:.2f}% "
         f"test_BAcc={float(br.get('test_balanced_accuracy', float('nan'))) * 100:.2f}%"
     )
+    _write_final_test_artifact(args, selected_row)
 
     model.load_state_dict(final_state, strict=False)
 
@@ -3260,6 +3464,8 @@ def _validate_lora_cli_contract(args):
 
 def main(args, ds_init):
 
+    _ensure_single_process_protocol(args)
+
     if ds_init is not None:
         utils.create_ds_config(args)
 
@@ -3414,6 +3620,11 @@ def main(args, ds_init):
     else:
         dataset_train, dataset_test, dataset_val, ch_names = get_datasets(args, dataset_info)
 
+    # get_datasets resolves the authoritative class count (including the
+    # binary one-logit convention), so protocol compatibility is checked here.
+    final_test_protocol = _select_final_test_protocol(args)
+    print(f"[Protocol] final test evaluator: {final_test_protocol}")
+
     save_split_integrity(
         args=args,
         dataset_train=dataset_train,
@@ -3483,7 +3694,14 @@ def main(args, ds_init):
         args, dataset_train, sampler_train
     )
 
-    if args.monitor_dynamics and args.eval_train_set and args.task_mod != 'Retrieval':
+    needs_train_eval_support = (
+        final_test_protocol == 'prototype'
+        and str(getattr(args, 'proto_source', 'train_eval')).lower() == 'train_eval'
+    )
+    if (
+        args.task_mod != 'Retrieval'
+        and ((args.monitor_dynamics and args.eval_train_set) or needs_train_eval_support)
+    ):
         data_loader_train_eval = _make_train_eval_loader(args, dataset_train)
     else:
         data_loader_train_eval = None
@@ -3557,6 +3775,8 @@ def main(args, ds_init):
             raise RuntimeError("--module_c_preflight_only requested, but automatic Module C search did not run.")
         print("[ModuleC] preflight-only verification completed; formal training was not started.")
         return
+
+    _prepare_final_test_artifact(args)
 
     # load the model
     model = get_models(args, ch_names, dataset_info['num_t'])
@@ -3650,6 +3870,10 @@ def main(args, ds_init):
     utils.auto_load_model(
         args=args, model=model, model_without_ddp=model_without_ddp,
         optimizer=optimizer, loss_scaler=loss_scaler)
+    # auto_load_model may advance start_epoch; re-run resume-sensitive
+    # protocol validation after that state transition.
+    final_test_protocol = _select_final_test_protocol(args)
+    _ensure_resume_controller_state(args, module_e_controller)
 
     # ---------------------------monitor init state--------------------------------
     monitor_init_state = None
@@ -3689,6 +3913,13 @@ def main(args, ds_init):
             img_features_train_all, img_features_test_all, config=args, loss_scaler=loss_scaler, 
             logger=args.logger, lr_schedule_values=lr_schedule_values, ch_names=ch_names,
             wd_schedule_values=wd_schedule_values, num_training_steps_per_epoch=num_training_steps_per_epoch)
+        retrieval_final_row = dict(results[0])
+        retrieval_final_row.update({
+            'protocol': 'retrieval_fixed_final_epoch',
+            'selected_by': 'predeclared_epoch_count',
+            'test_used_for_selection': 0,
+        })
+        _write_final_test_artifact(args, retrieval_final_row)
         
         # Save results to a CSV file
         results_dir = os.path.join(args.output_dir, current_time)
@@ -3702,10 +3933,10 @@ def main(args, ds_init):
             print(f'Results saved to {results_file}')
     else:
         start_time = time.time()
-        max_accuracy = 0.0
-        max_accuracy_test = 0.0
-        max_r2 = 0.0
-        max_r2_test = 0.0
+        max_accuracy = -float('inf')
+        max_r2 = -float('inf')
+        best_model_state = None
+        best_model_epoch = None
 
         plateau_best = -float('inf')
         plateau_bad_epochs = 0
@@ -3723,6 +3954,56 @@ def main(args, ds_init):
             metrics = ["accuracy", 'balanced_accuracy', 'pr_auc', 'roc_auc']
 
         module_d_latest_eval_row = None
+
+        if (
+            int(getattr(args, 'start_epoch', 0)) > 0
+            and data_loader_val is not None
+            and final_test_protocol in ('standard', 'prototype')
+        ):
+            resumed_training_state = _get_model_cpu_state(model_without_ddp)
+            resumed_best_state, resumed_best_epoch = _load_validation_best_checkpoint(args)
+            try:
+                model_without_ddp.load_state_dict(resumed_best_state, strict=True)
+                resumed_val_stats, resumed_val_details = evaluate(
+                    args,
+                    data_loader_val,
+                    model,
+                    device,
+                    header='Resume-Best-Val:',
+                    ch_names=ch_names,
+                    metrics=metrics,
+                    return_details=True,
+                )
+                _add_selection_metrics(
+                    resumed_val_stats, resumed_val_details, args
+                )
+                if args.task_mod == 'Classification':
+                    resumed_score = _select_metric(
+                        resumed_val_stats, args.best_metric
+                    )
+                    if resumed_score is None:
+                        raise RuntimeError(
+                            f'Resumed validation-best checkpoint has no metric '
+                            f'{args.best_metric!r}.'
+                        )
+                    max_accuracy = float(resumed_score)
+                else:
+                    resumed_score = resumed_val_stats.get('R2_Score', None)
+                    if resumed_score is None:
+                        raise RuntimeError(
+                            'Resumed validation-best checkpoint has no R2_Score.'
+                        )
+                    max_r2 = float(resumed_score)
+                best_model_state = _get_model_cpu_state(model_without_ddp)
+                best_model_epoch = resumed_best_epoch
+                print(
+                    f'[Protocol] restored prior validation winner '
+                    f'({best_model_epoch}) with score={float(resumed_score):.8f}'
+                )
+            finally:
+                model_without_ddp.load_state_dict(
+                    resumed_training_state, strict=True
+                )
 
         for epoch in range(args.start_epoch, args.epochs):
             epoch_id = epoch + 1
@@ -3809,7 +4090,6 @@ def main(args, ds_init):
             # -------------------------------evaluation--------------------------------
             train_eval_stats, train_eval_details = None, None
             val_stats, val_details = None, None
-            test_stats, test_details = None, None
 
             eval_restore_state = None
             eval_uses_temp_state = False
@@ -3842,7 +4122,11 @@ def main(args, ds_init):
                 )
 
             if data_loader_val is not None:
-                if args.monitor_dynamics or getattr(args, 'module_d_sbr_eval', False):
+                if (
+                    args.monitor_dynamics
+                    or getattr(args, 'module_d_sbr_eval', False)
+                    or final_test_protocol == 'boundary_anchor'
+                ):
                     val_stats, val_details = evaluate(
                         args,
                         data_loader_val,
@@ -3853,60 +4137,8 @@ def main(args, ds_init):
                         metrics=metrics,
                         return_details=True
                     )
-                    test_logit_bias = None
-                    test_header = 'Test:'
-                    if args.eval_logit_adjust and args.task_mod == 'Classification' and val_details is not None:
-                        test_logit_bias = build_logit_adjust_bias(
-                            val_details=val_details,
-                            nb_classes=args.nb_classes,
-                            strength=args.logit_adjust_strength,
-                            clip=args.logit_adjust_clip,
-                        )
-                        if test_logit_bias is not None:
-                            test_header = 'Test-Calib:'
-
-                    test_stats, test_details = evaluate(
-                        args,
-                        data_loader_test,
-                        model,
-                        device,
-                        header=test_header,
-                        ch_names=ch_names,
-                        metrics=metrics,
-                        return_details=True,
-                        logit_bias=test_logit_bias
-                    )
                     _add_selection_metrics(train_eval_stats, train_eval_details, args)
                     _add_selection_metrics(val_stats, val_details, args)
-                    _add_selection_metrics(test_stats, test_details, args)
-
-                    if (
-                        getattr(args, 'proto_eval', False)
-                        and args.task_mod == 'Classification'
-                        and args.nb_classes > 1
-                    ):
-                        proto_source = str(getattr(args, 'proto_source', 'train_eval')).lower()
-                        support_loader = data_loader_train_eval if proto_source == 'train_eval' else data_loader_val
-                        proto_stats, proto_details = _evaluate_logit_prototype_fusion(
-                            args=args,
-                            support_loader=support_loader,
-                            query_loader=data_loader_test,
-                            model=model,
-                            device=device,
-                            metrics=metrics,
-                            header='Proto-Test:',
-                        )
-                        _add_selection_metrics(proto_stats, proto_details, args)
-                        _merge_prefixed_scalar_stats(test_stats, 'proto', proto_stats)
-
-                    if args.task_mod == 'Classification':
-                        module_d_latest_eval_row = module_d_eval_row_from_details(
-                            val_stats=val_stats,
-                            val_details=val_details,
-                            test_stats=test_stats,
-                            test_details=test_details,
-                            source=f"epoch_{epoch_id:03d}",
-                        )
                 else:
                     val_stats = evaluate(
                         args,
@@ -3917,67 +4149,16 @@ def main(args, ds_init):
                         ch_names=ch_names,
                         metrics=metrics
                     )
-                    test_stats = evaluate(
-                        args,
-                        data_loader_test,
-                        model,
-                        device,
-                        header='Test:',
-                        ch_names=ch_names,
-                        metrics=metrics
-                    )
 
-                if eval_uses_temp_state and eval_restore_state is not None:
-                    if getattr(args, 'save_eval_state_ckpt', False) and args.monitor_dynamics:
-                        _save_monitor_checkpoint(
-                            args=args,
-                            model=model_without_ddp,
-                            epoch=epoch_id,
-                            tag=f"epoch_{epoch_id:03d}"
-                        )
-                        print(f"[EvalState] saved temporary eval state to monitor checkpoint epoch_{epoch_id:03d}.pth")
-                    model_without_ddp.load_state_dict(eval_restore_state, strict=False)
-                    print('[EvalState] restored current training weights after temporary eval state')
-
-                # -------------------------------print main metrics--------------------------------
-                if args.task_mod == 'Classification':
-                    val_acc = val_stats.get("accuracy", float("nan"))
-                    test_acc = test_stats.get("accuracy", float("nan"))
-                    val_bacc = val_stats.get("balanced_accuracy", float("nan"))
-                    test_bacc = test_stats.get("balanced_accuracy", float("nan"))
-
-                    print(f"Accuracy on the val set: {val_acc * 100:.2f}%")
-                    print(f"Accuracy on the test set: {test_acc * 100:.2f}%")
-                    print(f"BAcc on the val set: {val_bacc * 100:.2f}%")
-                    print(f"BAcc on the test set: {test_bacc * 100:.2f}%")
-                else:
-                    print(f"R2_Score on the val set: {val_stats['R2_Score']:.2f}")
-                    print(f"R2_Score on the test set: {test_stats['R2_Score']:.2f}")
-
-                # -------------------------------save best checkpoint--------------------------------
+                # -------------------------------validation-only model selection--------------------------------
+                best_state_updated = False
                 if args.task_mod == 'Classification':
                     current_val_metric = _select_metric(val_stats, args.best_metric)
-                    current_test_metric = _corresponding_test_metric_for_selection(test_stats, args.best_metric)
-
                     if current_val_metric is not None and max_accuracy < current_val_metric:
                         max_accuracy = current_val_metric
-
-                        if args.output_dir and args.save_ckpt:
-                            utils.save_model(
-                                args=args,
-                                model=model,
-                                model_without_ddp=model_without_ddp,
-                                optimizer=optimizer,
-                                loss_scaler=loss_scaler,
-                                epoch="best"
-                            )
-
-                        max_accuracy_test = current_test_metric
-
-                    print(
-                        f"Best metric [{args.best_metric}] val: {max_accuracy * 100:.2f} %, "
-                        f"corresponding test: {max_accuracy_test * 100:.2f} %"
-                    )
+                        best_model_state = _get_model_cpu_state(model_without_ddp)
+                        best_model_epoch = epoch_id
+                        best_state_updated = True
 
                     boundary_anchor_best, boundary_anchor_epoch = _maybe_update_boundary_anchor(
                         args=args,
@@ -3985,29 +4166,72 @@ def main(args, ds_init):
                         epoch_id=epoch_id,
                         val_stats=val_stats,
                         val_details=val_details,
-                        test_stats=test_stats,
-                        test_details=test_details,
                         current_best_score=boundary_anchor_best,
                         current_best_epoch=boundary_anchor_epoch,
                     )
-
                 else:
-                    if max_r2 < val_stats["R2_Score"]:
-                        max_r2 = val_stats["R2_Score"]
+                    current_val_metric = val_stats.get("R2_Score", None)
+                    if current_val_metric is not None and max_r2 < current_val_metric:
+                        max_r2 = current_val_metric
+                        best_model_state = _get_model_cpu_state(model_without_ddp)
+                        best_model_epoch = epoch_id
+                        best_state_updated = True
 
-                        if args.output_dir and args.save_ckpt:
-                            utils.save_model(
-                                args=args,
-                                model=model,
-                                model_without_ddp=model_without_ddp,
-                                optimizer=optimizer,
-                                loss_scaler=loss_scaler,
-                                epoch="best"
-                            )
+                if eval_uses_temp_state and eval_restore_state is not None:
+                    if (
+                        args.monitor_dynamics
+                        and (
+                            getattr(args, 'save_eval_state_ckpt', False)
+                            or final_test_protocol == 'snapshot'
+                        )
+                    ):
+                        _save_monitor_checkpoint(
+                            args=args,
+                            model=model_without_ddp,
+                            epoch=epoch_id,
+                            tag=f"epoch_{epoch_id:03d}"
+                        )
+                        print(f"[EvalState] saved temporary eval state to monitor checkpoint epoch_{epoch_id:03d}.pth")
+                    model_without_ddp.load_state_dict(eval_restore_state, strict=True)
+                    print('[EvalState] restored current training weights after temporary validation')
 
-                        max_r2_test = test_stats["R2_Score"]
+                if best_state_updated and args.output_dir and args.save_ckpt:
+                    # The best checkpoint is an evaluation artifact. Exact
+                    # training resume uses checkpoint.pth; keeping optimizer
+                    # moments out of checkpoint-best.pth prevents a temporary
+                    # averaged/interpolated state from pretending to be a
+                    # resumable training state.
+                    utils.save_on_master(
+                        {
+                            'model': best_model_state,
+                            'epoch': 'best',
+                            'selected_epoch': int(best_model_epoch),
+                            'selected_by': 'validation',
+                            'selection_metric': (
+                                args.best_metric
+                                if args.task_mod == 'Classification'
+                                else 'R2_Score'
+                            ),
+                            'selection_score': float(current_val_metric),
+                            'optimizer_state_included': False,
+                            'args': args,
+                        },
+                        Path(args.output_dir) / 'checkpoint-best.pth',
+                    )
 
-                    print(f'Max R2_Score val: {max_r2:.2f}, max R2_Score test: {max_r2_test:.2f}')
+                # -------------------------------print validation metrics--------------------------------
+                if args.task_mod == 'Classification':
+                    val_acc = val_stats.get("accuracy", float("nan"))
+                    val_bacc = val_stats.get("balanced_accuracy", float("nan"))
+                    print(f"Accuracy on the val set: {val_acc * 100:.2f}%")
+                    print(f"BAcc on the val set: {val_bacc * 100:.2f}%")
+                    print(
+                        f"Best metric [{args.best_metric}] on validation: "
+                        f"{max_accuracy * 100:.2f}% at epoch {best_model_epoch}"
+                    )
+                else:
+                    print(f"R2_Score on the val set: {val_stats['R2_Score']:.2f}")
+                    print(f"Best validation R2: {max_r2:.2f} at epoch {best_model_epoch}")
 
                 # -------------------------------plateau-aware LR--------------------------------
                 if args.lr_schedule_type == 'plateau' and args.task_mod == 'Classification':
@@ -4039,7 +4263,6 @@ def main(args, ds_init):
                 log_stats = {
                     **{f'train_{k}': v for k, v in train_stats.items()},
                     **{f'val_{k}': v for k, v in val_stats.items()},
-                    **{f'test_{k}': v for k, v in test_stats.items()},
                     'epoch': epoch,
                     'epoch_id': epoch_id,
                     'n_parameters': n_parameters
@@ -4090,7 +4313,6 @@ def main(args, ds_init):
                 _add_prefixed_scalars(epoch_row, "train_loop", train_stats)
                 _add_prefixed_scalars(epoch_row, "train_eval", train_eval_stats)
                 _add_prefixed_scalars(epoch_row, "val", val_stats)
-                _add_prefixed_scalars(epoch_row, "test", test_stats)
 
                 # 过拟合 gap：优先看 balanced_accuracy，没有就退回 accuracy
                 if train_eval_stats is not None and val_stats is not None:
@@ -4098,12 +4320,6 @@ def main(args, ds_init):
                     val_main = _select_metric(val_stats, args.best_metric)
                     if train_eval_main is not None and val_main is not None:
                         epoch_row[f"train_val_gap_{args.best_metric}"] = train_eval_main - val_main
-
-                if train_eval_stats is not None and test_stats is not None:
-                    train_eval_main = _select_metric(train_eval_stats, args.best_metric)
-                    test_main = _select_metric(test_stats, args.best_metric)
-                    if train_eval_main is not None and test_main is not None:
-                        epoch_row[f"train_test_gap_{args.best_metric}"] = train_eval_main - test_main
 
                 _append_csv_row(metrics_csv, epoch_row)
 
@@ -4115,7 +4331,6 @@ def main(args, ds_init):
                 ):
                     _save_split_details(args, epoch_id, "train_eval", train_eval_details)
                     _save_split_details(args, epoch_id, "val", val_details)
-                    _save_split_details(args, epoch_id, "test", test_details)
 
                 # 保存权重 delta 谱分析
                 if (
@@ -4148,67 +4363,144 @@ def main(args, ds_init):
                 with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                     f.write(json.dumps(_json_safe_dict(log_stats)) + "\n")
 
-        if (
-            getattr(args, 'snapshot_eval', False)
-            and args.task_mod == 'Classification'
-            and data_loader_val is not None
-            and data_loader_test is not None
-            and utils.is_main_process()
-        ):
-            _run_snapshot_ensemble_report(
-                args=args,
-                model=model_without_ddp,
-                data_loader_val=data_loader_val,
-                data_loader_test=data_loader_test,
-                device=device,
-                metrics=metrics,
-            )
+        # -------------------------------single final test protocol--------------------------------
+        lifecycle_selection_row = None
+        final_evaluation_row = None
+        if data_loader_val is not None and data_loader_test is not None:
+            if final_test_protocol in ('standard', 'prototype'):
+                if best_model_state is None:
+                    raise RuntimeError(
+                        'No validation-selected model state is available for final test evaluation.'
+                    )
+                model_without_ddp.load_state_dict(best_model_state, strict=True)
+                final_val_stats, final_val_details = evaluate(
+                    args,
+                    data_loader_val,
+                    model,
+                    device,
+                    header=f'Final-Selected-Val-E{best_model_epoch}:',
+                    ch_names=ch_names,
+                    metrics=metrics,
+                    return_details=True,
+                )
+                _add_selection_metrics(final_val_stats, final_val_details, args)
 
-        if (
-            getattr(args, 'boundary_anchor_eval', False)
-            and args.task_mod == 'Classification'
-            and data_loader_val is not None
-            and data_loader_test is not None
-            and utils.is_main_process()
-        ):
-            _run_boundary_anchor_final_eval(
-                args=args,
-                model=model_without_ddp,
-                data_loader_val=data_loader_val,
-                data_loader_test=data_loader_test,
-                device=device,
-                metrics=metrics,
-            )
-
-        if (
-            getattr(args, 'adaptive_swa_eval', False)
-            and args.task_mod == 'Classification'
-            and data_loader_val is not None
-            and data_loader_test is not None
-            and utils.is_main_process()
-        ):
-            def _apply_module_a_eval_state_adjust(eval_model):
-                if _should_apply_cbra_eval_front_beta(args, monitor_init_state):
-                    _apply_cbra_front_beta_state(
-                        eval_model,
-                        monitor_init_state,
-                        getattr(args, 'cbra_eval_front_beta', 1.0),
+                if final_test_protocol == 'prototype':
+                    proto_source = str(getattr(args, 'proto_source', 'train_eval')).lower()
+                    support_loader = (
+                        data_loader_train_eval
+                        if proto_source == 'train_eval'
+                        else data_loader_val
+                    )
+                    if support_loader is None:
+                        raise RuntimeError(
+                            f'Prototype final evaluation has no {proto_source} support loader.'
+                        )
+                    final_test_stats, final_test_details = _evaluate_logit_prototype_fusion(
+                        args=args,
+                        support_loader=support_loader,
+                        query_loader=data_loader_test,
+                        model=model,
+                        device=device,
+                        metrics=metrics,
+                        header='Final-Proto-Test:',
+                    )
+                else:
+                    final_logit_bias = None
+                    final_test_header = 'Final-Test:'
+                    if (
+                        args.eval_logit_adjust
+                        and args.task_mod == 'Classification'
+                        and final_val_details is not None
+                    ):
+                        final_logit_bias = build_logit_adjust_bias(
+                            val_details=final_val_details,
+                            nb_classes=args.nb_classes,
+                            strength=args.logit_adjust_strength,
+                            clip=args.logit_adjust_clip,
+                        )
+                        if final_logit_bias is not None:
+                            final_test_header = 'Final-Test-Calib:'
+                    final_test_stats, final_test_details = evaluate(
+                        args,
+                        data_loader_test,
+                        model,
+                        device,
+                        header=final_test_header,
+                        ch_names=ch_names,
+                        metrics=metrics,
+                        return_details=True,
+                        logit_bias=final_logit_bias,
                     )
 
-            lifecycle_selection_row = run_lifecycle_window_search(
-                args=args,
-                model=model_without_ddp,
-                data_loader_val=data_loader_val,
-                data_loader_test=data_loader_test,
-                device=device,
-                metrics=metrics,
-                snapshots=adaptive_swa_snapshots,
-                evaluate_fn=evaluate,
-                build_logit_adjust_bias_fn=build_logit_adjust_bias,
-                eval_state_adjust_fn=_apply_module_a_eval_state_adjust,
-            )
-        else:
-            lifecycle_selection_row = None
+                _add_selection_metrics(final_test_stats, final_test_details, args)
+                final_evaluation_row = {
+                    'protocol': final_test_protocol,
+                    'selected_by': 'validation',
+                    'selected_epoch': int(best_model_epoch),
+                    'test_used_for_selection': 0,
+                }
+                _flatten_eval_row('val', final_val_stats, final_evaluation_row)
+                _flatten_eval_row('test', final_test_stats, final_evaluation_row)
+                _add_per_class_to_row('val', final_val_details, final_evaluation_row)
+                _add_per_class_to_row('test', final_test_details, final_evaluation_row)
+                if args.monitor_dynamics and utils.is_main_process():
+                    _save_split_details(
+                        args, best_model_epoch, 'final_test', final_test_details
+                    )
+
+            elif final_test_protocol == 'snapshot' and utils.is_main_process():
+                final_evaluation_row = _run_snapshot_ensemble_report(
+                    args=args,
+                    model=model_without_ddp,
+                    data_loader_val=data_loader_val,
+                    data_loader_test=data_loader_test,
+                    device=device,
+                    metrics=metrics,
+                )
+            elif final_test_protocol == 'boundary_anchor' and utils.is_main_process():
+                final_evaluation_row = _run_boundary_anchor_final_eval(
+                    args=args,
+                    model=model_without_ddp,
+                    data_loader_val=data_loader_val,
+                    data_loader_test=data_loader_test,
+                    device=device,
+                    metrics=metrics,
+                )
+            elif final_test_protocol == 'adaptive_swa' and utils.is_main_process():
+                def _apply_module_a_eval_state_adjust(eval_model):
+                    if _should_apply_cbra_eval_front_beta(args, monitor_init_state):
+                        _apply_cbra_front_beta_state(
+                            eval_model,
+                            monitor_init_state,
+                            getattr(args, 'cbra_eval_front_beta', 1.0),
+                        )
+
+                lifecycle_selection_row = run_lifecycle_window_search(
+                    args=args,
+                    model=model_without_ddp,
+                    data_loader_val=data_loader_val,
+                    data_loader_test=data_loader_test,
+                    device=device,
+                    metrics=metrics,
+                    snapshots=adaptive_swa_snapshots,
+                    evaluate_fn=evaluate,
+                    build_logit_adjust_bias_fn=build_logit_adjust_bias,
+                    eval_state_adjust_fn=_apply_module_a_eval_state_adjust,
+                )
+                final_evaluation_row = lifecycle_selection_row
+
+        final_evaluation_row = _require_final_test_result(
+            final_test_protocol,
+            final_evaluation_row,
+            data_loader_test is not None,
+        )
+        if final_evaluation_row is not None:
+            final_evaluation_row.setdefault('protocol', final_test_protocol)
+            final_evaluation_row.setdefault('selected_by', 'validation')
+            final_evaluation_row.setdefault('test_used_for_selection', 0)
+        _write_final_test_artifact(args, final_evaluation_row)
+        module_d_latest_eval_row = final_evaluation_row
 
         module_d_adapted_row = lifecycle_selection_row if lifecycle_selection_row is not None else module_d_latest_eval_row
         if args.task_mod == 'Classification' and utils.is_main_process():

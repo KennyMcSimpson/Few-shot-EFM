@@ -811,6 +811,18 @@ def evaluate(args, data_loader, model, device, header='Test:', ch_names=None, me
     pred = torch.cat(pred_list, dim=0).numpy()
     true = torch.cat(true_list, dim=0).numpy()
 
+    # Every rank must select checkpoints from the same complete validation
+    # set. DistributedSampler partitions examples, so local arrays alone would
+    # produce rank-specific metrics and potentially different best epochs.
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        world_size = torch.distributed.get_world_size()
+        gathered_pred = [None for _ in range(world_size)]
+        gathered_true = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(gathered_pred, pred)
+        torch.distributed.all_gather_object(gathered_true, true)
+        pred = np.concatenate(gathered_pred, axis=0)
+        true = np.concatenate(gathered_true, axis=0)
+
     ret = utils.get_metrics(pred, true, metrics, is_binary, 0.5)
     ret['loss'] = metric_logger.loss.global_avg
 
@@ -1133,14 +1145,6 @@ def main_train_loop(args, current_time, eeg_model,
     logger = wandb_logger(config) if logger else None
     logger.watch(eeg_model,logger) 
     train_losses, train_accuracies = [], []
-    test_losses, test_accuracies = [], []
-    v2_accs = []
-    v4_accs = []
-    v10_accs = []
-
-    best_accuracy = 0.0
-    best_epoch_info = {}
-    results = []  # List to store results for each epoch
     for epoch in range(config.epochs):
         # Train the model
         start_steps=epoch * num_training_steps_per_epoch
@@ -1159,110 +1163,74 @@ def main_train_loop(args, current_time, eeg_model,
             print(f"model saved in {file_path}!")
         train_losses.append(train_loss)
         train_accuracies.append(train_accuracy)
-        # Evaluate the model
-        test_loss, test_accuracy, top5_acc = evaluate_model(args, eeg_model, test_dataloader, device, img_features_test_all, k=200, config=config, ch_names=ch_names)
-        _, v2_acc, _ = evaluate_model(args, eeg_model, test_dataloader, device, img_features_test_all, k=2, config=config, ch_names=ch_names)
-        _, v4_acc, _ = evaluate_model(args, eeg_model, test_dataloader, device, img_features_test_all, k=4, config=config, ch_names=ch_names)
-        _, v10_acc, _ = evaluate_model(args, eeg_model, test_dataloader, device, img_features_test_all, k=10, config=config, ch_names=ch_names)
-        _, v50_acc, v50_top5_acc = evaluate_model(args, eeg_model, test_dataloader, device, img_features_test_all, k=50, config=config, ch_names=ch_names)
-        _, v100_acc, v100_top5_acc = evaluate_model(args, eeg_model, test_dataloader, device, img_features_test_all, k=100, config=config, ch_names=ch_names)
-        test_losses.append(test_loss)
-        test_accuracies.append(test_accuracy)
-        v2_accs.append(v2_acc)
-        v4_accs.append(v4_acc)
-        v10_accs.append(v10_acc)
-        
-        # Append results for this epoch
-        epoch_results = {
-        "epoch": epoch + 1,
+        logger.log({
+            "Train Loss": train_loss,
+            "Train Accuracy": train_accuracy,
+            "Epoch": epoch
+        })
+
+        print(f"Epoch {epoch + 1}/{config.epochs} - Train Loss: {train_loss:.4f}, Train Accuracy: {train_accuracy:.4f}")
+
+    # Retrieval has no validation split. Train for the configured number of
+    # epochs, then run each test protocol exactly once on the final model.
+    test_loss, test_accuracy, top5_acc = evaluate_model(args, eeg_model, test_dataloader, device, img_features_test_all, k=200, config=config, ch_names=ch_names)
+    _, v2_acc, _ = evaluate_model(args, eeg_model, test_dataloader, device, img_features_test_all, k=2, config=config, ch_names=ch_names)
+    _, v4_acc, _ = evaluate_model(args, eeg_model, test_dataloader, device, img_features_test_all, k=4, config=config, ch_names=ch_names)
+    _, v10_acc, _ = evaluate_model(args, eeg_model, test_dataloader, device, img_features_test_all, k=10, config=config, ch_names=ch_names)
+    _, v50_acc, v50_top5_acc = evaluate_model(args, eeg_model, test_dataloader, device, img_features_test_all, k=50, config=config, ch_names=ch_names)
+    _, v100_acc, v100_top5_acc = evaluate_model(args, eeg_model, test_dataloader, device, img_features_test_all, k=100, config=config, ch_names=ch_names)
+
+    final_results = {
+        "epoch": config.epochs,
         "test_loss": test_loss,
         "test_accuracy": test_accuracy,
         "v2_acc": v2_acc,
         "v4_acc": v4_acc,
         "v10_acc": v10_acc,
-        "top5_acc":top5_acc,
+        "top5_acc": top5_acc,
         "v50_acc": v50_acc,
         "v100_acc": v100_acc,
-        "v50_top5_acc":v50_top5_acc,
-        "v100_top5_acc": v100_top5_acc
-        }
+        "v50_top5_acc": v50_top5_acc,
+        "v100_top5_acc": v100_top5_acc,
+    }
+    results = [final_results]
 
-        results.append(epoch_results)
-        # If the test accuracy of the current epoch is the best, save the model and related information
-        if test_accuracy > best_accuracy:
-            best_accuracy = test_accuracy
-            # best_model_weights = model.state_dict().copy()
-            
-            best_epoch_info = {
-                "epoch": epoch + 1,
-                "train_loss": train_loss,
-                "train_accuracy": train_accuracy,
-                "test_loss": test_loss,
-                "test_accuracy": test_accuracy,
-                "v2_acc":v2_acc,
-                "v4_acc":v4_acc,
-                "v10_acc":v10_acc
-            }
-        logger.log({
-            "Train Loss": train_loss,
-            "Train Accuracy": train_accuracy,
-            "Test Loss": test_loss,
-            "Test Accuracy": test_accuracy,
-            "v2 Accuracy": v2_acc,
-            "v4 Accuracy": v4_acc,
-            "v10 Accuracy": v10_acc,
-            "Epoch": epoch
-        })
+    logger.log({
+        "Final Test Loss": test_loss,
+        "Final Test Accuracy": test_accuracy,
+        "Final v2 Accuracy": v2_acc,
+        "Final v4 Accuracy": v4_acc,
+        "Final v10 Accuracy": v10_acc,
+        "Final v50 Accuracy": v50_acc,
+        "Final v100 Accuracy": v100_acc,
+        "Epoch": config.epochs,
+    })
 
-        print(f"Epoch {epoch + 1}/{config.epochs} - Train Loss: {train_loss:.4f}, Train Accuracy: {train_accuracy:.4f}, Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.4f}, Top5 Accuracy: {top5_acc:.4f}")
-        print(f"Epoch {epoch + 1}/{config.epochs} - v2 Accuracy:{v2_acc} - v4 Accuracy:{v4_acc} - v10 Accuracy:{v10_acc} - v50 Accuracy:{v50_acc} - v100 Accuracy:{v100_acc}")
-  
-    # # Load the best model weights
-    # model.load_state_dict(best_model_weights)
-
-    # Create 5 subplots
-    fig, axs = plt.subplots(3, 2, figsize=(10, 15))
+    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
 
     # Loss curve
-    axs[0, 0].plot(train_losses, label='Train Loss')
-    axs[0, 0].plot(test_losses, label='Test Loss')
-    axs[0, 0].legend()
-    axs[0, 0].set_title("Loss Curve")
+    axs[0].plot(train_losses, label='Train Loss')
+    axs[0].legend()
+    axs[0].set_title("Training Loss Curve")
 
     # Overall accuracy curve
-    axs[0, 1].plot(train_accuracies, label='Train Accuracy')
-    axs[0, 1].plot(test_accuracies, label='Test Accuracy')
-    axs[0, 1].legend()
-    axs[0, 1].set_title("Accuracy Curve")
-
-    # The following are the three new plots you added, assuming you've already calculated the corresponding accuracies
-    # 2-class accuracy plot
-    axs[1, 0].plot(v2_accs, label='2-class Accuracy')
-    axs[1, 0].legend()
-    axs[1, 0].set_title("2-Class Accuracy Curve")
-
-    # 4-class accuracy plot
-    axs[1, 1].plot(v4_accs, label='4-class Accuracy')
-    axs[1, 1].legend()
-    axs[1, 1].set_title("4-Class Accuracy Curve")
-
-    # 10-class accuracy plot
-    axs[2, 0].plot(v10_accs, label='10-class Accuracy')
-    axs[2, 0].legend()
-    axs[2, 0].set_title("10-Class Accuracy Curve")
+    axs[1].plot(train_accuracies, label='Train Accuracy')
+    axs[1].legend()
+    axs[1].set_title("Training Accuracy Curve")
 
     # Construct the string information for annotation
-    info_text = (f"Best Model Info (from Epoch {best_epoch_info['epoch']}):\n"
-                f"Train Loss: {best_epoch_info['train_loss']:.4f}\n"
-                f"Train Accuracy: {best_epoch_info['train_accuracy']:.4f}\n"
-                f"Test Loss: {best_epoch_info['test_loss']:.4f}\n"
-                f"Test Accuracy: {best_epoch_info['test_accuracy']:.4f}\n"
-                f"v2_acc:{best_epoch_info['v2_acc']:.4f}\n"
-                f"v4_acc:{best_epoch_info['v4_acc']:.4f}\n"
-                f"v10_acc:{best_epoch_info['v10_acc']:.4f}")
+    info_text = (f"Final Model Test (after Epoch {config.epochs}):\n"
+                f"Test Loss: {test_loss:.4f}\n"
+                f"Test Accuracy: {test_accuracy:.4f}\n"
+                f"Top5 Accuracy: {top5_acc:.4f}\n"
+                f"v2_acc: {v2_acc:.4f}\n"
+                f"v4_acc: {v4_acc:.4f}\n"
+                f"v10_acc: {v10_acc:.4f}\n"
+                f"v50_acc: {v50_acc:.4f}\n"
+                f"v100_acc: {v100_acc:.4f}")
 
-    axs[2, 1].axis('off')  
-    axs[2, 1].text(0.5, 0.5, info_text, fontsize=10, ha='center', va='center', transform=axs[2, 1].transAxes)
+    axs[2].axis('off')
+    axs[2].text(0.5, 0.5, info_text, fontsize=10, ha='center', va='center', transform=axs[2].transAxes)
 
     plt.tight_layout()
 

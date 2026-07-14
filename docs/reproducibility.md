@@ -25,6 +25,28 @@ Adapter and checkpoint selection must use validation data only. Test metrics are
 for final evaluation and must not feed Module A, Module C, early stopping, or
 hyperparameter choice.
 
+The training loop enforces this boundary: epoch logs contain training and
+validation metrics only. After validation has fixed the model state, one final
+test protocol is executed and written to
+`diagnostics/final_test_metrics.json`. Standard best-checkpoint evaluation,
+snapshot ensemble, boundary anchor, adaptive SWA, prototype evaluation, and
+offline adapter calibration are mutually exclusive within one run. Snapshot
+ranking rejects training- or test-prefixed metrics.
+
+Retrieval currently has no validation split. Its epoch count is therefore a
+predeclared protocol choice: it trains for exactly that count and runs the test
+suite only after the last epoch. It does not select or report a "best" epoch
+from test accuracy.
+
+Split-integrity checks may compare test sample identities with train/validation
+to detect overlap, but they deliberately withhold test label counts until final
+evaluation.
+
+The current entrypoint is fail-closed to one process. Native DDP and DeepSpeed
+launches are rejected because their selection lifecycle and partitioned
+checkpoint semantics are not yet implemented end to end; a multi-rank command
+must not silently produce rank-local validation decisions.
+
 ## Portable experiment manifests
 
 `experiment_manifests/module_c_exhaustive_seed0_4datasets.json` is the checked
@@ -77,6 +99,14 @@ optimizer parameter groups and state, scheduler/scaler state, epoch position,
 and active adaptation-controller state. The code validates the optimizer schema
 before loading a legacy optimizer state. A mismatch is a deliberate failure,
 not a reason to silently discard state.
+
+`checkpoint.pth` is the training-resume checkpoint. `checkpoint-best.pth` is a
+weights-only validation-selection artifact with a numeric selected epoch; it is
+required to preserve model selection across a resumed standard run. Legacy
+best checkpoints without that provenance are rejected. Resume is also rejected
+for in-memory adaptive/adapter SWA, CBraMod temporary interpolation, plateau
+scheduling, and active Module E controller runs until those controller states
+are persisted exactly.
 
 When changing the adapter subset or other trainable topology, start a new run
 from weights and document it as initialization from a prior checkpoint rather

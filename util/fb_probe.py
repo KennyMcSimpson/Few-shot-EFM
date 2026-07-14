@@ -101,13 +101,16 @@ def save_split_integrity(args, dataset_train=None, dataset_val=None, dataset_tes
         json_path=os.path.join(root,f"{split}.json") if root else ""; records=_read_json_records(json_path,max_records)
         labels=[]; ids=[]
         for r in records:
-            lab=_first_label(r)
-            if lab is not None: labels.append(lab)
+            # Test identities may be inspected for overlap, but test labels
+            # remain sealed until the one final evaluation.
+            if split!="test":
+                lab=_first_label(r)
+                if lab is not None: labels.append(lab)
             rid=_record_id(r)
             if rid: ids.append(rid)
         ids_by_split[split]=set(ids); counts=Counter(labels)
         for lab,cnt in sorted(counts.items(),key=lambda x:str(x[0])): class_rows.append({"split":split,"label":lab,"count":cnt,"source":"json"})
-        split_rows.append({"split":split,"dataset_len":_dataset_len(ds),"json_path":json_path,"json_records_read":len(records),"json_label_count_total":sum(counts.values()),"json_unique_ids":len(ids_by_split[split]),"class_count_summary":";".join([f"{k}:{v}" for k,v in sorted(counts.items(),key=lambda x:str(x[0]))])})
+        split_rows.append({"split":split,"dataset_len":_dataset_len(ds),"json_path":json_path,"json_records_read":len(records),"json_label_count_total":"" if split=="test" else sum(counts.values()),"json_unique_ids":len(ids_by_split[split]),"class_count_summary":"withheld_until_final_evaluation" if split=="test" else ";".join([f"{k}:{v}" for k,v in sorted(counts.items(),key=lambda x:str(x[0]))])})
     train_ids=ids_by_split.get("train",set())
     for row in split_rows:
         ids=ids_by_split.get(row["split"],set())
