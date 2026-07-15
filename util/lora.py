@@ -682,15 +682,35 @@ def _apply_lora_to_gram_module(
     skip = any(k in lower for k in ("vqgan", "quant", "codebook", "decoder", "tokenizer"))
     should_replace = False
     if not skip:
+        attention_part = None
+        if ".attn." in lower:
+            for part in ("query", "key", "value", "proj"):
+                if lower.endswith(part):
+                    attention_part = part
+                    break
+        part_to_plan_id = {
+            "query": "q",
+            "key": "k",
+            "value": "v",
+            "proj": "o",
+        }
+        ordinary_attention_target = plan.target_lower in (
+            "qv",
+            "attn_qv",
+            "qv_ffn",
+            "qkv",
+            "attn_qkv",
+            "qkvo",
+            "attn",
+            "attention",
+            "qkvo_ffn",
+            "attn_ffn",
+            "all_linear",
+        )
+        if attention_part is not None and ordinary_attention_target:
+            should_replace = part_to_plan_id[attention_part] in plan.enabled_parts
         if plan.use_structural:
-            is_attn_linear = (".attn." in lower and (
-                lower.endswith("key")
-                or lower.endswith("query")
-                or lower.endswith("value")
-                or lower.endswith("proj")
-            ))
-            is_layer_fusion = ("proj_layers" in lower)
-            should_replace = is_attn_linear or is_layer_fusion
+            should_replace = should_replace or attention_part is not None or "proj_layers" in lower
         if not should_replace and plan.use_all_linear and lower.startswith("main_model."):
             should_replace = True
 
